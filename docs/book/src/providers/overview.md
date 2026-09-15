@@ -1,6 +1,6 @@
 # Providers overview
 
-A backend is how meka reaches an LLM inference service. meka ships with five, each selectable as an account's `backend`:
+A backend is how meka reaches an LLM inference service. meka ships with eight drivers, three of them one product, each selectable as an account's `backend`:
 
 | Backend | Protocol | Endpoint | Auth |
 |---------|----------|----------|------|
@@ -9,10 +9,11 @@ A backend is how meka reaches an LLM inference service. meka ships with five, ea
 | [`openai-chat-completions`](./openai-chat-completions.md) | OpenAI Chat Completions | `{base}/chat/completions` | API key |
 | [`openai-responses`](./openai-responses.md) | OpenAI Responses | `{base}/responses` | API key |
 | [`chatgpt-subscription`](./chatgpt-subscription.md) | OpenAI Responses | `chatgpt.com/backend-api/codex/responses` | ChatGPT subscription |
+| [`opencode-go`](./opencode-go.md) | OpenAI Chat Completions | `opencode.ai/zen/go/v1/chat/completions` | API key |
+| [`opencode-go-responses`](./opencode-go.md) | OpenAI Responses | `opencode.ai/zen/go/v1/responses` | API key |
+| [`opencode-go-messages`](./opencode-go.md) | Anthropic Messages | `opencode.ai/zen/go/v1/messages` | API key |
 
-**A backend names the wire protocol, not a vendor.** That is deliberate, and it cuts both ways. One vendor can serve several protocols: OpenAI publishes Chat Completions *and* Responses, and they are different request shapes, not options on one. One protocol is served by many vendors: `/v1/messages` is implemented by Anthropic, Amazon Bedrock, Databricks, LiteLLM and Ollama, so calling it "the Claude API" would misname it the moment you point it elsewhere.
-
-The two subscription backends are the exception, and carry a vendor name instead. What you pick there is a billing relationship; the endpoint and the client shape come with it and are not yours to choose.
+A backend names the wire protocol, not a vendor, with one exception: a product whose endpoint and client shape are fixed is named for the product, because what you pick there is a billing relationship rather than a protocol. OpenAI publishes Chat Completions *and* Responses, and they are different request shapes, not options on one. One protocol is served by many vendors: `/v1/messages` is implemented by Anthropic, Amazon Bedrock, Databricks, LiteLLM and Ollama, so calling it "the Claude API" would misname it the moment you point it elsewhere.
 
 Synthetic is the clearest case for why this matters. One vendor, two protocols, two base URLs:
 
@@ -107,6 +108,13 @@ Three backends, two protocols:
 - **`chatgpt-subscription`** posts to `chatgpt.com/backend-api/codex/responses`, authenticating by OAuth against `auth.openai.com` and mirroring the first-party Codex CLI. Choose it to bill a ChatGPT Plus / Pro / Team / Business subscription instead of a per-token API key.
 
 The first two differ by protocol; the last two differ only by auth and endpoint.
+
+## OpenCode Go
+
+[`opencode-go`](./opencode-go.md), `opencode-go-responses` and `opencode-go-messages` are one
+product: OpenCode's subscription, served over all three protocols. The backend follows the protocol
+the model is served on, which is OpenCode's routing rather than meka's. Every request carries the
+conversation's id in `x-opencode-session`, which the gateway requires.
 
 ## Streaming vs non-streaming
 

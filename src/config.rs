@@ -1156,12 +1156,15 @@ pub(crate) struct SessionConfig {
 
 impl Backend {
     /// Every backend, in the order the names sort, which is the order a user is shown them.
-    pub(crate) const ALL: [Backend; 5] = [
+    pub(crate) const ALL: [Backend; 8] = [
         Self::AnthropicMessages,
         Self::ChatGptSubscription,
         Self::ClaudeSubscription,
         Self::OpenAiChatCompletions,
         Self::OpenAiResponses,
+        Self::OpenCodeGo,
+        Self::OpenCodeGoMessages,
+        Self::OpenCodeGoResponses,
     ];
 
     /// The name an account's `backend` gives this backend.
@@ -1172,6 +1175,9 @@ impl Backend {
             Self::ClaudeSubscription => "claude-subscription",
             Self::OpenAiChatCompletions => "openai-chat-completions",
             Self::OpenAiResponses => "openai-responses",
+            Self::OpenCodeGo => "opencode-go",
+            Self::OpenCodeGoMessages => "opencode-go-messages",
+            Self::OpenCodeGoResponses => "opencode-go-responses",
         }
     }
 
@@ -1192,7 +1198,10 @@ impl Backend {
     /// for Claude: the protocol name `anthropic-messages` silently falls out of it, and nothing
     /// about the failure is visible except a missing line.
     pub(crate) const fn takes_thinking(self) -> bool {
-        matches!(self, Self::AnthropicMessages | Self::ClaudeSubscription)
+        matches!(
+            self,
+            Self::AnthropicMessages | Self::ClaudeSubscription | Self::OpenCodeGoMessages
+        )
     }
 
     /// Whether this backend actually sends the profile key `key`.
@@ -1213,10 +1222,11 @@ impl Backend {
             "thinking_display" => matches!(self, Self::ClaudeSubscription),
             "thinking" | "thinking_budget" => self.takes_thinking(),
             // Not `claude-subscription`: its breakpoint is pinned by the captured wire, and its
-            // endpoint cannot vary.
-            "cache_control" => matches!(self, Self::AnthropicMessages),
-            // Chat Completions has no declaration to make.
-            "deferred_tools" => !matches!(self, Self::OpenAiChatCompletions),
+            // endpoint cannot vary. `opencode-go-messages` builds the same Messages provider as
+            // `anthropic-messages`, so the breakpoint is one of its live settings too.
+            "cache_control" => matches!(self, Self::AnthropicMessages | Self::OpenCodeGoMessages),
+            // Chat Completions has no declaration to make, whatever endpoint speaks it.
+            "deferred_tools" => !matches!(self, Self::OpenAiChatCompletions | Self::OpenCodeGo),
             _ => true,
         }
     }
@@ -1229,7 +1239,11 @@ impl Backend {
             "client_id" | "oauth_token_url" => {
                 matches!(self, Self::ClaudeSubscription | Self::ChatGptSubscription)
             }
-            "interleaved_thinking" => matches!(self, Self::AnthropicMessages),
+            // The shared Messages provider reads the flag to decide the beta header, so the key
+            // is live on `opencode-go-messages` too; `claude-subscription` alone pins it.
+            "interleaved_thinking" => {
+                matches!(self, Self::AnthropicMessages | Self::OpenCodeGoMessages)
+            }
             _ => true,
         }
     }
@@ -1239,8 +1253,16 @@ impl Backend {
     /// endpoints' caps are the endpoints' own facts.
     pub(crate) fn default_max_request_bytes(self) -> Option<usize> {
         match self {
-            Self::AnthropicMessages | Self::ClaudeSubscription => Some(ANTHROPIC_MAX_REQUEST_BYTES),
-            Self::ChatGptSubscription | Self::OpenAiChatCompletions | Self::OpenAiResponses => None,
+            // An `opencode-go-*` backend caps like the wire it speaks, since the provider that
+            // applies the fallback is the shared one and its constant is the same.
+            Self::AnthropicMessages | Self::ClaudeSubscription | Self::OpenCodeGoMessages => {
+                Some(ANTHROPIC_MAX_REQUEST_BYTES)
+            }
+            Self::ChatGptSubscription
+            | Self::OpenAiChatCompletions
+            | Self::OpenAiResponses
+            | Self::OpenCodeGo
+            | Self::OpenCodeGoResponses => None,
         }
     }
 }
@@ -3176,11 +3198,13 @@ impl From<ThinkingMode> for String {
 /// How a profile's wire carries the tools a request defers: the endpoint's own declaration, or
 /// the array growth every endpoint takes.
 ///
-/// Unset, a profile takes `native` where the endpoint is known to honor it, the two subscription
-/// backends and an API-key backend with no `base_url`, and `append` everywhere else. A gateway
-/// that ignores `defer_loading` accepts it silently and then shows every deferred schema from the
-/// first request, so the default errs toward append and the key is the way to say otherwise,
-/// per profile because one gateway answers differently per model behind it.
+/// Unset, a profile takes `native` where the endpoint is known to honor it — the two subscription
+/// backends and an API-key backend with no `base_url`, which lands on the vendor's own endpoint —
+/// and `append` everywhere else, `opencode-go-*` included: its endpoint is fixed too, but it is a
+/// gateway, not a vendor's promise. A gateway that ignores `defer_loading` accepts it silently and
+/// then shows every deferred schema from the first request, so the default errs toward append and
+/// the key is the way to say otherwise, per profile because one gateway answers differently per
+/// model behind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub(crate) enum DeferredTools {
@@ -3208,14 +3232,19 @@ impl DeferredTools {
             .join(", ")
     }
 
-    /// What an unset key means for `backend`, given whether the account names a `base_url`.
+    /// What an unset key means for `backend`, given whether the account names a `base_url`. The
+    /// `opencode-go-*` gateways have fixed endpoints but no known answer for `defer_loading`, so
+    /// they err toward `append` like every other endpoint meka cannot vouch for.
     pub(crate) const fn default_for(backend: Backend, has_base_url: bool) -> Self {
         match backend {
             Backend::ClaudeSubscription | Backend::ChatGptSubscription => Self::Native,
             Backend::AnthropicMessages | Backend::OpenAiResponses if !has_base_url => Self::Native,
             Backend::AnthropicMessages
             | Backend::OpenAiResponses
-            | Backend::OpenAiChatCompletions => Self::Append,
+            | Backend::OpenAiChatCompletions
+            | Backend::OpenCodeGo
+            | Backend::OpenCodeGoMessages
+            | Backend::OpenCodeGoResponses => Self::Append,
         }
     }
 }
@@ -4482,8 +4511,9 @@ required = false
         assert!(resolved.mcp_overlay.required);
     }
 
-    /// Unset, the key takes the endpoint's answer: native where the endpoint is fixed or official,
-    /// append behind a `base_url`, and Chat Completions never reads it at all.
+    /// Unset, the key takes the endpoint's answer: native where the endpoint is known to honor it
+    /// (a fixed product or the official API-key endpoint), append behind a `base_url` or at a
+    /// gateway whose answer is not known, and Chat Completions never reads it at all.
     #[test]
     fn deferred_tools_defaults_to_native_on_an_official_endpoint_only() {
         use Backend::*;
@@ -4498,6 +4528,12 @@ required = false
             (OpenAiResponses, true, DeferredTools::Append),
             (OpenAiChatCompletions, false, DeferredTools::Append),
             (OpenAiChatCompletions, true, DeferredTools::Append),
+            (OpenCodeGo, false, DeferredTools::Append),
+            (OpenCodeGo, true, DeferredTools::Append),
+            (OpenCodeGoMessages, false, DeferredTools::Append),
+            (OpenCodeGoMessages, true, DeferredTools::Append),
+            (OpenCodeGoResponses, false, DeferredTools::Append),
+            (OpenCodeGoResponses, true, DeferredTools::Append),
         ] {
             assert_eq!(
                 DeferredTools::default_for(backend, has_base_url),
@@ -4508,7 +4544,7 @@ required = false
         for backend in Backend::ALL {
             assert_eq!(
                 backend.reads_profile_key("deferred_tools"),
-                backend != OpenAiChatCompletions,
+                !matches!(backend, OpenAiChatCompletions | OpenCodeGo),
                 "{backend}"
             );
         }
@@ -4840,14 +4876,35 @@ model = "m"
         }
     }
 
-    /// The breakpoint key is `anthropic-messages`'s alone, which is what the two CLI write doors
-    /// and the load-time check all ask.
+    /// The breakpoint key is read by the backends whose provider places the breakpoint at request
+    /// time (`anthropic-messages` and `opencode-go-messages`); `claude-subscription`'s is pinned by
+    /// its captured wire. The two CLI write doors and the load-time check all ask.
     #[test]
-    fn only_the_messages_backend_reads_the_cache_control_key() {
+    fn the_cache_control_key_is_read_wherever_the_breakpoint_may_move() {
         for backend in Backend::ALL {
             assert_eq!(
                 backend.reads_profile_key("cache_control"),
-                matches!(backend, Backend::AnthropicMessages),
+                matches!(
+                    backend,
+                    Backend::AnthropicMessages | Backend::OpenCodeGoMessages
+                ),
+                "{backend}"
+            );
+        }
+    }
+
+    /// The account key is read by the backends whose provider sends the interleaved-thinking beta
+    /// when the flag says the endpoint takes it: the two Messages providers. `claude-subscription`
+    /// pins its own answer to the captured wire.
+    #[test]
+    fn the_interleaved_thinking_key_is_read_by_the_messages_providers() {
+        for backend in Backend::ALL {
+            assert_eq!(
+                backend.reads_account_key("interleaved_thinking"),
+                matches!(
+                    backend,
+                    Backend::AnthropicMessages | Backend::OpenCodeGoMessages
+                ),
                 "{backend}"
             );
         }

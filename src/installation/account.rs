@@ -391,7 +391,10 @@ pub(crate) fn credential_kind(backend: config::Backend) -> CredentialKind {
         config::Backend::ChatGptSubscription => CredentialKind::ChatGptLogin,
         config::Backend::AnthropicMessages
         | config::Backend::OpenAiChatCompletions
-        | config::Backend::OpenAiResponses => CredentialKind::ApiKey,
+        | config::Backend::OpenAiResponses
+        | config::Backend::OpenCodeGo
+        | config::Backend::OpenCodeGoMessages
+        | config::Backend::OpenCodeGoResponses => CredentialKind::ApiKey,
     }
 }
 
