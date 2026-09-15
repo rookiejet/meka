@@ -51,6 +51,9 @@ pub(crate) struct OpenAiResponsesProvider {
     reasoning_summary: bool,
     /// See `AccountConfig::prompt_cache_key`.
     prompt_cache_key: bool,
+    /// The OpenCode Go gateway facts, when this provider is one of the `opencode-*` backends;
+    /// `None` (the generic case) adds nothing to the wire.
+    opencode: Option<crate::provider::opencode::Gateway>,
 }
 
 impl OpenAiResponsesProvider {
@@ -69,6 +72,7 @@ impl OpenAiResponsesProvider {
             encrypted_reasoning,
             reasoning_summary,
             prompt_cache_key,
+            opencode,
             ..
         } = settings;
         let resolved_effort = crate::provider::resolve_effort_level(reasoning_effort.as_deref());
@@ -92,6 +96,7 @@ impl OpenAiResponsesProvider {
             encrypted_reasoning,
             reasoning_summary,
             prompt_cache_key,
+            opencode,
         })
     }
 
@@ -182,11 +187,15 @@ impl ResponsesBackend for OpenAiResponsesProvider {
     async fn authenticated_request(
         &self,
         request: reqwest::RequestBuilder,
-        _attribution: &crate::provider::Attribution,
+        attribution: &crate::provider::Attribution,
     ) -> Result<reqwest::RequestBuilder> {
-        Ok(request
-            .header("Authorization", crate::text::bearer(&self.api_key))
-            .header("Accept", "text/event-stream"))
+        Ok(crate::provider::opencode::apply_request_headers(
+            request
+                .header("Authorization", crate::text::bearer(&self.api_key))
+                .header("Accept", "text/event-stream"),
+            attribution,
+            self.opencode,
+        ))
     }
 }
 
@@ -214,6 +223,21 @@ impl Provider for OpenAiResponsesProvider {
         cancellation: CancellationToken,
     ) -> Result<()> {
         super::responses_wire::stream(self, request, event_sender, cancellation).await
+    }
+
+    async fn fetch_usage(&self) -> Result<Option<crate::provider::AccountUsage>> {
+        match self.opencode {
+            Some(gateway) => Ok(Some(
+                crate::provider::opencode::fetch_usage(
+                    &self.client,
+                    format!("{}/usage", self.base_url),
+                    &self.api_key,
+                    gateway,
+                )
+                .await?,
+            )),
+            None => Ok(None),
+        }
     }
 
     fn resolved_effort(&self) -> Option<String> {
@@ -434,5 +458,85 @@ mod tests {
         assert!(body.get("reasoning").is_none(), "{body}");
         // An empty system prompt sends no `instructions` rather than an empty one.
         assert!(body.get("instructions").is_none(), "{body}");
+    }
+
+    /// An `opencode-go-responses` stream stamps the conversation's id into `x-opencode-session`
+    /// (both `complete` and `stream` route through `authenticated_request`, so one wire test
+    /// covers the shared site).
+    #[tokio::test]
+    async fn an_opencode_go_responses_stream_carries_the_session_header() {
+        let (local, head_receiver) =
+            crate::provider::opencode::mock_endpoint_capturing_the_head().await;
+        let provider = OpenAiResponsesProvider::from_settings(
+            "test-key".to_string(),
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::OpenCodeGoResponses,
+                crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                "gpt-5.6-luna".to_string(),
+            )
+            .base_url(Some(format!("http://{local}")))
+            .opencode(),
+        )
+        .expect("provider");
+        let session_id = uuid::Uuid::new_v4();
+        let (sender, _receiver) = mpsc::channel(8);
+        if let Ok(()) = provider
+            .stream(
+                CompletionRequest::new("", &[Message::user("hello")], &[]).attributed(
+                    crate::provider::Attribution {
+                        session_id: Some(session_id),
+                        ..Default::default()
+                    },
+                ),
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+        {
+            panic!("a 400 from the endpoint must not read as a completed stream");
+        }
+        let head = head_receiver.await.expect("the mock saw the request");
+        assert!(
+            head.lines()
+                .any(|line| line == format!("x-opencode-session: {session_id}")),
+            "the stream must carry the session; head:\n{head}"
+        );
+    }
+
+    /// The generic backend sends what it always sent.
+    #[tokio::test]
+    async fn a_generic_responses_request_carries_no_session_header() {
+        let (local, head_receiver) =
+            crate::provider::opencode::mock_endpoint_capturing_the_head().await;
+        let provider = OpenAiResponsesProvider::from_settings(
+            "test-key".to_string(),
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::OpenAiResponses,
+                crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                "gpt-5.6-sol".to_string(),
+            )
+            .base_url(Some(format!("http://{local}"))),
+        )
+        .expect("provider");
+        let (sender, _receiver) = mpsc::channel(8);
+        if let Ok(()) = provider
+            .stream(
+                CompletionRequest::new("", &[Message::user("hello")], &[]),
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+        {
+            panic!("a 400 from the endpoint must not read as a completed stream");
+        }
+        let head = head_receiver.await.expect("the mock saw the request");
+        assert!(
+            !head.contains("x-opencode-session"),
+            "a generic backend must not name a session; head:\n{head}"
+        );
+        assert!(
+            !head.contains("user-agent: meka/"),
+            "a generic backend must keep its wire identity; head:\n{head}"
+        );
     }
 }

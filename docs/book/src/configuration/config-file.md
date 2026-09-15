@@ -128,11 +128,16 @@ The driver the account uses (required).
 | `openai-chat-completions` | OpenAI Chat Completions, `POST {base}/chat/completions` | API key |
 | `openai-responses` | OpenAI Responses, `POST {base}/responses` | API key |
 | `chatgpt-subscription` | OpenAI Responses, against `chatgpt.com/backend-api/codex` | ChatGPT subscription OAuth |
+| `opencode-go` | OpenAI Chat Completions, against `opencode.ai/zen/go/v1` | API key |
+| `opencode-go-responses` | OpenAI Responses, against `opencode.ai/zen/go/v1` | API key |
+| `opencode-go-messages` | Anthropic Messages, against `opencode.ai/zen/go/v1` | API key |
 
 An API-key backend is named for the protocol it speaks, because `base_url` decides the endpoint and
-the same protocol is served by many vendors. A subscription backend is named for the product,
-because the endpoint is fixed and what the account holds is a billing relationship. See [Providers
-overview](../providers/overview.md) for which servers implement which protocol.
+the same protocol is served by many vendors. A product backend is named for the product, because
+the endpoint is fixed and what the account holds is a billing relationship; the three `opencode-go`
+backends are one product, reached over all three protocols. See [OpenCode
+Go](../providers/opencode-go.md), or [Providers overview](../providers/overview.md) for which
+servers implement which protocol.
 
 ### `base_url`
 
@@ -147,6 +152,7 @@ If not set, defaults to:
 - `https://api.openai.com/v1` for the `openai-chat-completions` and `openai-responses` backends
 - `https://chatgpt.com` for the `chatgpt-subscription` backend (request path is `/backend-api/codex/responses`)
 - `https://api.anthropic.com` for the `anthropic-messages` and `claude-subscription` backends
+- `https://opencode.ai/zen/go/v1` for the three `opencode-go` backends
 
 Set it with `meka account add <name> --base-url <url>`, or edit the account table by hand.
 
