@@ -8,10 +8,10 @@ a model, which is the profile's. The requested data goes to **stdout**; notes an
 **stderr**, so `meka account … 2>/dev/null | jq` stays clean. The rest of the `meka account` suite
 (`add`, `login`, `list`, `remove`) is documented under [Config file](../configuration/config-file.md#meka-account-cli).
 
-Availability is per backend: `claude-subscription` and `chatgpt-subscription` (subscription OAuth) support these;
-for `usage` and `stats`, API-key backends, OpenAI-compatible endpoints and Ollama print a short
-"not available" note and exit non-zero. `whoami` works on any account: it fills the fields it can
-and fails only when the credential itself is invalid.
+Availability is per backend: the subscription backends, `opencode-go` included, support these; every
+other backend prints a short "not available" note for `usage` and `stats` and exits non-zero.
+`whoami` works on any account: it fills the fields it can and fails only when the credential itself
+is invalid.
 
 ## `meka account usage`
 

@@ -199,7 +199,7 @@ Account usage
   Weekly             [----------]   2% used  (resets in 22h 50m, 2026-07-02 13:00 +02:00)
 ```
 
-This is distinct from `/status`, which reports this session's own token counters. `/usage` queries the upstream service for your whole-account subscription limits. It works only for the two subscription backends, which expose a usage endpoint (`claude-subscription`'s 5-hour and weekly windows; `chatgpt-subscription`'s primary/secondary windows plus plan and credit balance). For an API-key backend it prints a short note that usage is not available there instead. The same command is available under ACP.
+This is distinct from `/status`, which reports this session's own token counters. `/usage` queries the upstream service for your whole-account subscription limits. It works only for the backends that expose a usage endpoint: `claude-subscription`, `chatgpt-subscription`, and the three `opencode-go` backends. For an API-key backend it prints a short note that usage is not available there instead. The same command is available under ACP.
 
 ### `/compact`
 

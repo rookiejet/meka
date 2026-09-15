@@ -92,8 +92,8 @@ The credential for a session's profile is loaded from the store, keyed by the pr
 name. It is acquired interactively:
 
 - `meka account add <name>` runs the OAuth login (`claude-subscription`, `chatgpt-subscription`) or
-  prompts for the API key (`anthropic-messages`, `openai-chat-completions`, `openai-responses`) when
-  the account is created.
+  prompts for the API key (`anthropic-messages`, `openai-chat-completions`, `openai-responses`, the
+  `opencode-go` backends) when the account is created.
 - `meka account login <name>` re-acquires it for an existing account (rotate an API key, recover
   from a dead OAuth refresh token), keeping every setting on the account and every profile on it.
   Add `--api-key-stdin` to pipe the key in for scripted rotation.

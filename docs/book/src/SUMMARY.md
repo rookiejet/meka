@@ -39,6 +39,7 @@
 - [OpenAI Chat Completions](./providers/openai-chat-completions.md)
 - [OpenAI Responses](./providers/openai-responses.md)
 - [ChatGPT subscription](./providers/chatgpt-subscription.md)
+- [OpenCode Go](./providers/opencode-go.md)
 
 # Tools
 

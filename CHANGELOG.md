@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Three `opencode-go` backends, one per protocol, for OpenCode Go's subscription.
+- OpenCode Go requests carry the required `x-opencode-session` header per conversation.
+- `meka account usage` reports an OpenCode Go subscription's dollar-budget windows.
+
 ## [0.65.0] - 2026-09-26
 
 ### Added
