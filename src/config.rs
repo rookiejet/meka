@@ -797,12 +797,15 @@ pub(crate) struct SessionConfig {
 
 impl Backend {
     /// Every backend, in the order the names sort, which is the order a user is shown them.
-    pub(crate) const ALL: [Backend; 5] = [
+    pub(crate) const ALL: [Backend; 8] = [
         Self::AnthropicMessages,
         Self::ChatGptSubscription,
         Self::ClaudeSubscription,
         Self::OpenAiChatCompletions,
         Self::OpenAiResponses,
+        Self::OpenCodeGo,
+        Self::OpenCodeGoMessages,
+        Self::OpenCodeGoResponses,
     ];
 
     /// The name an account's `backend` gives this backend.
@@ -813,6 +816,9 @@ impl Backend {
             Self::ClaudeSubscription => "claude-subscription",
             Self::OpenAiChatCompletions => "openai-chat-completions",
             Self::OpenAiResponses => "openai-responses",
+            Self::OpenCodeGo => "opencode-go",
+            Self::OpenCodeGoMessages => "opencode-go-messages",
+            Self::OpenCodeGoResponses => "opencode-go-responses",
         }
     }
 
@@ -833,7 +839,10 @@ impl Backend {
     /// for Claude: the protocol name `anthropic-messages` silently falls out of it, and nothing
     /// about the failure is visible except a missing line.
     pub(crate) const fn takes_thinking(self) -> bool {
-        matches!(self, Self::AnthropicMessages | Self::ClaudeSubscription)
+        matches!(
+            self,
+            Self::AnthropicMessages | Self::ClaudeSubscription | Self::OpenCodeGoMessages
+        )
     }
 
     /// Whether this backend actually sends the profile key `key`.

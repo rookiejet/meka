@@ -25,6 +25,8 @@ pub(crate) struct ProviderBuilder {
     pub(super) context_window: Option<u64>,
     pub(super) max_output_tokens: Option<u64>,
     pub(super) max_request_bytes: Option<usize>,
+    /// The OpenCode Go gateway facts, set for the three `opencode-go` backends only.
+    pub(super) opencode: Option<opencode::Gateway>,
 }
 impl ProviderBuilder {
     pub(crate) fn new(
@@ -49,6 +51,7 @@ impl ProviderBuilder {
             context_window: None,
             max_output_tokens: None,
             max_request_bytes: None,
+            opencode: None,
         }
     }
 
@@ -135,6 +138,14 @@ impl ProviderBuilder {
         self
     }
 
+    /// Say the provider is an OpenCode Go gateway client: every request carries the conversation's
+    /// id in `x-opencode-session` and meka's user agent. Consumed by the three `opencode-go`
+    /// backends; every other backend ignores it.
+    pub(crate) fn opencode(mut self) -> Self {
+        self.opencode = Some(opencode::Gateway::GO);
+        self
+    }
+
     /// The row a subscription backend writes refreshed tokens to.
     ///
     /// No default in its place: the registry is the one authority on which row a profile's
@@ -213,6 +224,54 @@ impl ProviderBuilder {
                     ));
                 }
                 Ok(Arc::new(ChatGptSubscriptionProvider::new(self)?))
+            }
+            Backend::OpenCodeGo => {
+                let api_key = match &self.credential {
+                    AuthCredential::ApiKey(key) => key.clone(),
+                    AuthCredential::OAuthToken { .. } => {
+                        return Err(MekaError::Config(
+                            "backend 'opencode-go' takes an API key, not an OAuth token; \
+                             'chatgpt-subscription' bills a subscription"
+                                .to_string(),
+                        ));
+                    }
+                };
+                Ok(Arc::new(OpenAiChatCompletionsProvider::new(
+                    api_key,
+                    self.opencode(),
+                )?))
+            }
+            Backend::OpenCodeGoResponses => {
+                let api_key = match &self.credential {
+                    AuthCredential::ApiKey(key) => key.clone(),
+                    AuthCredential::OAuthToken { .. } => {
+                        return Err(MekaError::Config(
+                            "backend 'opencode-go-responses' takes an API key, not an OAuth \
+                             token; 'chatgpt-subscription' bills a subscription"
+                                .to_string(),
+                        ));
+                    }
+                };
+                Ok(Arc::new(OpenAiResponsesProvider::new(
+                    api_key,
+                    self.opencode(),
+                )?))
+            }
+            Backend::OpenCodeGoMessages => {
+                let api_key = match &self.credential {
+                    AuthCredential::ApiKey(key) => key.clone(),
+                    AuthCredential::OAuthToken { .. } => {
+                        return Err(MekaError::Config(
+                            "backend 'opencode-go-messages' takes an API key, not an OAuth \
+                             token; 'claude-subscription' bills a subscription"
+                                .to_string(),
+                        ));
+                    }
+                };
+                Ok(Arc::new(AnthropicMessagesProvider::new(
+                    api_key,
+                    self.opencode(),
+                )?))
             }
         }
     }

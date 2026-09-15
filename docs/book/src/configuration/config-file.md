@@ -125,11 +125,16 @@ The driver the account uses (required).
 | `openai-chat-completions` | OpenAI Chat Completions, `POST {base}/chat/completions` | API key |
 | `openai-responses` | OpenAI Responses, `POST {base}/responses` | API key |
 | `chatgpt-subscription` | OpenAI Responses, against `chatgpt.com/backend-api/codex` | ChatGPT subscription OAuth |
+| `opencode-go` | OpenAI Chat Completions, against `opencode.ai/zen/go/v1` | API key |
+| `opencode-go-responses` | OpenAI Responses, against `opencode.ai/zen/go/v1` | API key |
+| `opencode-go-messages` | Anthropic Messages, against `opencode.ai/zen/go/v1` | API key |
 
 An API-key backend is named for the protocol it speaks, because `base_url` decides the endpoint and
-the same protocol is served by many vendors. A subscription backend is named for the product,
-because the endpoint is fixed and what the account holds is a billing relationship. See [Providers
-overview](../providers/overview.md) for which servers implement which protocol.
+the same protocol is served by many vendors. A product backend is named for the product, because
+the endpoint is fixed and what the account holds is a billing relationship; the three `opencode-go`
+backends are one product, reached over all three protocols. See [OpenCode
+Go](../providers/opencode-go.md), or [Providers overview](../providers/overview.md) for which
+servers implement which protocol.
 
 ### `base_url`
 
@@ -144,6 +149,7 @@ If not set, defaults to:
 - `https://api.openai.com/v1` for the `openai-chat-completions` and `openai-responses` backends
 - `https://chatgpt.com` for the `chatgpt-subscription` backend (request path is `/backend-api/codex/responses`)
 - `https://api.anthropic.com` for the `anthropic-messages` and `claude-subscription` backends
+- `https://opencode.ai/zen/go/v1` for the three `opencode-go` backends
 
 Set it with `meka account add <name> --base-url <url>`, or edit the account table by hand.
 
@@ -365,7 +371,7 @@ store, never the config file.
 
 | Command | Action |
 |---|---|
-| `meka account add <name> [--backend B] [--base-url U] [--client-id ID] [--oauth-token-url U] [--api-key-stdin]` | Add an account. Prompts for the backend and base URL when not flagged, then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, API-key prompt for `anthropic-messages` / `openai-chat-completions` / `openai-responses`). `--api-key-stdin` reads the key from stdin instead, and then needs `--backend` as a flag too, since a prompt would consume the piped key; it is refused for the two subscription backends, which have no key to read. `--client-id` and `--oauth-token-url` are dropped with a warning on an API-key backend, which never reads them. `device_id` has no flag, because meka resolves and persists it itself. |
+| `meka account add <name> [--backend B] [--base-url U] [--client-id ID] [--oauth-token-url U] [--api-key-stdin]` | Add an account. Prompts for the backend and base URL when not flagged, then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, an API-key prompt for every other backend). `--api-key-stdin` reads the key from stdin instead, and then needs `--backend` as a flag too, since a prompt would consume the piped key; it is refused for the two subscription backends, which have no key to read. `--client-id` and `--oauth-token-url` are dropped with a warning on an API-key backend, which never reads them. `device_id` has no flag, because meka resolves and persists it itself. |
 | `meka account list` | List configured accounts with backend, base URL, and whether each has a stored credential; `--format json` prints the same as one document. Also names any stored credential that no account claims (see [Leftover credentials](#leftover-credentials)). |
 | `meka account login <name> [--api-key-stdin]` | Re-acquire the secret for an existing account (re-authenticate, recover from a dead OAuth refresh token, or rotate an API key). `--api-key-stdin` reads the key from stdin for scripted rotation, and is refused on the subscription backends, which have no key to read. Every setting on the account is kept. |
 | `meka account remove <name>` | Delete the stored credential from the store and remove the `[accounts.<name>]` entry from the config file. Refused while any profile names the account, naming the profiles: remove or repoint those first. Works on a name with only one of the two halves, so it can clean up after a hand-edit. |

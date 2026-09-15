@@ -39,6 +39,9 @@ pub(crate) struct AnthropicMessagesProvider {
     max_output_tokens: Option<u64>,
     /// See [`crate::config::ProfileConfig::max_request_bytes`].
     max_request_bytes: Option<usize>,
+    /// The OpenCode Go gateway facts, when this provider is one of the `opencode-*` backends;
+    /// `None` (the generic case) adds nothing to the wire.
+    opencode: Option<crate::provider::opencode::Gateway>,
 }
 
 impl AnthropicMessagesProvider {
@@ -52,6 +55,7 @@ impl AnthropicMessagesProvider {
             effort,
             max_output_tokens,
             max_request_bytes,
+            opencode,
             ..
         } = settings;
         let resolved_effort = crate::provider::resolve_effort_level(effort.as_deref());
@@ -69,6 +73,7 @@ impl AnthropicMessagesProvider {
             resolved_effort,
             max_output_tokens,
             max_request_bytes,
+            opencode,
         })
     }
 
@@ -205,13 +210,18 @@ impl shared::ClaudeBackend for AnthropicMessagesProvider {
         _has_tools: bool,
         stream: bool,
         thinking: ThinkingOverride,
+        attribution: &crate::provider::Attribution,
     ) -> Result<reqwest::RequestBuilder> {
         let request = if stream {
             request.header("accept-encoding", "identity")
         } else {
             request
         };
-        Ok(self.apply_headers(request, thinking))
+        Ok(crate::provider::opencode::apply_request_headers(
+            self.apply_headers(request, thinking),
+            attribution,
+            self.opencode,
+        ))
     }
 }
 
@@ -232,6 +242,23 @@ impl Provider for AnthropicMessagesProvider {
         cancellation: CancellationToken,
     ) -> Result<()> {
         shared::stream(self, request, event_sender, cancellation).await
+    }
+
+    async fn fetch_usage(&self) -> Result<Option<crate::provider::AccountUsage>> {
+        match self.opencode {
+            Some(gateway) => Ok(Some(
+                crate::provider::opencode::fetch_usage(
+                    &self.client,
+                    // `self.base_url` carries no trailing `/v1` (the Messages driver strips it and
+                    // re-appends per request), so the usage endpoint re-appends it too.
+                    format!("{}/v1/usage", self.base_url),
+                    &self.api_key,
+                    gateway,
+                )
+                .await?,
+            )),
+            None => Ok(None),
+        }
     }
 
     fn resolved_effort(&self) -> Option<String> {
@@ -640,6 +667,89 @@ mod tests {
         assert!(
             body.get("system").is_none(),
             "anthropic-messages should omit `system` when the prompt is empty"
+        );
+    }
+
+    /// An `opencode-go-messages` completion stamps the conversation's id into `x-opencode-session`
+    /// (both `complete` and `stream` route through `authenticated_request`, so one wire test
+    /// covers the shared site).
+    #[tokio::test]
+    async fn an_opencode_go_messages_completion_carries_the_session_header() {
+        let (local, head_receiver) =
+            crate::provider::opencode::mock_endpoint_capturing_the_head().await;
+        let provider = AnthropicMessagesProvider::new(
+            "test-key".to_string(),
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::OpenCodeGoMessages,
+                crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                "minimax-m3".to_string(),
+            )
+            .base_url(Some(format!("http://{local}")))
+            .opencode(),
+        )
+        .expect("provider");
+        let session_id = uuid::Uuid::new_v4();
+        if provider
+            .complete(
+                CompletionRequest::new("", &[Message::user("hello")], &[]).attributed(
+                    crate::provider::Attribution {
+                        session_id: Some(session_id),
+                        ..Default::default()
+                    },
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .is_ok()
+        {
+            panic!("a 400 from the endpoint must not read as a completed completion");
+        }
+        let head = head_receiver.await.expect("the mock saw the request");
+        assert!(
+            head.lines()
+                .any(|line| line == format!("x-opencode-session: {session_id}")),
+            "the completion must carry the session; head:\n{head}"
+        );
+        assert!(
+            head.lines()
+                .any(|line| line.starts_with("user-agent: meka/")),
+            "the completion must carry meka's user agent; head:\n{head}"
+        );
+    }
+
+    /// The generic backend sends what it always sent.
+    #[tokio::test]
+    async fn a_generic_messages_request_carries_no_session_header() {
+        let (local, head_receiver) =
+            crate::provider::opencode::mock_endpoint_capturing_the_head().await;
+        let provider = AnthropicMessagesProvider::new(
+            "test-key".to_string(),
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::AnthropicMessages,
+                crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                "claude-opus-5".to_string(),
+            )
+            .base_url(Some(format!("http://{local}"))),
+        )
+        .expect("provider");
+        if provider
+            .complete(
+                CompletionRequest::new("", &[Message::user("hello")], &[]),
+                CancellationToken::new(),
+            )
+            .await
+            .is_ok()
+        {
+            panic!("a 400 from the endpoint must not read as a completed completion");
+        }
+        let head = head_receiver.await.expect("the mock saw the request");
+        assert!(
+            !head.contains("x-opencode-session"),
+            "a generic backend must not name a session; head:\n{head}"
+        );
+        assert!(
+            !head.contains("user-agent: meka/"),
+            "a generic backend must keep its wire identity; head:\n{head}"
         );
     }
 }

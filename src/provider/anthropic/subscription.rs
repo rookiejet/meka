@@ -808,6 +808,7 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
         has_tools: bool,
         _stream: bool,
         thinking: ThinkingOverride,
+        _attribution: &crate::provider::Attribution,
     ) -> Result<reqwest::RequestBuilder> {
         let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
         Ok(attestation::apply_headers(

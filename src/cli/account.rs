@@ -675,7 +675,10 @@ fn credential_kind(backend: config::Backend) -> CredentialKind {
         config::Backend::ChatGptSubscription => CredentialKind::ChatGptLogin,
         config::Backend::AnthropicMessages
         | config::Backend::OpenAiChatCompletions
-        | config::Backend::OpenAiResponses => CredentialKind::ApiKey,
+        | config::Backend::OpenAiResponses
+        | config::Backend::OpenCodeGo
+        | config::Backend::OpenCodeGoMessages
+        | config::Backend::OpenCodeGoResponses => CredentialKind::ApiKey,
     }
 }
 
@@ -1023,7 +1026,7 @@ pub(super) fn prompt_line(prompt: &str) -> io::Result<String> {
 /// still speaks. The menu entries, in the order they are offered. Separate from [`prompt_backend`]
 /// so a test can check it against [`config::Backend::ALL`]: this is the last hand-written backend
 /// list, and a backend missing from it is simply never offered interactively, with nothing failing.
-fn backend_menu() -> [(config::Backend, &'static str); 5] {
+fn backend_menu() -> [(config::Backend, &'static str); 8] {
     [
         (
             config::Backend::ClaudeSubscription,
@@ -1044,6 +1047,18 @@ fn backend_menu() -> [(config::Backend, &'static str); 5] {
         (
             config::Backend::OpenAiResponses,
             "OpenAI-compatible Responses API key",
+        ),
+        (
+            config::Backend::OpenCodeGo,
+            "OpenCode Go Chat Completions API key",
+        ),
+        (
+            config::Backend::OpenCodeGoResponses,
+            "OpenCode Go Responses API key",
+        ),
+        (
+            config::Backend::OpenCodeGoMessages,
+            "OpenCode Go Anthropic Messages API key",
         ),
     ]
 }

@@ -663,6 +663,7 @@ pub(super) trait ClaudeBackend: crate::oauth::RefreshesCredential + Send + Sync 
         has_tools: bool,
         stream: bool,
         thinking: ThinkingOverride,
+        attribution: &crate::provider::Attribution,
     ) -> Result<reqwest::RequestBuilder>;
     /// Record the response's request id where the next request can name it; a no-op for a backend
     /// whose wire carries none.
@@ -728,6 +729,7 @@ pub(super) async fn complete<B: ClaudeBackend>(
                     !tools.is_empty(),
                     false,
                     thinking,
+                    &attribution,
                 )
                 .await?
                 .body(body_json.clone()))
@@ -812,6 +814,7 @@ pub(super) async fn stream<B: ClaudeBackend>(
                     !tools.is_empty(),
                     true,
                     thinking,
+                    &attribution,
                 )
                 .await?
                 .body(body_json.clone()))

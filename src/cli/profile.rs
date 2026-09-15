@@ -191,6 +191,11 @@ fn default_model_for(backend: config::Backend) -> &'static str {
         config::Backend::OpenAiChatCompletions
         | config::Backend::OpenAiResponses
         | config::Backend::ChatGptSubscription => "gpt-5.6-sol",
+        // The current headline model per protocol family, per OpenCode's docs; the user picks any
+        // of the catalog's models on the matching protocol.
+        config::Backend::OpenCodeGo => "kimi-k3",
+        config::Backend::OpenCodeGoResponses => "gpt-5.6-luna",
+        config::Backend::OpenCodeGoMessages => "minimax-m3",
     }
 }
 
@@ -1456,6 +1461,15 @@ mod tests {
         assert_eq!(
             default_model_for(config::Backend::ChatGptSubscription),
             "gpt-5.6-sol"
+        );
+        assert_eq!(default_model_for(config::Backend::OpenCodeGo), "kimi-k3");
+        assert_eq!(
+            default_model_for(config::Backend::OpenCodeGoResponses),
+            "gpt-5.6-luna"
+        );
+        assert_eq!(
+            default_model_for(config::Backend::OpenCodeGoMessages),
+            "minimax-m3"
         );
     }
 

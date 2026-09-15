@@ -40,6 +40,9 @@ pub(crate) struct OpenAiChatCompletionsProvider {
     max_output_tokens: Option<u64>,
     /// See [`crate::config::ProfileConfig::max_request_bytes`]; unset means no ceiling here.
     max_request_bytes: Option<usize>,
+    /// The OpenCode Go gateway facts, when this provider is one of the `opencode-*` backends;
+    /// `None` (the generic case) adds nothing to the wire.
+    opencode: Option<crate::provider::opencode::Gateway>,
 }
 
 impl OpenAiChatCompletionsProvider {
@@ -51,6 +54,7 @@ impl OpenAiChatCompletionsProvider {
             effort: reasoning_effort,
             max_output_tokens,
             max_request_bytes,
+            opencode,
             ..
         } = settings;
         let resolved_effort = crate::provider::resolve_effort_level(reasoning_effort.as_deref());
@@ -68,6 +72,7 @@ impl OpenAiChatCompletionsProvider {
             resolved_effort,
             max_output_tokens,
             max_request_bytes,
+            opencode,
         })
     }
 
@@ -403,6 +408,7 @@ impl Provider for OpenAiChatCompletionsProvider {
             system_prompt,
             messages,
             tools,
+            attribution,
             ..
         } = request;
         let (body_json, redaction_notice) =
@@ -413,12 +419,15 @@ impl Provider for OpenAiChatCompletionsProvider {
             crate::error::ProviderRequest::Completion,
             |error| crate::error::provider_transport_error("HTTP request failed", error, None),
             || async {
-                Ok(self
-                    .client
-                    .post(format!("{}/chat/completions", self.base_url))
-                    .header("Authorization", crate::text::bearer(&self.api_key))
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .body(body_json.clone()))
+                Ok(crate::provider::opencode::apply_request_headers(
+                    self.client
+                        .post(format!("{}/chat/completions", self.base_url))
+                        .header("Authorization", crate::text::bearer(&self.api_key))
+                        .header(reqwest::header::CONTENT_TYPE, "application/json"),
+                    &attribution,
+                    self.opencode,
+                )
+                .body(body_json.clone()))
             },
             &cancellation,
         )
@@ -460,6 +469,7 @@ impl Provider for OpenAiChatCompletionsProvider {
             system_prompt,
             messages,
             tools,
+            attribution,
             ..
         } = request;
         let (body_json, redaction_notice) =
@@ -480,12 +490,15 @@ impl Provider for OpenAiChatCompletionsProvider {
             crate::error::ProviderRequest::Completion,
             |error| crate::error::provider_transport_error("HTTP request failed", error, None),
             || async {
-                Ok(self
-                    .client
-                    .post(format!("{}/chat/completions", self.base_url))
-                    .header("Authorization", crate::text::bearer(&self.api_key))
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .body(body_json.clone()))
+                Ok(crate::provider::opencode::apply_request_headers(
+                    self.client
+                        .post(format!("{}/chat/completions", self.base_url))
+                        .header("Authorization", crate::text::bearer(&self.api_key))
+                        .header(reqwest::header::CONTENT_TYPE, "application/json"),
+                    &attribution,
+                    self.opencode,
+                )
+                .body(body_json.clone()))
             },
             &cancellation,
         )
@@ -501,6 +514,21 @@ impl Provider for OpenAiChatCompletionsProvider {
         )
         .await?;
         conclude_stream(end, protocol, &event_sender).await
+    }
+
+    async fn fetch_usage(&self) -> Result<Option<crate::provider::AccountUsage>> {
+        match self.opencode {
+            Some(gateway) => Ok(Some(
+                crate::provider::opencode::fetch_usage(
+                    &self.client,
+                    format!("{}/usage", self.base_url),
+                    &self.api_key,
+                    gateway,
+                )
+                .await?,
+            )),
+            None => Ok(None),
+        }
     }
 
     fn resolved_effort(&self) -> Option<String> {
@@ -1877,5 +1905,124 @@ mod tests {
             .expect("the tool message");
         assert!(tool_message.get("is_error").is_none(), "{tool_message}");
         assert_eq!(tool_message["content"], "Error: no such file");
+    }
+
+    fn opencode_provider(local: std::net::SocketAddr) -> OpenAiChatCompletionsProvider {
+        OpenAiChatCompletionsProvider::new(
+            "test-key".to_string(),
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::OpenCodeGo,
+                crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                "kimi-k3".to_string(),
+            )
+            .base_url(Some(format!("http://{local}")))
+            .opencode(),
+        )
+        .expect("provider")
+    }
+
+    /// An `opencode-go` completion stamps the conversation's id into `x-opencode-session`; it is
+    /// the one fact that makes the gateway accept the request at all.
+    #[tokio::test]
+    async fn an_opencode_go_completion_carries_the_session_header() {
+        let (local, head_receiver) =
+            crate::provider::opencode::mock_endpoint_capturing_the_head().await;
+        let provider = opencode_provider(local);
+        let session_id = uuid::Uuid::new_v4();
+        // The refusal is the point of the mock, not of the test.
+        if provider
+            .complete(
+                CompletionRequest::new("", &[Message::user("hello")], &[]).attributed(
+                    crate::provider::Attribution {
+                        session_id: Some(session_id),
+                        ..Default::default()
+                    },
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .is_ok()
+        {
+            panic!("a 400 from the endpoint must not read as a completed completion");
+        }
+        let head = head_receiver.await.expect("the mock saw the request");
+        assert!(
+            head.lines()
+                .any(|line| line == format!("x-opencode-session: {session_id}")),
+            "the completion must carry the session; head:\n{head}"
+        );
+        assert!(
+            head.lines()
+                .any(|line| line.starts_with("user-agent: meka/")),
+            "the completion must carry meka's user agent; head:\n{head}"
+        );
+    }
+
+    /// The streaming path stamps the same header; the two request sites must not drift.
+    #[tokio::test]
+    async fn an_opencode_go_stream_carries_the_session_header() {
+        let (local, head_receiver) =
+            crate::provider::opencode::mock_endpoint_capturing_the_head().await;
+        let provider = opencode_provider(local);
+        let session_id = uuid::Uuid::new_v4();
+        let (sender, _receiver) = mpsc::channel(8);
+        if let Ok(()) = provider
+            .stream(
+                CompletionRequest::new("", &[Message::user("hello")], &[]).attributed(
+                    crate::provider::Attribution {
+                        session_id: Some(session_id),
+                        ..Default::default()
+                    },
+                ),
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+        {
+            panic!("a 400 from the endpoint must not read as a completed stream");
+        }
+        let head = head_receiver.await.expect("the mock saw the request");
+        assert!(
+            head.lines()
+                .any(|line| line == format!("x-opencode-session: {session_id}")),
+            "the stream must carry the session; head:\n{head}"
+        );
+    }
+
+    /// The generic backend sends what it always sent: no session header, no meka user agent.
+    #[tokio::test]
+    async fn a_generic_chat_completions_request_carries_neither_gateway_header() {
+        let (local, head_receiver) =
+            crate::provider::opencode::mock_endpoint_capturing_the_head().await;
+        let provider = OpenAiChatCompletionsProvider::new(
+            "test-key".to_string(),
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::OpenAiChatCompletions,
+                crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                "gpt-5.6-sol".to_string(),
+            )
+            .base_url(Some(format!("http://{local}"))),
+        )
+        .expect("provider");
+        let (sender, _receiver) = mpsc::channel(8);
+        if let Ok(()) = provider
+            .stream(
+                CompletionRequest::new("", &[Message::user("hello")], &[]),
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+        {
+            panic!("a 400 from the endpoint must not read as a completed stream");
+        }
+        let head = head_receiver.await.expect("the mock saw the request");
+        assert!(
+            !head.contains("x-opencode-session"),
+            "a generic backend must not name a session; head:\n{head}"
+        );
+        assert!(
+            !head.contains("user-agent: meka/"),
+            "a generic backend must keep its wire identity; head:\n{head}"
+        );
     }
 }
