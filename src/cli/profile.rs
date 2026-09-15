@@ -188,6 +188,11 @@ fn default_model_for(backend: config::Backend) -> &'static str {
         config::Backend::OpenAiChatCompletions
         | config::Backend::OpenAiResponses
         | config::Backend::ChatGptSubscription => "gpt-6-astra",
+        // The current headline model per protocol family, per OpenCode's docs; the user picks any
+        // of the catalog's models on the matching protocol.
+        config::Backend::OpenCodeGo => "kimi-k3",
+        config::Backend::OpenCodeGoResponses => "gpt-5.6-luna",
+        config::Backend::OpenCodeGoMessages => "minimax-m3",
     }
 }
 
@@ -780,6 +785,15 @@ mod tests {
             default_model_for(config::Backend::ChatGptSubscription),
             "gpt-6-astra"
         );
+        assert_eq!(default_model_for(config::Backend::OpenCodeGo), "kimi-k3");
+        assert_eq!(
+            default_model_for(config::Backend::OpenCodeGoResponses),
+            "gpt-5.6-luna"
+        );
+        assert_eq!(
+            default_model_for(config::Backend::OpenCodeGoMessages),
+            "minimax-m3"
+        );
     }
 
     /// A flag the account's backend never sends is refused before anything is asked or written,
@@ -912,8 +926,9 @@ mod tests {
         }
     }
 
-    /// `--cache-control` is read on `anthropic-messages` alone: the OpenAI wires have no
-    /// breakpoint to withhold, and `claude-subscription` pins its own to the captured wire.
+    /// `--cache-control` is read on the two Messages wires alone: the OpenAI wires have no
+    /// breakpoint to withhold, `claude-subscription` pins its own to the captured wire, and
+    /// `opencode-go` speaks Chat Completions.
     #[test]
     fn a_cache_control_flag_is_kept_only_where_it_is_read() {
         for backend in config::Backend::ALL {
@@ -928,7 +943,10 @@ mod tests {
             };
             // Every prompted setting is pinned, so this returns before any prompt: no stdin.
             let resolved = resolve_tuning(flags, backend, "work", None, None);
-            if backend == config::Backend::AnthropicMessages {
+            if matches!(
+                backend,
+                config::Backend::AnthropicMessages | config::Backend::OpenCodeGoMessages
+            ) {
                 assert_eq!(resolved.expect("read").cache_control, Some(false));
             } else {
                 assert!(resolved.is_err(), "{backend} kept a flag it never sends");
@@ -936,8 +954,9 @@ mod tests {
         }
     }
 
-    /// Chat Completions has no declaration to make, so the flag is refused there and kept on the
-    /// four wires that have one.
+    /// Chat Completions has no declaration to make, so the flag is refused on the wires that
+    /// speak it (`openai-chat-completions` and `opencode-go`) and kept on the six left with a
+    /// declaration to make.
     #[test]
     fn a_deferred_tools_flag_is_refused_only_for_chat_completions() {
         for backend in config::Backend::ALL {
@@ -951,7 +970,10 @@ mod tests {
                 ..Default::default()
             };
             let resolved = resolve_tuning(flags, backend, "work", None, None);
-            if backend == config::Backend::OpenAiChatCompletions {
+            if matches!(
+                backend,
+                config::Backend::OpenAiChatCompletions | config::Backend::OpenCodeGo
+            ) {
                 assert!(resolved.is_err(), "{backend} kept a flag it never sends");
             } else {
                 assert_eq!(
