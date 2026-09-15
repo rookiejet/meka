@@ -29,6 +29,15 @@ pub(crate) enum Backend {
     OpenAiChatCompletions,
     /// An OpenAI-compatible Responses endpoint, billed to an API key.
     OpenAiResponses,
+    /// OpenCode Go's subscription gateway over the Chat Completions protocol; every request must
+    /// carry the conversation's id in `x-opencode-session`.
+    OpenCodeGo,
+    /// OpenCode Go's subscription gateway over the Anthropic Messages protocol, for the models
+    /// served there.
+    OpenCodeGoMessages,
+    /// OpenCode Go's subscription gateway over the Responses protocol, for the models served
+    /// there.
+    OpenCodeGoResponses,
 }
 
 /// The context window meka assumes when a profile doesn't state one.

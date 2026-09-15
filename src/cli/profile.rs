@@ -202,6 +202,11 @@ fn default_model_for(backend: config::Backend) -> &'static str {
         config::Backend::OpenAiChatCompletions
         | config::Backend::OpenAiResponses
         | config::Backend::ChatGptSubscription => "gpt-6-astra",
+        // The current headline model per protocol family, per OpenCode's docs; the user picks any
+        // of the catalog's models on the matching protocol.
+        config::Backend::OpenCodeGo => "kimi-k3",
+        config::Backend::OpenCodeGoResponses => "gpt-5.6-luna",
+        config::Backend::OpenCodeGoMessages => "minimax-m3",
     }
 }
 
@@ -1607,6 +1612,15 @@ mod tests {
             default_model_for(config::Backend::ChatGptSubscription),
             "gpt-6-astra"
         );
+        assert_eq!(default_model_for(config::Backend::OpenCodeGo), "kimi-k3");
+        assert_eq!(
+            default_model_for(config::Backend::OpenCodeGoResponses),
+            "gpt-5.6-luna"
+        );
+        assert_eq!(
+            default_model_for(config::Backend::OpenCodeGoMessages),
+            "minimax-m3"
+        );
     }
 
     /// Every thinking flag must be *dropped* on a backend whose requests have no thinking field,
@@ -1693,9 +1707,9 @@ mod tests {
         );
     }
 
-    /// `--cache-control` is dropped on every backend but `anthropic-messages`: the OpenAI wires
-    /// have no breakpoint to withhold, and `claude-subscription` pins its own to the captured
-    /// wire.
+    /// `--cache-control` is dropped on every backend that cannot move a breakpoint: the OpenAI
+    /// wires have none to withhold, `claude-subscription` pins its own to the captured wire, and
+    /// `opencode-go` speaks Chat Completions. The two Messages providers keep the flag.
     #[test]
     fn a_cache_control_flag_aimed_at_a_backend_that_never_reads_it_is_dropped() {
         let flags = || ProfileTuning {
@@ -1711,6 +1725,9 @@ mod tests {
             (config::Backend::OpenAiChatCompletions, None),
             (config::Backend::OpenAiResponses, None),
             (config::Backend::ChatGptSubscription, None),
+            (config::Backend::OpenCodeGo, None),
+            (config::Backend::OpenCodeGoMessages, Some(false)),
+            (config::Backend::OpenCodeGoResponses, None),
         ] {
             // Every prompted setting is pinned, so this returns before any prompt: no stdin.
             let tuning = resolve_tuning(flags(), backend, "work", None, None).expect("resolve");
@@ -1718,8 +1735,9 @@ mod tests {
         }
     }
 
-    /// Chat Completions has no declaration to make, so the flag is dropped there and kept on the
-    /// four wires that have one.
+    /// Chat Completions has no declaration to make, so the flag is dropped on the wires that speak
+    /// it (`openai-chat-completions` and `opencode-go`) and kept on the ones left with a
+    /// declaration to make.
     #[test]
     fn a_deferred_tools_flag_is_dropped_only_for_chat_completions() {
         let flags = || ProfileTuning {
@@ -1731,8 +1749,11 @@ mod tests {
         };
         for backend in config::Backend::ALL {
             let tuning = resolve_tuning(flags(), backend, "work", None, None).expect("resolve");
-            let kept = (backend != config::Backend::OpenAiChatCompletions)
-                .then_some(config::DeferredTools::Native);
+            let kept = (!matches!(
+                backend,
+                config::Backend::OpenAiChatCompletions | config::Backend::OpenCodeGo
+            ))
+            .then_some(config::DeferredTools::Native);
             assert_eq!(tuning.deferred_tools, kept, "{backend}");
         }
     }

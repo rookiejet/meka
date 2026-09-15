@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Three `opencode-go` backends, one per protocol, for OpenCode Go's subscription.
+- OpenCode Go requests carry the required `x-opencode-session` header per conversation.
+- `meka account usage` reports an OpenCode Go subscription's dollar-budget windows.
+
 ### Changed
 
 - Inline memory bodies share a 32 KiB budget, `[memory] inline_max_bytes`; it was 4 KiB and fixed.
@@ -39,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - RUSTSEC-2026-0382 and 0383: `rustls-webpki` moves to 0.103.16 and `webpki-root-certs` to 1.0.10.
+||||||| parent of 1607976 (feat: support OpenCode Go, its session header and usage endpoint)
 
 ## [0.82.0] - 2026-10-19
 
