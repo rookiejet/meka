@@ -16,6 +16,8 @@ mod budget;
 #[cfg(any(debug_assertions, feature = "mock-provider"))]
 pub(crate) mod mock;
 pub(crate) mod openai;
+/// The OpenCode Go gateway: the session header its endpoints require, and its usage endpoint.
+pub(crate) mod opencode;
 /// Backoff policy for retrying [`crate::error::MekaError::RetryableProvider`] failures.
 pub(crate) mod retry;
 pub(crate) mod sse;
@@ -74,6 +76,8 @@ pub(crate) const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 pub(crate) const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 /// See [`DEFAULT_ANTHROPIC_BASE_URL`].
 pub(crate) const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com";
+/// See [`DEFAULT_ANTHROPIC_BASE_URL`].
+pub(crate) const DEFAULT_OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 
 /// The default endpoint for `backend`.
 pub(crate) fn default_base_url(backend: Backend) -> &'static str {
@@ -81,6 +85,9 @@ pub(crate) fn default_base_url(backend: Backend) -> &'static str {
         Backend::AnthropicMessages | Backend::ClaudeSubscription => DEFAULT_ANTHROPIC_BASE_URL,
         Backend::OpenAiChatCompletions | Backend::OpenAiResponses => DEFAULT_OPENAI_BASE_URL,
         Backend::ChatGptSubscription => DEFAULT_CHATGPT_BASE_URL,
+        Backend::OpenCodeGo | Backend::OpenCodeGoResponses | Backend::OpenCodeGoMessages => {
+            DEFAULT_OPENCODE_GO_BASE_URL
+        }
     }
 }
 
@@ -2911,6 +2918,67 @@ mod tests {
         )
         .build();
         assert!(result.is_err());
+    }
+
+    /// All three OpenCode Go backends bill an API key, never an OAuth bundle.
+    #[test]
+    fn every_opencode_go_backend_refuses_an_oauth_token() {
+        for backend in [
+            Backend::OpenCodeGo,
+            Backend::OpenCodeGoResponses,
+            Backend::OpenCodeGoMessages,
+        ] {
+            let result = ProviderBuilder::new(
+                backend,
+                AuthCredential::OAuthToken {
+                    access_token: "ey...".to_string(),
+                    refresh_token: None,
+                    expires_at: None,
+                    account_id: None,
+                },
+                "some-model",
+            )
+            .build();
+            assert!(result.is_err(), "{backend} must refuse an OAuth token");
+        }
+    }
+
+    /// A profile named on an OpenCode Go account builds a provider that carries the gateway facts,
+    /// and an account that names no `base_url` lands on the gateway's own endpoint rather than the
+    /// shared wire provider's vendor default: pressing Enter at `account add`'s URL prompt must
+    /// reach the gateway the prompt showed. A `base_url` the account named is kept as named.
+    #[test]
+    fn an_opencode_go_account_builds_a_gateway_provider() {
+        for backend in [
+            Backend::OpenCodeGo,
+            Backend::OpenCodeGoResponses,
+            Backend::OpenCodeGoMessages,
+        ] {
+            let defaulted = ProviderBuilder::new(
+                backend,
+                AuthCredential::ApiKey("sk-...".to_string()),
+                "some-model",
+            )
+            .opencode();
+            assert_eq!(
+                defaulted.base_url.as_deref(),
+                Some(DEFAULT_OPENCODE_GO_BASE_URL),
+                "{backend} with no base_url lands on the gateway"
+            );
+            defaulted.build().expect("an API key must build");
+            let named = ProviderBuilder::new(
+                backend,
+                AuthCredential::ApiKey("sk-...".to_string()),
+                "some-model",
+            )
+            .base_url(Some("http://127.0.0.1:9/".to_string()))
+            .opencode();
+            assert_eq!(
+                named.base_url.as_deref(),
+                Some("http://127.0.0.1:9/"),
+                "{backend} keeps the base_url the account named"
+            );
+        }
     }
 
     fn now_ms_in_far_future() -> i64 {

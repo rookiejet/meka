@@ -25,6 +25,7 @@ A general-purpose AI agent harness.
 - **OpenAI Chat Completions**: the industry standard. Supported by almost every provider.
 - **OpenAI Responses**: OpenAI's agent-oriented interface, recommended for new projects.
 - **Claude subscription** / **ChatGPT subscription**: sign in with your subscription plan.
+- **OpenCode Go**: OpenCode's subscription, over all three protocols.
 
 ## Interfaces
 

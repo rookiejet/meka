@@ -45,6 +45,8 @@ pub(crate) struct ProviderBuilder {
     pub(super) stream_usage: bool,
     /// The longest tool name the endpoint takes; the backend's own when the account states none.
     max_tool_name_bytes: Option<usize>,
+    /// The OpenCode Go gateway facts, set for the three `opencode-go` backends only.
+    pub(super) opencode: Option<opencode::Gateway>,
 }
 impl ProviderBuilder {
     pub(crate) fn new(
@@ -79,6 +81,7 @@ impl ProviderBuilder {
             prompt_cache_key: true,
             stream_usage: true,
             max_tool_name_bytes: None,
+            opencode: None,
         }
     }
 
@@ -231,6 +234,21 @@ impl ProviderBuilder {
         self
     }
 
+    /// Say the provider is an OpenCode Go gateway client: every request carries the conversation's
+    /// id in `x-opencode-session` and Meka's user agent, and an account that names no `base_url`
+    /// lands on the gateway's own endpoint. The shared wire providers fall back to their vendor's
+    /// URL — right for the backend they are named for, wrong for a gateway riding the same wire —
+    /// so the default comes from [`crate::provider::default_base_url`], the same answer the
+    /// `account add` prompt shows for an empty one. Consumed by the three `opencode-go` backends;
+    /// every other backend ignores it.
+    pub(crate) fn opencode(mut self) -> Self {
+        self.opencode = Some(opencode::Gateway::GO);
+        if self.base_url.is_none() {
+            self.base_url = Some(crate::provider::default_base_url(self.backend).to_string());
+        }
+        self
+    }
+
     /// The row a subscription backend writes refreshed tokens to.
     ///
     /// No default in its place: the registry is the one authority on which row a profile's
@@ -326,6 +344,54 @@ impl ProviderBuilder {
                     ));
                 }
                 Ok(Arc::new(ChatGptSubscriptionProvider::from_settings(self)?))
+            }
+            Backend::OpenCodeGo => {
+                let api_key = match &self.credential {
+                    AuthCredential::ApiKey(key) => key.clone(),
+                    AuthCredential::OAuthToken { .. } => {
+                        return Err(MekaError::Config(
+                            "backend 'opencode-go' takes an API key, not an OAuth token; \
+                             'chatgpt-subscription' bills a subscription"
+                                .to_string(),
+                        ));
+                    }
+                };
+                Ok(Arc::new(OpenAiChatCompletionsProvider::from_settings(
+                    api_key,
+                    self.opencode(),
+                )?))
+            }
+            Backend::OpenCodeGoResponses => {
+                let api_key = match &self.credential {
+                    AuthCredential::ApiKey(key) => key.clone(),
+                    AuthCredential::OAuthToken { .. } => {
+                        return Err(MekaError::Config(
+                            "backend 'opencode-go-responses' takes an API key, not an OAuth \
+                             token; 'chatgpt-subscription' bills a subscription"
+                                .to_string(),
+                        ));
+                    }
+                };
+                Ok(Arc::new(OpenAiResponsesProvider::from_settings(
+                    api_key,
+                    self.opencode(),
+                )?))
+            }
+            Backend::OpenCodeGoMessages => {
+                let api_key = match &self.credential {
+                    AuthCredential::ApiKey(key) => key.clone(),
+                    AuthCredential::OAuthToken { .. } => {
+                        return Err(MekaError::Config(
+                            "backend 'opencode-go-messages' takes an API key, not an OAuth \
+                             token; 'claude-subscription' bills a subscription"
+                                .to_string(),
+                        ));
+                    }
+                };
+                Ok(Arc::new(AnthropicMessagesProvider::from_settings(
+                    api_key,
+                    self.opencode(),
+                )?))
             }
         }
     }

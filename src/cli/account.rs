@@ -529,7 +529,7 @@ pub(super) fn prompt_line(prompt: &str) -> io::Result<String> {
 /// still speaks. The menu entries, in the order they are offered. Separate from [`prompt_backend`]
 /// so a test can check it against [`config::Backend::ALL`]: this is the last hand-written backend
 /// list, and a backend missing from it is simply never offered interactively, with nothing failing.
-fn backend_menu() -> [(config::Backend, &'static str); 5] {
+fn backend_menu() -> [(config::Backend, &'static str); 8] {
     [
         (
             config::Backend::ClaudeSubscription,
@@ -550,6 +550,18 @@ fn backend_menu() -> [(config::Backend, &'static str); 5] {
         (
             config::Backend::OpenAiResponses,
             "OpenAI-compatible Responses API key",
+        ),
+        (
+            config::Backend::OpenCodeGo,
+            "OpenCode Go Chat Completions API key",
+        ),
+        (
+            config::Backend::OpenCodeGoResponses,
+            "OpenCode Go Responses API key",
+        ),
+        (
+            config::Backend::OpenCodeGoMessages,
+            "OpenCode Go Anthropic Messages API key",
         ),
     ]
 }
@@ -1009,10 +1021,10 @@ mod tests {
         assert_eq!(status.expires_at, None);
     }
 
-    /// A setting the backend never reads, `--interleaved-thinking` on any backend but
-    /// `anthropic-messages` and an OAuth override on an API-key backend, would be written and
-    /// never read, so `add` refuses it ahead of the key prompt, in the words the door refuses it
-    /// with over HTTP.
+    /// A setting the backend never reads, `--interleaved-thinking` on any backend but the
+    /// Messages providers (`anthropic-messages` and `opencode-go-messages`) and an OAuth override
+    /// on an API-key backend, would be written and never read, so `add` refuses it ahead of the
+    /// key prompt, in the words the door refuses it with over HTTP.
     #[tokio::test]
     async fn add_refuses_a_setting_the_backend_never_reads_ahead_of_the_prompts() {
         let dir = tempfile::tempdir().expect("tempdir");
