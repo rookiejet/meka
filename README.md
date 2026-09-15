@@ -28,6 +28,7 @@ A general-purpose AI agent harness.
 - **OpenAI Chat Completions**: the industry standard. Supported by almost every provider.
 - **OpenAI Responses**: OpenAI's agent-oriented interface, recommended for new projects.
 - **Claude subscription** / **ChatGPT subscription**: sign in with your subscription plan.
+- **OpenCode Go**: OpenCode's subscription, over all three protocols.
 
 ## Interfaces
 
@@ -60,7 +61,7 @@ meka account add anthropic --backend claude-subscription
 meka profile add work --account anthropic --model claude-opus-5-5
 ```
 
-An account is a backend, an endpoint and a login. The backend is either a wire protocol (`anthropic-messages`, `openai-chat-completions`, `openai-responses`) or a subscription (`claude-subscription`, `chatgpt-subscription`). A profile is an account plus a model, so one login can serve several models. Add several and switch with `meka profile use <name>` or `--profile <name>`. For an OpenAI-compatible endpoint like OpenRouter, set `--base-url` on the account:
+An account is a backend, an endpoint and a login. The backend is either a wire protocol (`anthropic-messages`, `openai-chat-completions`, `openai-responses`) or a product whose endpoint is fixed (`claude-subscription` and `chatgpt-subscription`, which sign in with your subscription; `opencode-go`, `opencode-go-responses` and `opencode-go-messages`, which take an API key). A profile is an account plus a model, so one login can serve several models. Add several and switch with `meka profile use <name>` or `--profile <name>`. For an OpenAI-compatible endpoint like OpenRouter, set `--base-url` on the account:
 
 ```bash
 meka account add openrouter --backend openai-chat-completions --base-url https://openrouter.ai/api/v1

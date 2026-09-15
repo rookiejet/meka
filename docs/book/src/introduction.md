@@ -22,7 +22,7 @@ The same agent core is exposed through four front-ends:
 ## What the harness provides
 
 - **Built-in tools**: file read/write/edit, glob search, regex content search (ripgrep), web fetch and shell command execution
-- **Pluggable backends**: `anthropic-messages`, `claude-subscription`, `openai-chat-completions`, `openai-responses`, `chatgpt-subscription`, and any endpoint serving one of those protocols
+- **Pluggable backends**: `anthropic-messages`, `claude-subscription`, `openai-chat-completions`, `openai-responses`, `chatgpt-subscription`, the three `opencode-go` backends, and any endpoint serving one of those protocols
 - **MCP support**: extend the agent with tools, resources, and prompts from external MCP servers
 - **Permission model**: control what the agent can do (none/read/workspace/unrestricted), switchable mid-session
 - **Sessions**: conversations persisted in SQLite; resume, export, or compact any session
