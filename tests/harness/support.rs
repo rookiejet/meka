@@ -25,6 +25,25 @@ pub(crate) fn meka() -> Command {
     Command::new(env!("CARGO_BIN_EXE_meka"))
 }
 
+/// Whether this host has a sandbox a scripted command can run under at `read`.
+///
+/// A harness that scripts a command at `read` needs one, and none of them can supply it on FreeBSD:
+/// the confinement is a socket only root can own, under a chain only root can write, which no test
+/// process can arrange. Callers skip with a reason rather than weakening the level they assert.
+pub(crate) fn a_read_level_sandbox_is_available() -> bool {
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    )) {
+        return true;
+    }
+    // Said out loud, like every other skip in this suite: a test that quietly returns reads as one
+    // that passed, and this one never ran.
+    eprintln!("skipping: no `read`-level sandbox this harness can supply");
+    false
+}
+
 /// An isolated config and data directory pair under one tempdir, plus the environment that points
 /// a `meka` process at them and at the scripted mock provider.
 ///

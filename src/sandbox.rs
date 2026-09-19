@@ -9,17 +9,22 @@
 //! `read` spawns the child with a duplicated primary token dropped to Low integrity via
 //! `SetTokenInformation(TokenIntegrityLevel, …)`, which blocks writes to anything outside the
 //! documented Low-integrity surface, while `workspace` uses a `WRITE_RESTRICTED` token plus a
-//! per-root capability ACE and deliberately leaves the integrity label alone. Where no backend is
-//! usable, sandboxing is unavailable and shell execution at `read` hard-errors rather than running
-//! unconfined.
+//! per-root capability ACE and deliberately leaves the integrity label alone. On FreeBSD the
+//! confinement is a jail built by `jailbrokerd`, a privileged daemon reached over a Unix socket
+//! (see `jailbroker`, which is FreeBSD-only and so deliberately not an intra-doc link); meka spawns
+//! nothing itself, and a command at `read` or `workspace` runs only while that daemon is listening.
 //!
 //! **What every backend does not restrict**: reads. A sandboxed child can read any file the user
 //! can, including credential files, and the network is deliberately left open on all of them. The
 //! boundary these enforce is "this command cannot change the machine", not "this command cannot see
-//! or send anything".
+//! or send anything". FreeBSD is the one exception to the first half, and it is the broker's
+//! doing rather than a stronger claim here: a jailed command sees the base the operator's prefix
+//! policy admits rather than the whole host.
 
 #[cfg(target_os = "linux")]
 mod bubblewrap;
+#[cfg(target_os = "freebsd")]
+pub(crate) mod jailbroker;
 #[cfg(target_os = "linux")]
 mod landlock;
 pub(crate) mod seatbelt;
@@ -97,12 +102,31 @@ impl Confinement {
     }
 
     /// The roots this call may write beneath. Empty for every state but [`Self::Workspace`].
+    ///
+    /// Every platform sandbox spawn path reads this, and each turns it into that backend's own
+    /// spelling of a writable root: a `bwrap` bind, a Landlock rule, a Seatbelt subpath, a Windows
+    /// ACE, or the writable roots of a jailbroker plan.
     pub(crate) fn writable(&self) -> &[std::path::PathBuf] {
         match self {
             Self::Workspace(roots) => roots,
             _ => &[],
         }
     }
+}
+
+/// Whether `path` is a directory only root can write to.
+///
+/// The test both the bubblewrap binary check and the jailbroker socket check are built on.
+/// Group- and other-writable are both disqualifying: a directory writable by any group the user is
+/// in is writable by the user.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub(crate) fn only_root_can_write(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    metadata.uid() == 0 && metadata.permissions().mode() & 0o022 == 0
 }
 
 /// Hand back any standing OS-level grant this process placed, before an exit that will not unwind.
@@ -139,6 +163,7 @@ pub(crate) struct SandboxResolution {
 pub(crate) fn resolve_backend(
     configured: Option<crate::config::SandboxBackend>,
     enabled: bool,
+    jailbroker_socket: &std::path::Path,
 ) -> SandboxResolution {
     if !enabled {
         return SandboxResolution {
@@ -149,7 +174,7 @@ pub(crate) fn resolve_backend(
             },
         };
     }
-    let (backend, auto_resolved, probe) = resolve_sandbox_backend(configured);
+    let (backend, auto_resolved, probe) = resolve_sandbox_backend(configured, jailbroker_socket);
     SandboxResolution {
         backend,
         auto_resolved,
@@ -169,6 +194,7 @@ pub(crate) fn resolve_backend(
 #[cfg(target_os = "linux")]
 pub(crate) fn resolve_sandbox_backend(
     configured: Option<SandboxBackend>,
+    _jailbroker_socket: &std::path::Path,
 ) -> (SandboxBackend, bool, BackendProbe) {
     // Probe Bubblewrap only when its result is load-bearing for the resolution: either the user
     // pinned it explicitly, or no value was configured (so the probe decides whether to auto-pick
@@ -192,16 +218,36 @@ pub(crate) fn resolve_sandbox_backend(
         (SandboxBackend::Bubblewrap, Some(probe)) => probe,
         (SandboxBackend::Bubblewrap, None) => probe_backend(SandboxBackend::Bubblewrap),
         (SandboxBackend::Landlock, _) => probe_backend(SandboxBackend::Landlock),
+        (SandboxBackend::Jailbroker, _) => probe_backend(SandboxBackend::Jailbroker),
     };
     (backend, auto_resolved, backend_probe)
 }
-/// Non-Linux platforms have a single platform-native sandbox (`sandbox-exec` on macOS,
-/// Low-integrity on Windows, nothing elsewhere). `[shell].sandbox_backend` is documented as
-/// Linux-only and is ignored here: the resolved capability comes from [`detect`] and is surfaced
-/// through the same `BackendProbe::Ok` envelope so the downstream wiring needs no platform branch.
-#[cfg(not(target_os = "linux"))]
+/// FreeBSD has a single platform-native sandbox too, and it is not in this process at all: the
+/// confinement is a jail `jailbrokerd` builds, so "what can this machine do" is decided by whether
+/// the socket it listens on is there and trustworthy rather than by anything meka can probe on its
+/// own. `[shell].sandbox_backend` is documented as Linux-only and is ignored here, as it is on the
+/// other single-backend platforms.
+#[cfg(target_os = "freebsd")]
 pub(crate) fn resolve_sandbox_backend(
     _configured: Option<SandboxBackend>,
+    jailbroker_socket: &std::path::Path,
+) -> (SandboxBackend, bool, BackendProbe) {
+    // The backend is the platform's, so it is reported as itself rather than as a Linux name: what
+    // a message or a log says the shell was confined by should be what confined it.
+    (
+        SandboxBackend::Jailbroker,
+        true,
+        jailbroker::probe(jailbroker_socket),
+    )
+}
+/// Non-Linux, non-FreeBSD platforms have a single platform-native sandbox (`sandbox-exec` on
+/// macOS, Low-integrity on Windows, nothing elsewhere). `[shell].sandbox_backend` is documented as
+/// Linux-only and is ignored here: the resolved capability comes from [`detect`] and is surfaced
+/// through the same `BackendProbe::Ok` envelope so the downstream wiring needs no platform branch.
+#[cfg(all(not(target_os = "linux"), not(target_os = "freebsd")))]
+pub(crate) fn resolve_sandbox_backend(
+    _configured: Option<SandboxBackend>,
+    _jailbroker_socket: &std::path::Path,
 ) -> (SandboxBackend, bool, BackendProbe) {
     let probe = match detect() {
         SandboxCapability::Unavailable => BackendProbe::Missing {
@@ -239,6 +285,23 @@ pub(crate) enum SandboxCapability {
     /// launchd, pasteboard, LaunchServices, etc.); network is unrestricted.
     #[cfg(target_os = "macos")]
     SandboxExec,
+    /// FreeBSD: a jail built by `jailbrokerd`, whose Unix socket is the `socket` here. meka spawns
+    /// nothing; it sends the plan and reads the events (see [`jailbroker`]). What that buys over
+    /// the other backends is on the operator's side: the base is the host as their prefix policy
+    /// admits it, the writable roots are named paths, and the command runs as the caller's uid in a
+    /// jail of its own. The network is not restricted, and neither is what the base admits: reads
+    /// inside the jail are bounded by the mount set rather than by this process's own rules.
+    #[cfg(target_os = "freebsd")]
+    Jailbroker {
+        /// The socket the daemon listens on, already checked to be one only root could have put
+        /// there.
+        socket: std::path::PathBuf,
+        /// The prefixes the daemon's policy grants for writing, as its probe reported them. Empty
+        /// means every `workspace` command is refused, which is said once at startup rather than
+        /// left to the first one; the paths are also what a caller needs to name a root the policy
+        /// will admit.
+        writable_prefixes: Vec<std::path::PathBuf>,
+    },
     /// Windows: child runs with a duplicated primary token dropped to Low integrity. Blocks writes
     /// outside the Low-integrity surface (user home, AppData, Program Files); IPC mutation is
     /// constrained but not as tightly as Linux/macOS.
@@ -252,7 +315,23 @@ pub(crate) enum SandboxCapability {
 /// Result of probing a specific sandbox backend at config-resolution time. The probe is run once
 /// per meka launch (twice when the resolver needs to consider both Landlock and Bubblewrap for
 /// auto-pick) and cached on `ResolvedConfig.backend_probe`.
+///
+/// A platform with no sandbox backend at all never reports a capability: its resolver answers
+/// [`BackendProbe::Missing`] unconditionally, so `Ok` is unconstructed there. Which platforms
+/// those are is the resolver's business (`resolve_sandbox_backend`), not a fixed list.
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "freebsd"
+    )),
+    allow(
+        dead_code,
+        reason = "no probe outcome carries a capability on this platform"
+    )
+)]
 pub(crate) enum BackendProbe {
     Ok(SandboxCapability),
     /// The backend's prerequisite is missing: `bwrap` isn't on `$PATH`, the Landlock kernel ABI
@@ -283,15 +362,15 @@ pub(crate) enum BackendProbe {
 /// Snapshot of the sandbox-relevant config slice. Carried by components that need to emit the
 /// sandbox warns (`warn_if_sandbox_issues`) without depending on the whole `ResolvedConfig`.
 ///
-/// The fields are read only on Linux (`warn_if_sandbox_issues` early-returns on other platforms
-/// because the warnings reference Linux-only config keys), but the struct is constructed
-/// unconditionally so the hosts need no platform branch.
+/// The fields are read only where a warning names a backend or a probe (Linux), but the struct is
+/// constructed unconditionally so the hosts need no platform branch. FreeBSD reads `enabled` and
+/// `probe` and not the two the Linux nudges are built from.
 #[derive(Clone)]
 #[cfg_attr(
     not(target_os = "linux"),
     allow(
         dead_code,
-        reason = "the fields are read only on the Linux warning path"
+        reason = "the fields are read only on the Linux warning path, and partly on FreeBSD's"
     )
 )]
 pub(crate) struct SandboxState {
@@ -346,10 +425,43 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
     // `sandbox_backend` is a Linux-only config knob; the warnings below name it directly and would
     // be misleading on macOS / Windows where the platform has a single fixed backend. On those
     // hosts an unusable platform sandbox is a near-impossible configuration and surfaces at use
-    // time via the hard-error path in `src/tools/shell.rs` anyway.
-    #[cfg(target_os = "macos")]
+    // time via the hard-error path in `src/tools/shell.rs` anyway. A platform with no backend at
+    // all has nothing to reconfigure either: the level itself is the notice.
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (state, context);
+    }
+
+    // FreeBSD: `jailbrokerd` is the only thing that can confine a command, so a socket that is not
+    // there, not trusted, or not answering leaves `read` and `workspace` without a shell. Named at
+    // every boundary for the same reason Linux names its unavailable backend at every boundary: the
+    // user needs to know now rather than on the first refused command.
+    #[cfg(target_os = "freebsd")]
+    if state.enabled
+        && let Some(reason) = backend_unavailable_reason(&state.probe)
+    {
+        tracing::warn!(
+            "no usable `read` sandbox ({reason}); shell commands at `read` and `workspace` fail \
+             until a jailbroker is listening"
+        );
+    }
+
+    // FreeBSD: the daemon is there and trusted, so `read` works. Whether `workspace` can is a
+    // separate fact it reports, and one worth naming at startup: a policy that grants no writable
+    // path refuses every `workspace` shell, which otherwise surfaces as a refusal at the first
+    // command.
+    #[cfg(target_os = "freebsd")]
+    if context == WarnContext::Startup
+        && state.enabled
+        && let BackendProbe::Ok(SandboxCapability::Jailbroker {
+            writable_prefixes, ..
+        }) = &state.probe
+        && writable_prefixes.is_empty()
+    {
+        tracing::warn!(
+            "the jailbroker's policy grants no path for writing, so shell commands at `workspace` \
+             are refused until its configuration names one"
+        );
     }
 
     // Integrity levels stop a Low-integrity process writing up, not reading up, so the one
@@ -453,13 +565,20 @@ pub(crate) fn probe_backend(backend: crate::config::SandboxBackend) -> BackendPr
     match backend {
         crate::config::SandboxBackend::Landlock => probe_landlock(),
         crate::config::SandboxBackend::Bubblewrap => probe_bubblewrap(),
+        // FreeBSD's backend has no probe on this platform: the daemon it would ask is not here, and
+        // nothing on Linux resolves to it. The arm exists because the variant is not
+        // Linux-specific, and a listing built on this platform has to answer for every
+        // backend it can name.
+        crate::config::SandboxBackend::Jailbroker => BackendProbe::Missing {
+            reason: "the jailbroker backend belongs to FreeBSD".to_string(),
+        },
     }
 }
 
 /// Test-only "what's the strongest sandbox available right now?" entry point. Production code
 /// takes the backend `ResolvedConfig` settled from `[shell].sandbox_backend`, `--sandbox-backend`
 /// and `MEKA_SANDBOX_BACKEND`; tests reach for whatever capability the host happens to support.
-#[cfg(any(test, not(target_os = "linux")))]
+#[cfg(any(test, not(any(target_os = "linux", target_os = "freebsd"))))]
 pub(crate) fn detect() -> SandboxCapability {
     #[cfg(target_os = "linux")]
     {
@@ -476,6 +595,17 @@ pub(crate) fn detect() -> SandboxCapability {
     {
         if std::path::Path::new("/usr/bin/sandbox-exec").exists() {
             return SandboxCapability::SandboxExec;
+        }
+    }
+
+    #[cfg(target_os = "freebsd")]
+    {
+        // The default socket rather than the configured one: this entry point takes no config, and
+        // a test or a developer asking "what can this host do" means the host as it stands.
+        if let BackendProbe::Ok(capability) = jailbroker::probe(std::path::Path::new(
+            crate::config::DEFAULT_JAILBROKER_SOCKET,
+        )) {
+            return capability;
         }
     }
 
@@ -1312,7 +1442,10 @@ mod tests {
     #[test]
     fn detect_sandbox_capability() {
         let capability = detect();
-        // Should detect something on Linux/macOS/Windows, Unavailable on others
+        // `detect` answers with whatever this host can do, so the only claim worth asserting is
+        // that the answer is one this build can hold: `Unavailable` is the one every platform may
+        // give. The match is exhaustive by construction, so a variant with no arm here is a
+        // compile error on the platform that has it.
         match capability {
             #[cfg(target_os = "linux")]
             SandboxCapability::Landlock { abi_version } => {
@@ -1324,6 +1457,8 @@ mod tests {
             SandboxCapability::SandboxExec => {}
             #[cfg(target_os = "windows")]
             SandboxCapability::LowIntegrity => {}
+            #[cfg(target_os = "freebsd")]
+            SandboxCapability::Jailbroker { .. } => {}
             SandboxCapability::Unavailable => {}
         }
     }

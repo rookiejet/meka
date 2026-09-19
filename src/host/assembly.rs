@@ -167,7 +167,11 @@ pub(crate) async fn build_shared_deps(
 
     // Detection, not configuration: which backend this machine can run is probed once here, and
     // the startup warning about an unusable or improvable sandbox is given from the same answer.
-    let sandbox = crate::sandbox::resolve_backend(config.sandbox_backend, config.sandbox);
+    let sandbox = crate::sandbox::resolve_backend(
+        config.sandbox_backend,
+        config.sandbox,
+        &config.jailbroker_socket,
+    );
     crate::sandbox::warn_if_sandbox_issues(
         &crate::sandbox::SandboxState::new(config.sandbox, &sandbox),
         crate::sandbox::WarnContext::Startup,

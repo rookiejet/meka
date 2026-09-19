@@ -795,6 +795,14 @@ fn the_resume_banner_can_be_hidden() {
 /// would put a blank there that nobody chose.
 #[test]
 fn the_shutdown_notice_reads_as_one_block_with_the_exit_banner() {
+    // The scripted command runs at `read`, which needs a sandbox behind it. This harness supplies
+    // none: it drives a whole meka in a temporary install, and on FreeBSD the sandbox is a socket
+    // only root can own, which no test process can arrange. Skipped rather than weakened to a level
+    // the shell is offered at, because the level is not what this assertion is about.
+    if !support::a_read_level_sandbox_is_available() {
+        return;
+    }
+
     let install = repl_install_with_extra(true, true, "", "\n[background]\nenabled = true\n");
     let script = r#"[
         [
@@ -1343,6 +1351,13 @@ fn a_resumed_session_replays_the_reasoning_it_recorded() {
 /// catching it needs an assertion about drawing rather than about the conversation.
 #[test]
 fn a_canceled_task_rides_the_next_prompt_in_the_repl() {
+    // Same caveat as `the_shutdown_notice_reads_as_one_block_with_the_exit_banner`: the background
+    // command is scripted at `read`, and a host without a sandbox refuses it there, which leaves
+    // the cancellation nothing to carry.
+    if !support::a_read_level_sandbox_is_available() {
+        return;
+    }
+
     let install = repl_install_with_extra(
         true,
         true,

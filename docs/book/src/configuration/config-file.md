@@ -923,11 +923,12 @@ Default: `true`
 sandbox = false  # disable the sandboxed shell at read
 ```
 
-The sandbox uses one of two backends on Linux (see [`shell.sandbox_backend`](#shellsandbox_backend)), `sandbox-exec` on macOS, and a duplicated Low-integrity primary token on Windows. On platforms where no backend is usable, shell commands always require `unrestricted` regardless of this setting.
+The sandbox uses one of two backends on Linux (see [`shell.sandbox_backend`](#shellsandbox_backend)), `sandbox-exec` on macOS, a duplicated Low-integrity primary token on Windows, and a jail built by the `jailbrokerd` you run on FreeBSD (see [`shell.jailbroker_socket`](#shelljailbroker_socket)). Where no backend is usable, shell commands always require `unrestricted` regardless of this setting.
 
 ### `shell.sandbox_backend`
 
-Linux-only choice between `"landlock"` and `"bubblewrap"`:
+Linux-only choice between `"landlock"` and `"bubblewrap"` (FreeBSD's backend is the platform's own
+`jailbroker` and is not settable):
 
 - **Bubblewrap** (`"bubblewrap"`) wraps the command in `bwrap` with read-only bind of `/`, tmpfs masks over `/run` / `/tmp` / `/var/tmp` / `$XDG_RUNTIME_DIR`, and `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks hide the dbus session bus and the systemd-user socket, so state-changing IPC calls like `systemctl --user start` and `dbus-send` fail. Network is intentionally not unshared so `curl http://x | pdftotext` still works. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
 - **Landlock** (`"landlock"`) uses the Landlock LSM to block filesystem writes, and requires **ABI v3 (kernel 6.2+)**: below that `truncate(2)` is unmediated, so a command at `read` could still empty a file, and meka reports the backend unusable instead. On kernel 7.1+ (ABI v9) it also blocks `connect()` to Unix sockets on disk, closing the dbus / systemd-user route out of the sandbox at the cost of socket-based clients like `docker` and `psql`. Between v3 and v9 that right does not exist, so a sandboxed shell can still invoke state-mutating dbus methods; meka warns at startup naming what the running ABI lacks. Kept as the lighter-weight fallback for hosts without Bubblewrap.
@@ -939,12 +940,32 @@ If the configured backend can't be used at runtime (bwrap not installed, user na
 Overridable for one run with `meka --sandbox-backend landlock|bubblewrap`, and for a whole
 environment with `MEKA_SANDBOX_BACKEND`. Precedence is flag, then environment, then this field.
 
-Default: unset (auto-detect). Ignored on macOS and Windows.
+Default: unset (auto-detect). Ignored on macOS, Windows and FreeBSD.
 
 ```toml
 [shell]
 sandbox = true
 sandbox_backend = "bubblewrap"  # or "landlock"
+```
+
+### `shell.jailbroker_socket`
+
+FreeBSD only, and in effect the address of the backend: the file system confinement there is a jail
+that `jailbrokerd` builds on meka's behalf, and this is the Unix socket meka sends its plans to. The
+daemon's own configuration owns that path; this key is how meka is told where it is.
+
+meka probes it once at startup, and it is the probe that decides whether `read` has a shell at all:
+a socket that is not there, not owned by root, or not under a directory chain only root can write is
+refused, and a daemon that does not answer its version's handshake is refused as well. A refused
+socket leaves `shell_execute` at `unrestricted` alone, with the reason reported in the error.
+
+Ignored on every other platform.
+
+Default: `/var/run/jailbroker.sock`.
+
+```toml
+[shell]
+jailbroker_socket = "/var/run/jailbroker.sock"
 ```
 
 ## `[tools]`: built-in tool filters

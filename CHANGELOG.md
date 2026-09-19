@@ -9,9 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- FreeBSD: `shell_execute` at `read` and `workspace` runs in a jail `jailbrokerd` builds.
+- `[shell].jailbroker_socket` names the socket that daemon listens on.
 - Three `opencode-go` backends, one per protocol, for OpenCode Go's subscription.
 - OpenCode Go requests carry the required `x-opencode-session` header per conversation.
 - `meka account usage` reports an OpenCode Go subscription's dollar-budget windows.
+
+### Fixed
+
+- Builds on FreeBSD.
 
 ## [0.61.0] - 2026-09-19
 

@@ -33,19 +33,6 @@ pub(super) enum SmokeResult {
     UserNamespaceDenied { stderr: String },
     OtherFailure { reason: String },
 }
-/// Whether `path` is a directory only root can write to.
-///
-/// The test that decides whether a `bwrap` found there can be trusted. Group- and other-writable
-/// are both disqualifying: a directory writable by any group the user is in is writable by the
-/// user.
-pub(super) fn only_root_can_write(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    metadata.uid() == 0 && metadata.permissions().mode() & 0o022 == 0
-}
 /// A regular file with at least one execute bit set.
 ///
 /// Named so the rule can be exercised on a file a test can actually create. Inline in

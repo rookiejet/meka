@@ -55,11 +55,12 @@ A confined command may or may not get a writable temporary directory, and this i
 | Backend | Scratch space | Effect |
 |---|---|---|
 | Bubblewrap (`read`) | Private `/tmp` tmpfs | `mktemp`, `git`, `python`, `gpg`, `pip` all work |
+| FreeBSD jailbroker (both levels) | Private `/tmp` and `/var/tmp` tmpfs | `mktemp`, `git`, `python`, `gpg`, `pip` all work |
 | Landlock (`read`) | None | Anything that writes a temp file is denied |
 | Windows `workspace` | None outside the roots | `New-TemporaryFile` is denied (measured) |
 | macOS Seatbelt (`read`) | Per-backend; see below | |
 
-Under Bubblewrap the child gets a private writable `/tmp`, so `mktemp` succeeds and the write goes nowhere real. Under Landlock there is no such directory and the write is simply denied, which takes `git`'s index lock, Python's `tempfile`, `gpg` and `pip` with it. The same is true of `workspace` on Windows outside the granted roots.
+Under Bubblewrap and FreeBSD's jailbroker the child gets a private writable `/tmp`, so `mktemp` succeeds and the write goes nowhere real. Under Landlock there is no such directory and the write is simply denied, which takes `git`'s index lock, Python's `tempfile`, `gpg` and `pip` with it. The same is true of `workspace` on Windows outside the granted roots.
 
 This divergence is deliberate. Granting a scratch directory under Landlock would weaken what `read` promises on the backend that currently keeps that promise strictly, so the narrower behavior stays.
 
@@ -123,6 +124,59 @@ See [Permissions](../usage/permissions.md#per-platform-enforcement) for the full
 #### When the configured backend is unavailable
 
 If `sandbox_backend = "bubblewrap"` is set but `bwrap` isn't on `$PATH` (or user namespaces are denied), `shell_execute` at `read` returns a hard error rather than silently falling back. The error names the configured backend and the specific failure reason. Either install `bubblewrap`, set `sandbox_backend = "landlock"`, or switch to `unrestricted` (Shift+Tab).
+
+#### FreeBSD
+
+FreeBSD's confinement is not in meka. `jailbrokerd`, a privileged daemon you run, builds a jail per
+command and runs it there as your own uid; meka sends it a plan over a Unix socket and reads its
+events. The platform has no unprivileged mechanism that refuses a write outside a set of paths that
+would fit in a process (Capsicum removes pathname lookup rather than write access, and a jail needs
+root and is a separate filesystem tree), so the privileged part lives in one small daemon rather
+than in meka.
+
+The only thing to configure here is where that daemon listens:
+
+```toml
+[shell]
+jailbroker_socket = "/var/run/jailbroker.sock"   # the default
+```
+
+`jailbrokerd` and the policy it enforces are set up separately, and that policy is the operator's
+rather than meka's: it names which host paths exist in a jail and which of them may be written. What
+the two levels mean once it is listening:
+
+- **`read`** runs the command in a jail whose filesystem is the host as that policy admits it, by
+  default `/` read-only with any path the policy denies left out. Nothing is mounted read-write.
+  Reads are bounded by that mount set, which is the one place this backend is narrower than the
+  others: a path outside it is not there. `/tmp` and `/var/tmp` are masked empty and world-writable
+  so a command has a scratch directory (a file another tool left in the host's `/tmp` is not visible
+  to it), and meka's config directory, data directory and command captures are masked last, exactly
+  as they are on the other backends. The host's `/var/run` is left alone, because it holds the
+  loader's hint file and a mask over that directory takes everything in it, after which every
+  program from packages fails to start. What keeps a command out of the daemon's own socket is the
+  daemon's rule, which refuses any request that comes from inside a jail it built.
+- **`workspace`** is the same jail plus the session's roots, mounted read-write. A root the policy
+  grants only for reading is refused by name rather than mounted read-only, and a denied path
+  *inside* a root is cut out of it, so the command can write anywhere in that root except there.
+  meka warns when a workspace session comes back with part of a root cut out.
+
+So a `workspace` root has to sit under a path the policy grants for writing, and so does the
+session's working directory, which counts as a root because the file tools may write there too. A
+policy that grants nothing leaves `read` working everywhere and refuses every `workspace` command;
+meka says so at startup. A refusal names the resolved path and the prefix that decided it, and
+nothing is created, so the session you get is never narrower than the level you asked for.
+
+meka refuses a socket that is not root-owned under a root-owned chain of directories. The daemon
+takes orders from whoever can connect, and every plan carries a command's environment and its write
+boundary, so a socket another user could have put there is one whose answers are not the broker's.
+If nothing is listening, `read` has no shell at all and `shell_execute` at `read` returns the
+reason; `unrestricted` runs a command with no jail, as it does everywhere.
+
+The alternative is to run meka itself inside a jail: every command it spawns is then confined by the
+jail's filesystem, network and process view, so `unrestricted` becomes a reasonable level to run at.
+The session's roots have to be mounted into the jail at the paths the session uses, meka's config
+and data directories have to live inside it, and its store should be treated as the only copy of
+anything the agent may write.
 
 #### Disabling the sandbox entirely
 
