@@ -453,7 +453,10 @@ impl ReadFence {
 /// which Bubblewrap mounts on its own and Landlock alone has to be told about. The macOS list is
 /// Codex's `:minimal` seatbelt defaults widened to the two package prefixes whole and to Apple's
 /// developer tools, since nearly every command a developer runs comes from one of them and the
-/// boundary exists to stop reads of the user's data, not the system's programs. On Windows the
+/// boundary exists to stop reads of the user's data, not the system's programs. The FreeBSD list is
+/// that system's own layout — `/libexec` where the runtime helpers live and `/var/db`, where `pkg`
+/// keeps its database, in place of the Linux multiarch and Nix paths. A command there is confined
+/// by the jail's mount set instead, so this list is the file tools' fence alone. On Windows the
 /// list is [`system_read_paths`]'s four directories, which the environment locates.
 #[cfg(target_os = "linux")]
 pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[
@@ -485,6 +488,10 @@ pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[
     "/opt/homebrew",
     "/Library/Developer",
     "/dev",
+];
+#[cfg(target_os = "freebsd")]
+pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[
+    "/bin", "/sbin", "/usr", "/lib", "/libexec", "/etc", "/proc", "/dev", "/var/db",
 ];
 #[cfg(windows)]
 pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[];
