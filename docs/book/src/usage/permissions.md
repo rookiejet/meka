@@ -122,6 +122,11 @@ On Windows the shell cannot hold this boundary: neither token mechanism confines
 tools keep it, a command does not, the agent is told so in its environment block, and startup logs
 one warning when `confine_reads` is on.
 
+On FreeBSD the shell is confined by its jail, but not to this set: a command reads the mount set
+`jailbrokerd`'s policy admits, which the switch does not shape and which is chosen at the daemon,
+not here. The file tools keep this boundary exactly whatever the policy says, and the agent is
+told so in its environment block.
+
 If `[shell].sandbox = false`, `shell_execute` is refused at `workspace` rather than run
 unconfined. Nothing else would be holding the boundary, and half a boundary reported as a whole one
 is worse than an error that says so. Use `unrestricted` for those turns.
@@ -142,7 +147,9 @@ Four limits, stated plainly because none of them is visible from the inside:
   config keys, not by this one.
 - **Reads are not confined unless `[permissions].confine_reads` is on.** The boundary alone is
   "this cannot change things outside the workspace", not "this cannot see them"; the switch adds
-  the second half, as [the read boundary](#the-read-boundary) describes.
+  the second half, as [the read boundary](#the-read-boundary) describes. A jail is the one
+  exception, and it is narrower rather than stronger: inside one, a command reads the mount set
+  its operator admitted and nothing else.
 - **The in-process fence resolves paths, it does not pin them.** `file_write` and `file_edit`
   resolve every existing component of a target before judging it, so a symlink already planted on
   the path is caught. What is left open is the race: a directory checked and then swapped for a
@@ -159,6 +166,7 @@ Four limits, stated plainly because none of them is visible from the inside:
 | Linux | Landlock (fallback) | Yes: one path-beneath rule per root, or one per sibling where the root contains meka's directories | Yes: read and execute rules on the readable paths instead of on `/`; names and sizes outside stay visible to `stat` |
 | macOS | `sandbox-exec` | Yes: writable subpath per root | Yes: data reads and executable mappings per readable path instead of everywhere; existence and metadata stay global so paths resolve |
 | Windows | `WRITE_RESTRICTED` token + per-root ACE | Yes: writes are permitted only where a workspace capability has an ACE | No: the file tools hold the boundary, a command reads anywhere, and startup warns once |
+| FreeBSD | `jailbrokerd`, a jail per command | Yes: the host as its operator admits it, plus a mount per workspace root | Yes, switch or not: a jail's reads are the mount set its operator admitted, not the readable paths |
 
 Under Bubblewrap, `/tmp`, `/run` and `/var/tmp` are masked with a tmpfs, so paths there are not
 merely unwritable but invisible. A workspace root under `/tmp` is bound after the mask and stays
@@ -183,6 +191,17 @@ denial at all: under it a command at `read` can still read the config directory 
 account credentials included, and a workspace root containing them can write them; see
 [Shell](../tools/shell.md#macos-and-windows). Only `unrestricted` writes there on the other
 backends.
+
+On FreeBSD the confinement is a jail a separate daemon builds, so the boundary is a mount set rather
+than a filter over your filesystem: at `read` the command sees the host as that daemon's operator
+admits it and writes nothing of it (a `tmpfs` over `/tmp` and `/var/tmp` is scratch that goes
+nowhere), and at `workspace` it also writes in the session's roots. Three consequences follow from
+that policy being the operator's rather than meka's. A workspace root the policy does not grant for
+writing is refused rather than mounted read-only. A denied path inside a root is cut out of it, which
+meka reports rather than passing off as the root you asked for. And the network is not restricted, as
+on every other backend: a jail that shares the host's stack still has it. The [shell
+page](../tools/shell.md#freebsd) covers the two levels and what meka checks about the socket it talks
+to.
 
 Windows works differently enough to be worth stating. meka mints a deterministic capability SID per
 workspace root, adds an inheritable write ACE for it on that root, and runs the shell under a

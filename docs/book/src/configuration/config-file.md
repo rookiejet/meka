@@ -972,11 +972,11 @@ Default: `true`
 sandbox = false  # disable the sandboxed shell at read
 ```
 
-The sandbox uses Bubblewrap or Landlock on Linux, chosen by [`shell.sandbox_backend`](#shellsandbox_backend), `sandbox-exec` on macOS, and a duplicated Low-integrity primary token on Windows. On platforms where no backend is usable, shell commands always require `unrestricted` regardless of this setting.
+The sandbox uses Bubblewrap or Landlock on Linux, chosen by [`shell.sandbox_backend`](#shellsandbox_backend), `sandbox-exec` on macOS, and a duplicated Low-integrity primary token on Windows. On FreeBSD the sandbox is a jail that the `jailbrokerd` you run builds (see [`shell.jailbroker_socket`](#shelljailbroker_socket)). On platforms where no backend is usable, shell commands always require `unrestricted` regardless of this setting.
 
 ### `shell.sandbox_backend`
 
-Linux-only choice between `"landlock"`, `"bubblewrap"` and `"bubblewrap-landlock"`:
+Linux-only choice between `"landlock"`, `"bubblewrap"` and `"bubblewrap-landlock"` (FreeBSD's backend is the platform's own `jailbroker` and is not settable):
 
 - **Bubblewrap** (`"bubblewrap"`) wraps the command in `bwrap` with read-only bind of `/`, tmpfs masks over `/run` / `/tmp` / `/var/tmp` / `$XDG_RUNTIME_DIR`, and `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks hide the dbus session bus and the systemd-user socket, so state-changing IPC calls like `systemctl --user start` and `dbus-send` fail. Network is intentionally not unshared so `curl http://x | pdftotext` still works. On a kernel with Landlock ABI v6 (6.12) or newer the command also runs inside meka's Landlock ruleset, enacted by `meka confine` after the mounts, which closes the abstract namespace, signals and device ioctls, and from kernel 7.1 the sockets the masks do not cover. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
 - **Bubblewrap with Landlock** (`"bubblewrap-landlock"`) is Bubblewrap with the Landlock layer inside required rather than added where the kernel allows: on a kernel below 6.12 the backend is unusable and `shell_execute` at `read` fails, so a pinned value guarantees the layer is applied. What the layer closes still follows the kernel: the abstract namespace, signals and device ioctls from 6.12, sockets on disk outside the masks from 7.1. Auto-detection never picks it; pin it on a host where that guarantee matters more than a working shell.
@@ -989,7 +989,7 @@ If the configured backend can't be used at runtime (bwrap not installed, user na
 Overridable for one run with `meka --sandbox-backend landlock|bubblewrap|bubblewrap-landlock`, and for a whole
 environment with `MEKA_SANDBOX_BACKEND`. Precedence is flag, then environment, then this field.
 
-Default: unset (auto-detect). Ignored on macOS and Windows.
+Default: unset (auto-detect). Ignored on macOS, Windows and FreeBSD.
 
 ```toml
 [shell]
@@ -999,13 +999,33 @@ sandbox_backend = "bubblewrap"  # or "landlock", or "bubblewrap-landlock" to req
 
 ### `shell.readable_paths`
 
-Directories every confined command may read beyond the system directories, wherever reads are confined: with [`permissions.confine_reads`](#permissions) on, and for a sub-agent whose spawn confined them. The system directories are where the operating system keeps the programs, libraries and configuration a command needs to run at all, and the list is deliberately system-level: on Linux `/bin`, `/sbin`, `/usr`, `/lib`, `/lib32`, `/lib64`, `/etc`, `/proc`, `/dev`, `/nix/store` and `/run/current-system/sw`; on macOS `/bin`, `/sbin`, `/usr`, `/etc`, `/System`, `/Library/Apple`, `/Library/Preferences`, `/Library/Filesystems/NetFSPlugins`, `/var/db`, `/opt/homebrew`, `/Library/Developer` and `/dev`, plus the active developer directory `xcode-select` records, since the developer commands in `/usr/bin` are stubs that run the real binaries from there. Each is taken only where it exists. The skill roots [`[skills].extra_paths`](#skills) names are readable too. Add here what else this machine keeps system software under: `/opt`, `/snap`, a toolchain outside the home directory. An entry is warned about and dropped when it does not resolve, when it is relative, or when it is a directory the sandbox masks (`/tmp`, `/run`, the runtime directory, the filesystem root, meka's own directories), since Bubblewrap binds the readable paths after its masks and `/run` named here would hand the session bus back to a confined command. Never in effect on Windows, where the shell's reads are not confined.
+Directories every confined command may read beyond the system directories, wherever reads are confined: with [`permissions.confine_reads`](#permissions) on, and for a sub-agent whose spawn confined them. The system directories are where the operating system keeps the programs, libraries and configuration a command needs to run at all, and the list is deliberately system-level: on Linux `/bin`, `/sbin`, `/usr`, `/lib`, `/lib32`, `/lib64`, `/etc`, `/proc`, `/dev`, `/nix/store` and `/run/current-system/sw`; on macOS `/bin`, `/sbin`, `/usr`, `/etc`, `/System`, `/Library/Apple`, `/Library/Preferences`, `/Library/Filesystems/NetFSPlugins`, `/var/db`, `/opt/homebrew`, `/Library/Developer` and `/dev`, plus the active developer directory `xcode-select` records, since the developer commands in `/usr/bin` are stubs that run the real binaries from there; on FreeBSD `/bin`, `/sbin`, `/usr`, `/lib`, `/libexec`, `/etc`, `/proc`, `/dev` and `/var/db`, where `pkg` keeps its database. Each is taken only where it exists. The skill roots [`[skills].extra_paths`](#skills) names are readable too. Add here what else this machine keeps system software under: `/opt`, `/snap`, a toolchain outside the home directory. An entry is warned about and dropped when it does not resolve, when it is relative, or when it is a directory the sandbox masks (`/tmp`, `/run`, the runtime directory, the filesystem root, meka's own directories), since Bubblewrap binds the readable paths after its masks and `/run` named here would hand the session bus back to a confined command. Never in effect on Windows, where the shell's reads are not confined. On FreeBSD it widens the file tools' fence alone: a jailed command reads the mount set its operator's policy admits, not this list.
 
 Default: `[]`
 
 ```toml
 [shell]
 readable_paths = ["/opt", "/snap"]
+```
+
+### `shell.jailbroker_socket`
+
+FreeBSD only, and in effect the address of the backend: the file system confinement there is a jail
+that `jailbrokerd` builds on meka's behalf, and this is the Unix socket meka sends its plans to. The
+daemon's own configuration owns that path; this key is how meka is told where it is.
+
+meka probes it once at startup, and it is the probe that decides whether `read` has a shell at all:
+a socket that is not there, not owned by root, or not under a directory chain only root can write is
+refused, and a daemon that does not answer its version's handshake is refused as well. A refused
+socket leaves `shell_execute` at `unrestricted` alone, with the reason reported in the error.
+
+Ignored on every other platform.
+
+Default: `/var/run/jailbroker.sock`.
+
+```toml
+[shell]
+jailbroker_socket = "/var/run/jailbroker.sock"
 ```
 
 ## `[tools]`: built-in tool filters

@@ -1158,6 +1158,14 @@ fn build_environment_context(
                 "On this platform the shell's reads are not confined; the file tools' are.\n",
             );
         }
+        // The jail is narrower rather than stronger here: it confines a command's reads, but to
+        // the mount set its operator's policy admits, which is not this list.
+        if cfg!(target_os = "freebsd") {
+            context.push_str(
+                "On this platform the shell's reads are the jail's mount set, not these roots; \
+                 the file tools' are.\n",
+            );
+        }
     }
 
     let now = chrono::Local::now().to_rfc2822();
@@ -4408,6 +4416,11 @@ mod tests {
             assert_eq!(
                 context.contains("the shell's reads are not confined"),
                 cfg!(windows),
+                "{context}"
+            );
+            assert_eq!(
+                context.contains("the jail's mount set"),
+                cfg!(target_os = "freebsd"),
                 "{context}"
             );
         }
