@@ -393,7 +393,7 @@ flag reaches the same hosts the workspace flag does, and is likewise never recor
 
 Pick the sandbox backend for this run: `landlock`, `bubblewrap` or `bubblewrap-landlock` on Linux,
 `appcontainer` or `restricted-token` on Windows. A value from another platform is refused, and
-macOS has one backend and takes no value. Wins over `MEKA_SANDBOX_BACKEND` and
+macOS and FreeBSD have one backend each and take no value (FreeBSD's is the jailbroker). Wins over `MEKA_SANDBOX_BACKEND` and
 [`[shell].sandbox_backend`](./config-file.md#shellsandbox_backend), and like either of those,
 pinning a value suppresses the warning the auto-pick prints when it falls back.
 
