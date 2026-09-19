@@ -285,7 +285,7 @@ Pick the Linux sandbox backend for this run: `landlock`, `bubblewrap`, or `bubbl
 which requires the Landlock layer inside Bubblewrap and fails closed without it. Wins over
 `MEKA_SANDBOX_BACKEND` and [`[shell].sandbox_backend`](./config-file.md#shellsandbox_backend), and
 like either of those, pinning a value suppresses the install-Bubblewrap warning the auto-pick
-prints. Ignored on macOS and Windows.
+prints. Ignored on macOS, Windows and FreeBSD.
 
 ```bash
 meka --sandbox-backend landlock

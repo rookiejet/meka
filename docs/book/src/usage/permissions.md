@@ -86,7 +86,8 @@ Four limits, stated plainly because none of them is visible from the inside:
   `MEKA_DATA_DIR`, memories included, and skills under `MEKA_CONFIG_DIR`. They are governed by their own
   config keys, not by this one.
 - **Reads are never confined**, at any level. The boundary is "this cannot change things outside
-  the workspace", not "this cannot see them".
+  the workspace", not "this cannot see them". A jail is the one exception, and it is narrower rather
+  than stronger: inside one, a command reads the mount set its operator admitted and nothing else.
 - **The in-process fence resolves paths, it does not pin them.** `file_write` and `file_edit`
   resolve every existing component of a target before judging it, so a symlink already planted on
   the path is caught. What is left open is the race: a directory checked and then swapped for a
@@ -103,6 +104,7 @@ Four limits, stated plainly because none of them is visible from the inside:
 | Linux | Landlock (fallback) | Yes: one path-beneath rule per root, or one per sibling where the root contains meka's directories |
 | macOS | `sandbox-exec` | Yes: writable subpath per root |
 | Windows | `WRITE_RESTRICTED` token + per-root ACE | Yes: writes are permitted only where a workspace capability has an ACE |
+| FreeBSD | `jailbrokerd`, a jail per command | Yes: the host as its operator admits it, plus a mount per workspace root |
 
 Under Bubblewrap, `/tmp`, `/run` and `/var/tmp` are masked with a tmpfs, so paths there are not
 merely unwritable but invisible. A workspace root under `/tmp` is bound after the mask and stays
@@ -122,6 +124,17 @@ such a root can land only in one of its subdirectories. The Windows token cannot
 denial at all: under it a command at `read` can still read the store, and a workspace root
 containing it can write it, which Windows says at startup. Only `unrestricted` writes there on
 the other backends.
+
+On FreeBSD the confinement is a jail a separate daemon builds, so the boundary is a mount set rather
+than a filter over your filesystem: at `read` the command sees the host as that daemon's operator
+admits it and writes nothing of it (a `tmpfs` over `/tmp` and `/var/tmp` is scratch that goes
+nowhere), and at `workspace` it also writes in the session's roots. Three consequences follow from
+that policy being the operator's rather than meka's. A workspace root the policy does not grant for
+writing is refused rather than mounted read-only. A denied path inside a root is cut out of it, which
+meka reports rather than passing off as the root you asked for. And the network is not restricted, as
+on every other backend: a jail that shares the host's stack still has it. The [shell
+page](../tools/shell.md#freebsd) covers the two levels and what meka checks about the socket it talks
+to.
 
 Windows works differently enough to be worth stating. meka mints a deterministic capability SID per
 workspace root, adds an inheritable write ACE for it on that root, and runs the shell under a

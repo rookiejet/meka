@@ -267,16 +267,24 @@ impl ExecuteCommandTool {
         let Some(reason) = crate::sandbox::backend_unavailable_reason(&self.backend_probe) else {
             return Ok(());
         };
-        // `sandbox_backend` is Linux-only; on other platforms there's nothing to reconfigure. The
-        // only escape hatch is `unrestricted`, which is also the only level whose confinement is
-        // `Unconfined` and so never reaches this branch.
+        // `sandbox_backend` is a Linux-only key, so on the other platforms the remedy is not a
+        // config value of meka's: it is the platform's own backend. The one escape hatch is
+        // `unrestricted`, which is also the only level whose confinement is `Unconfined` and so
+        // never reaches this branch.
         #[cfg(target_os = "linux")]
         let message = format!(
             "configured sandbox backend ({}) is unavailable: {}; set `[shell].sandbox_backend` to \
              a usable one",
             self.sandbox_backend, reason
         );
-        #[cfg(not(target_os = "linux"))]
+        // FreeBSD: the reason names the socket and what was wrong with it, and the remedy is the
+        // broker rather than a config value meka owns.
+        #[cfg(target_os = "freebsd")]
+        let message = format!(
+            "sandbox is unavailable: {reason}; shell commands at `read` and `workspace` need a \
+             jailbroker listening, and `unrestricted` runs a command without a sandbox"
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         let message = format!(
             "sandbox is unavailable: {reason}. `unrestricted` runs shell commands without a \
              sandbox."
@@ -464,12 +472,44 @@ impl Tool for ExecuteCommandTool {
             cmd
         };
 
+        // Every Unix platform runs `sh -c` unless a sandbox replaces the builder with the program
+        // that imposes it, so the fallback is written once here and overwritten by the platform
+        // blocks below. Windows builds its own, above.
+        #[cfg(unix)]
+        let mut command_builder = {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg(&command);
+            cmd
+        };
+
+        // FreeBSD: the confinement is a jail `jailbrokerd` builds, so there is nothing to spawn
+        // here and the whole drain/cancel/assemble path is the daemon's shape of work rather than
+        // this one's. See `run_jailbroker`.
+        #[cfg(target_os = "freebsd")]
+        if sandboxed
+            && let crate::sandbox::SandboxCapability::Jailbroker { socket, .. } =
+                &self.sandbox_capability
+        {
+            let relay = OutputRelay::for_call(&context);
+            return run_jailbroker(
+                socket,
+                &command,
+                &confinement,
+                &self.site.cwd,
+                timeout,
+                cancellation,
+                relay,
+            )
+            .await;
+        }
+
         #[cfg(target_os = "macos")]
-        let mut command_builder = if sandboxed
+        if sandboxed
             && matches!(
                 self.sandbox_capability,
                 crate::sandbox::SandboxCapability::SandboxExec
-            ) {
+            )
+        {
             let (profile, params) = crate::sandbox::seatbelt::sandbox_profile_for(
                 confinement.writable(),
                 &crate::workspace::private_directories(),
@@ -479,12 +519,8 @@ impl Tool for ExecuteCommandTool {
             // `-D KEY=value` pairs, so a path never has to survive SBPL string quoting.
             cmd.args(&params);
             cmd.arg("sh").arg("-c").arg(&command);
-            cmd
-        } else {
-            let mut cmd = tokio::process::Command::new("sh");
-            cmd.arg("-c").arg(&command);
-            cmd
-        };
+            command_builder = cmd;
+        }
 
         // The executable that enacts the Landlock layer inside Bubblewrap, held open from here to
         // the spawn: the sandbox execs it through the descriptor, which the `pre_exec` below lets
@@ -502,7 +538,7 @@ impl Tool for ExecuteCommandTool {
         };
 
         #[cfg(target_os = "linux")]
-        let mut command_builder = if sandboxed
+        if sandboxed
             && let crate::sandbox::SandboxCapability::Bubblewrap { bwrap_path, .. } =
                 &self.sandbox_capability
         {
@@ -531,12 +567,8 @@ impl Tool for ExecuteCommandTool {
                 ));
             }
             cmd.arg("sh").arg("-c").arg(&command);
-            cmd
-        } else {
-            let mut cmd = tokio::process::Command::new("sh");
-            cmd.arg("-c").arg(&command);
-            cmd
-        };
+            command_builder = cmd;
+        }
 
         // The Landlock dialect's ABI, when this command runs under it.
         #[cfg(target_os = "linux")]
@@ -1317,6 +1349,134 @@ fn assemble_command_output(stdout: &str, stderr: &str, exit_code: i32) -> ToolOu
     )
 }
 
+/// Run a command in a jail the broker builds.
+///
+/// The FreeBSD sibling of the Unix spawn path, and a different shape of work: there is no child in
+/// this process to kill and no pipes to drain. The daemon owns the command, and its output arrives
+/// as two streams the same tasks read; everything downstream of the spawn is shared, so the relay,
+/// the residency ceiling, the capture to a file and the assembly behave exactly as they do for a
+/// command meka spawned itself.
+#[cfg(target_os = "freebsd")]
+async fn run_jailbroker(
+    socket: &std::path::Path,
+    command: &str,
+    confinement: &crate::sandbox::Confinement,
+    cwd: &crate::workspace::SharedCwd,
+    timeout: std::time::Duration,
+    cancellation: tokio_util::sync::CancellationToken,
+    relay: Option<OutputRelay>,
+) -> Result<ToolOutput> {
+    let plan = crate::sandbox::jailbroker::plan_for(
+        confinement,
+        &cwd.get(),
+        &crate::workspace::private_directories(),
+        &crate::sandbox::sandbox_child_env(),
+        command,
+    );
+    let crate::sandbox::jailbroker::Running {
+        stdout,
+        stderr,
+        mut outcome,
+        cancel,
+    } = crate::sandbox::jailbroker::run(socket, plan)
+        .await
+        .map_err(|failure| MekaError::ToolExecution {
+            tool_name: "shell_execute".to_string(),
+            message: failure.message().to_string(),
+        })?;
+
+    // The same shape as the standard path: both drains start before anything is awaited, so a
+    // command writing faster than the turn reads cannot fill the socket and stall the daemon.
+    let stdout_task = tokio::spawn({
+        let relay = relay.clone();
+        async move { read_to_string_best_effort(Some(stdout), relay).await }
+    });
+    let stderr_task =
+        tokio::spawn(async move { read_to_string_best_effort(Some(stderr), relay).await });
+
+    tokio::select! {
+        _ = cancellation.cancelled() => {
+            stop_jailbroker_command(&cancel).await;
+            abort_after_timeout(outcome, JAILBROKER_STOP_GRACE).await;
+            stdout_task.abort();
+            stderr_task.abort();
+            Err(MekaError::Interrupted)
+        }
+        _ = tokio::time::sleep(timeout) => {
+            stop_jailbroker_command(&cancel).await;
+            abort_after_timeout(outcome, JAILBROKER_STOP_GRACE).await;
+            stdout_task.abort();
+            stderr_task.abort();
+            // Timed out means meka stopped it, so this reports the stop rather than inventing an
+            // exit status; a frontend rendering a terminal shows "terminated" rather than "exit 0".
+            Ok(ToolOutput::text(
+                format!("Command timed out after {}ms", timeout.as_millis()),
+                true,
+            )
+            .with_metadata(timed_out_exit_metadata()))
+        }
+        outcome = &mut outcome => {
+            let outcome = outcome
+                .map_err(|error| MekaError::ToolExecution {
+                    tool_name: "shell_execute".to_string(),
+                    message: format!("failed to wait for the jailbroker: {error}"),
+                })?
+                .map_err(|failure| MekaError::ToolExecution {
+                    tool_name: "shell_execute".to_string(),
+                    message: failure.message().to_string(),
+                })?;
+
+            let (stdout_content, stdout_timed_out) =
+                join_drain_with_timeout(stdout_task, DRAIN_TIMEOUT).await;
+            let (stderr_content, stderr_timed_out) =
+                join_drain_with_timeout(stderr_task, DRAIN_TIMEOUT).await;
+            let mut output =
+                assemble_command_output(&stdout_content, &stderr_content, outcome.status);
+            if stdout_timed_out || stderr_timed_out {
+                append_drain_truncation_note(&mut output, stdout_timed_out, stderr_timed_out);
+            }
+            Ok(output.with_metadata(jailbroker_exit_metadata(outcome.status)))
+        }
+    }
+}
+
+/// How long a stopped command has to report its exit before meka stops waiting for it.
+///
+/// The daemon kills the process group on a cancel and answers promptly. If it does not answer, the
+/// tool call must still end, and dropping the session is what stops the command in any case: the
+/// daemon takes a session apart when its client goes away.
+#[cfg(target_os = "freebsd")]
+const JAILBROKER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ask the daemon to stop the running command.
+///
+/// A failure here is not fatal and is not silent: the session is about to be dropped, which stops
+/// the command anyway, so what went wrong is a diagnostic rather than something to report to the
+/// model as the outcome of a command it asked for.
+#[cfg(target_os = "freebsd")]
+async fn stop_jailbroker_command(cancel: &crate::sandbox::jailbroker::Cancel) {
+    if let Err(failure) = cancel.send().await {
+        tracing::debug!(
+            "failed to ask the jailbroker to stop the command: {}",
+            failure.message()
+        );
+    }
+}
+
+/// The exit status of a command the daemon ran.
+///
+/// The daemon reports a code, or 128 plus the signal that killed the command, which is the shell's
+/// own convention. Nothing on the wire says which of the two a number above 128 is, and a command
+/// that exits 137 is a thing that happens, so meka reports the number it was given and claims no
+/// signal: a name in a client's terminal is worth having only when the kernel is what said it.
+#[cfg(target_os = "freebsd")]
+fn jailbroker_exit_metadata(status: i32) -> crate::frontend::ToolOutputMetadata {
+    crate::frontend::ToolOutputMetadata::CommandExit {
+        exit_code: Some(status),
+        signal: None,
+    }
+}
+
 /// Windows-only: spawn via `CreateProcessAsUserW` with a Low-integrity token, read stdout/stderr
 /// from the pipe `File`s, and wait/kill through blocking tasks. Mirrors the timeout/cancellation
 /// semantics of the standard path.
@@ -1459,7 +1619,13 @@ async fn join_drain_with_timeout(
 
 /// Abort any pending `JoinHandle` after `timeout`. Used on cancel/timeout cleanup paths where we
 /// don't need the task's output, just its termination.
-#[cfg(windows)]
+#[cfg_attr(
+    not(any(target_os = "freebsd", windows)),
+    allow(
+        dead_code,
+        reason = "read only by the platforms that stop a command over a channel"
+    )
+)]
 async fn abort_after_timeout<T: 'static>(
     mut handle: tokio::task::JoinHandle<T>,
     timeout: std::time::Duration,
@@ -3516,17 +3682,48 @@ mod tests {
             );
         }
 
-        /// macOS has one `read`-level backend and `detect()` names it, so there is nothing to add.
+        /// macOS and FreeBSD each have one `read`-level backend and `detect()` names it, so there
+        /// is nothing to add.
         #[cfg(not(target_os = "linux"))]
         fn a_backend_detect_does_not_name() -> Option<crate::sandbox::SandboxCapability> {
             None
+        }
+
+        /// A directory the backend under test will accept as a workspace root.
+        ///
+        /// Every backend but the jailbroker takes a path anywhere: its writable roots are the
+        /// operator's to admit, and a root under `/tmp` is refused by name when the policy grants
+        /// nothing there, so a fixture placed by habit would exercise the refusal rather than the
+        /// boundary. `None` when the policy grants no writable path at all, which is a host where
+        /// this boundary cannot be exercised and the test says so instead of failing.
+        fn fixture_directory(
+            capability: &crate::sandbox::SandboxCapability,
+        ) -> Option<tempfile::TempDir> {
+            #[cfg(target_os = "freebsd")]
+            if let crate::sandbox::SandboxCapability::Jailbroker {
+                writable_prefixes, ..
+            } = capability
+            {
+                let parent = writable_prefixes.iter().find(|prefix| prefix.is_dir())?;
+                return tempfile::Builder::new()
+                    .prefix("meka-boundary-")
+                    .tempdir_in(parent)
+                    .ok();
+            }
+            let _ = capability;
+            tempfile::tempdir().ok()
         }
 
         /// One backend's worth of the boundary check above.
         async fn a_workspace_shell_boundary_holds_for(
             capability: crate::sandbox::SandboxCapability,
         ) {
-            let temp = tempfile::tempdir().expect("tempdir");
+            let Some(temp) = fixture_directory(&capability) else {
+                eprintln!(
+                    "skipping {capability:?}: its policy grants no path a workspace root may be"
+                );
+                return;
+            };
             let base = crate::workspace::canonical_for_test(temp.path());
             let work = base.join("work");
             let outside = base.join("outside");

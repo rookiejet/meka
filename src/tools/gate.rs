@@ -357,7 +357,7 @@ mod tests {
     /// that is always refused is confined vacuously, and one that always runs is not confined at
     /// all.
     #[test]
-    fn a_gate_may_admit_execute_command_only_where_it_will_be_sandboxed() {
+    fn a_gate_may_admit_shell_execute_only_where_it_will_be_sandboxed() {
         let toolset =
             |sandbox_enabled: bool, capability: crate::sandbox::SandboxCapability| GateToolset {
                 mcp: None,
@@ -375,31 +375,55 @@ mod tests {
         };
 
         // Whatever this platform's usable backend is; the rule under test is "anything but
-        // `Unavailable`", not any particular one.
-        #[cfg(target_os = "linux")]
-        let usable = crate::sandbox::SandboxCapability::Landlock { abi_version: 5 };
-        #[cfg(target_os = "macos")]
-        let usable = crate::sandbox::SandboxCapability::SandboxExec;
-        #[cfg(target_os = "windows")]
-        let usable = crate::sandbox::SandboxCapability::LowIntegrity;
+        // `Unavailable`", not any particular one. The variants are per-platform, so each host names
+        // its own; a host with no usable one (a FreeBSD host with no broker listening) skips the
+        // leg rather than faking a capability meka cannot reach on it.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "freebsd"
+        ))]
+        {
+            #[cfg(target_os = "linux")]
+            let usable = crate::sandbox::SandboxCapability::Landlock { abi_version: 5 };
+            #[cfg(target_os = "macos")]
+            let usable = crate::sandbox::SandboxCapability::SandboxExec;
+            #[cfg(target_os = "windows")]
+            let usable = crate::sandbox::SandboxCapability::LowIntegrity;
+            // The one backend that has to be running for a capability to exist at all: there is no
+            // capability to name without the daemon's socket, so the leg is skipped loudly there.
+            #[cfg(target_os = "freebsd")]
+            let usable = match crate::sandbox::detect() {
+                capability @ crate::sandbox::SandboxCapability::Jailbroker { .. } => capability,
+                crate::sandbox::SandboxCapability::Unavailable => {
+                    eprintln!("skipping the confined leg: no jailbroker is listening");
+                    return;
+                }
+            };
 
-        let sandboxed = toolset(true, usable);
-        assert_eq!(
-            sandboxed.resolve("shell_execute"),
-            Some(Permission::Read),
-            "with a usable sandbox the shell is a read-level tool"
-        );
-        assert!(
-            crate::schedule::gate_probe_is_authorized(&probe, Permission::Read, Some(&sandboxed))
+            let sandboxed = toolset(true, usable);
+            assert_eq!(
+                sandboxed.resolve("shell_execute"),
+                Some(Permission::Read),
+                "with a usable sandbox the shell is a read-level tool"
+            );
+            assert!(
+                crate::schedule::gate_probe_is_authorized(
+                    &probe,
+                    Permission::Read,
+                    Some(&sandboxed)
+                )
                 .is_ok(),
-            "so a gate at `read` may call it, the door this test exists to bound"
-        );
-        assert_eq!(
-            GateToolset::dispatch_permission().get(),
-            Permission::Read,
-            "and it is dispatched at `read`, which is what makes `Confinement::resolve` confine it: \
-             `unrestricted` is the only level that spawns a bare shell"
-        );
+                "so a gate at `read` may call it, the door this test exists to bound"
+            );
+            assert_eq!(
+                GateToolset::dispatch_permission().get(),
+                Permission::Read,
+                "and it is dispatched at `read`, which is what makes `Confinement::resolve` confine \
+                 it: `unrestricted` is the only level that spawns a bare shell"
+            );
+        }
 
         let unconfined = toolset(false, crate::sandbox::SandboxCapability::Unavailable);
         assert_eq!(
