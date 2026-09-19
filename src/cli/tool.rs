@@ -50,7 +50,11 @@ pub(crate) fn run_tool_subcommand(
             // where the sandbox is on and usable, so a listing built with the sandbox off would
             // print `unrestricted` on every machine whose sessions run the tool at `read`. The
             // warning is the one a session start gives, and it explains an `unrestricted` row.
-            let sandbox = crate::sandbox::resolve_backend(config.sandbox_backend, config.sandbox);
+            let sandbox = crate::sandbox::resolve_backend(
+                config.sandbox_backend,
+                config.sandbox,
+                &config.jailbroker_socket,
+            );
             crate::sandbox::warn_if_sandbox_issues(
                 &crate::sandbox::SandboxState::new(config.sandbox, &sandbox),
                 crate::sandbox::WarnContext::ToolListing,
