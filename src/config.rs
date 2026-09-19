@@ -894,11 +894,22 @@ pub(crate) struct ShellConfig {
     /// `[permissions].confine_reads` is on: where this machine keeps system software that the
     /// platform list does not name.
     pub(crate) additional_readable_directories: Option<Vec<PathBuf>>,
+    /// FreeBSD: the Unix socket `jailbrokerd` listens on. The broker's own configuration is where
+    /// the socket is named, so this is meka being told where that is;
+    /// [`DEFAULT_JAILBROKER_SOCKET`] is used when it is unset.
+    pub(crate) jailbroker_socket: Option<std::path::PathBuf>,
 }
 
+/// Where `jailbrokerd` listens unless `[shell].jailbroker_socket` names another path.
+///
+/// The broker's configuration owns this fact; meka only has to be told where it ended up, which is
+/// what makes it a config key rather than a probe over a list of guesses.
+pub(crate) const DEFAULT_JAILBROKER_SOCKET: &str = "/var/run/jailbroker.sock";
+
 /// Linux sandbox backend. Silently ignored on macOS and Windows (sandbox-exec and Low-integrity
-/// respectively are the only options on those platforms). The absence of a default impl is
-/// intentional: an unset value is meaningful and triggers auto-resolution in
+/// respectively are the only options on those platforms) and on FreeBSD, whose one backend is
+/// reached over the socket [`ShellConfig::jailbroker_socket`] names. The absence of a default impl
+/// is intentional: an unset value is meaningful and triggers auto-resolution in
 /// [`ResolvedConfig::resolve`].
 ///
 /// The wire spelling is [`Self::name`], which the file, the flag and the variable take; `Display`
@@ -914,10 +925,25 @@ pub(crate) enum SandboxBackend {
     Landlock,
     Bubblewrap,
     BubblewrapLandlock,
+    /// FreeBSD's backend: a jail built by `jailbrokerd`. Not in [`Self::ALL`], because it is not a
+    /// choice: no other backend exists on that platform, and `[shell].sandbox_backend` is a
+    /// Linux-only key. It is a variant so that what the shell tool records as the backend is the
+    /// one that ran the command rather than the nearest Linux name for it.
+    #[cfg_attr(
+        not(target_os = "freebsd"),
+        allow(
+            dead_code,
+            reason = "constructed only by the FreeBSD resolver; the arms that answer for it are on every platform"
+        )
+    )]
+    Jailbroker,
 }
 
 impl SandboxBackend {
-    /// Every backend, in the order the names sort.
+    /// Every backend a user may name, in the order the names sort.
+    ///
+    /// [`Self::Jailbroker`] is deliberately absent: it is the platform's, chosen by the resolver
+    /// rather than by a config key, a flag or a variable.
     pub(crate) const ALL: [SandboxBackend; 3] =
         [Self::Bubblewrap, Self::BubblewrapLandlock, Self::Landlock];
 
@@ -928,6 +954,7 @@ impl SandboxBackend {
             Self::Landlock => "landlock",
             Self::Bubblewrap => "bubblewrap",
             Self::BubblewrapLandlock => "bubblewrap-landlock",
+            Self::Jailbroker => "jailbroker",
         }
     }
 
@@ -937,6 +964,7 @@ impl SandboxBackend {
             Self::Landlock => "Landlock",
             Self::Bubblewrap => "Bubblewrap",
             Self::BubblewrapLandlock => "Bubblewrap with Landlock",
+            Self::Jailbroker => "Jailbroker",
         }
     }
 
@@ -1749,6 +1777,11 @@ pub(crate) struct ResolvedConfig {
     /// the host resolves and probes it at startup ([`crate::sandbox::resolve_backend`]) because
     /// the pick depends on what the machine has.
     pub(crate) sandbox_backend: Option<SandboxBackend>,
+    /// `[shell].jailbroker_socket`, or [`DEFAULT_JAILBROKER_SOCKET`]. The broker's own config
+    /// names the socket and this is meka being told where; the host probes it at startup for
+    /// the same reason it probes a backend, because whether anything is listening is a fact
+    /// about the machine.
+    pub(crate) jailbroker_socket: std::path::PathBuf,
     /// Resolved `[session].retention`. `None`, the default, disables the session sweep.
     pub(crate) retention: Option<std::time::Duration>,
     /// Resolved `[session].turn_retention`. `None`, the default, keeps every turn for the life of
@@ -2638,6 +2671,13 @@ impl ResolvedConfig {
             .or_else(sandbox_backend_override)
             .or(file_shell.sandbox_backend);
 
+        // The socket the broker listens on. Nothing resolves it: `jailbroker.conf` is the
+        // operator's and meka takes the path as given, because a guess at where a socket
+        // might be is worse than a probe that names what it looked for and found nothing.
+        let jailbroker_socket = file_shell
+            .jailbroker_socket
+            .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_JAILBROKER_SOCKET));
+
         // A directory that does not resolve contributes nothing to either boundary, because
         // `usable_roots` drops what it cannot canonicalize. Silently, until an access is refused
         // with a boundary the user believed included this path. The path is kept regardless of the
@@ -2696,6 +2736,7 @@ impl ResolvedConfig {
                 .additional_readable_directories
                 .unwrap_or_default(),
             sandbox_backend,
+            jailbroker_socket,
             retention: file_session.retention,
             turn_retention: file_session.turn_retention,
             thinking: active_settings
@@ -6357,6 +6398,11 @@ refuse_private_destinations = true
         assert!(toml::from_str::<ShellConfig>(r#"sandbox_backend = "none""#).is_err());
     }
 
+    /// A socket path for the resolver tests, whose platform ignores it.
+    fn ignored_socket() -> &'static std::path::Path {
+        std::path::Path::new(DEFAULT_JAILBROKER_SOCKET)
+    }
+
     /// When the user pins `sandbox_backend = "..."` explicitly, the resolver returns that choice
     /// with `auto_resolved == false`: no silent fallback even if the probe would suggest
     /// otherwise.
@@ -6364,12 +6410,12 @@ refuse_private_destinations = true
     #[test]
     fn resolve_sandbox_backend_explicit_value_is_binding() {
         let (backend, auto_resolved, _probe) =
-            resolve_sandbox_backend(Some(SandboxBackend::Landlock));
+            resolve_sandbox_backend(Some(SandboxBackend::Landlock), ignored_socket());
         assert_eq!(backend, SandboxBackend::Landlock);
         assert!(!auto_resolved);
 
         let (backend, auto_resolved, _probe) =
-            resolve_sandbox_backend(Some(SandboxBackend::Bubblewrap));
+            resolve_sandbox_backend(Some(SandboxBackend::Bubblewrap), ignored_socket());
         assert_eq!(backend, SandboxBackend::Bubblewrap);
         assert!(!auto_resolved);
     }
@@ -6381,7 +6427,7 @@ refuse_private_destinations = true
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_sandbox_backend_auto_resolves_when_unset() {
-        let (backend, auto_resolved, _probe) = resolve_sandbox_backend(None);
+        let (backend, auto_resolved, _probe) = resolve_sandbox_backend(None, ignored_socket());
         assert!(auto_resolved);
         assert!(matches!(
             backend,
@@ -6399,17 +6445,33 @@ refuse_private_destinations = true
     fn resolve_sandbox_backend_uses_platform_sandbox_on_non_linux() {
         use crate::sandbox::{BackendProbe, SandboxCapability};
 
-        // Explicit `Some(...)` is ignored on non-Linux; the field is documented as Linux-only.
-        let (_backend, auto_resolved, probe) =
-            resolve_sandbox_backend(Some(SandboxBackend::Bubblewrap));
-        assert!(!auto_resolved);
+        // Explicit `Some(...)` is ignored on non-Linux; the field is documented as Linux-only, so
+        // what comes back is the platform's backend rather than the one that was asked for.
+        let (backend, _auto_resolved, probe) =
+            resolve_sandbox_backend(Some(SandboxBackend::Bubblewrap), ignored_socket());
+        assert_ne!(
+            backend,
+            SandboxBackend::Bubblewrap,
+            "the configured backend is not what this platform runs"
+        );
+        #[cfg(target_os = "freebsd")]
+        assert_eq!(
+            backend,
+            SandboxBackend::Jailbroker,
+            "FreeBSD's backend is the jailbroker, and is reported as itself"
+        );
         // The probe should reflect what `detect()` reports for this host, surfaced as `Ok(...)` so
-        // the consumer can drop into the platform's spawn path.
+        // the consumer can drop into the platform's spawn path. `Ok(Unavailable)` is the one
+        // incoherent answer: confining nothing is what `Missing` is for. Checked with a predicate
+        // rather than a pattern, because on a host with no usable backend (a FreeBSD host with no
+        // jailbroker listening) `Unavailable` is the only capability there is, and a pattern naming
+        // it would leave every other arm of the match unreachable.
         match probe {
-            BackendProbe::Ok(SandboxCapability::Unavailable) => {
-                panic!("Ok(Unavailable) is incoherent: expected a real capability or Missing")
-            }
-            BackendProbe::Ok(_) | BackendProbe::Missing { .. } => {}
+            BackendProbe::Ok(capability) => assert!(
+                !matches!(capability, SandboxCapability::Unavailable),
+                "Ok(Unavailable) is incoherent: expected a real capability or Missing"
+            ),
+            BackendProbe::Missing { .. } => {}
             other => panic!("unexpected probe variant on non-Linux: {other:?}"),
         }
     }

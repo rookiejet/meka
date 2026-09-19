@@ -999,7 +999,7 @@ Controls which permission levels are reachable at runtime and which level the se
 | `enabled` | No | List of levels that can be reached at runtime via `/permission` and Shift+Tab. Default `["none", "read", "workspace", "unrestricted"]`. Disabled levels are skipped during Shift+Tab cycling and refused by `/permission` with an error. |
 | `approvals` | No | Whether a new session starts with [approvals](../usage/permissions.md#approvals) on: a tool call needing more than the session's level is put to you rather than refused. Default `false`. A session records its own switch afterwards, moved by `/approvals`, `PATCH /v1/sessions/{id}` or the ACP `approvals` config option. |
 | `confine_reads` | No | Whether a root session's reads below `unrestricted` are confined to its workspace, its additional readable directories and the directories a command needs to run, the way writes are confined to the workspace at `workspace`. Default `false`. Instance-wide, read at startup: every root session this process runs is bound by it, and `unrestricted` is the per-session escape. A sub-agent's reads are confined to its scope whatever this says. See [The read boundary](../usage/permissions.md#the-read-boundary). |
-| `network` | No | What a confined command and `web_fetch` may reach: `"host"`, the machine's network, or `"none"`. Default `"host"`. With `"none"`, Bubblewrap unshares the network namespace, Landlock refuses every TCP bind and connect (UDP has no Landlock right and stays open), `sandbox-exec` withholds its outbound rule, and `web_fetch`, which runs in the meka process where no sandbox reaches, is withheld from every session and listed by `meka tool list` as `disabled`. Windows has no mechanism for a command and warns once at startup; the tool is withheld there too. An MCP server is a separate process outside the sandbox and keeps its own network: a session that must not reach the network is also given no server that can, through `[[mcp.servers]]` or a sub-agent's `allow_servers`. `unrestricted` runs the shell unsandboxed, so the setting holds `web_fetch` alone there, and the scope lines say `Network: none (web_fetch)`. A sub-agent holds its parent's setting unless its spawn narrows it with [`network`](../tools/overview.md#agent_spawn), and its scope lines say `Network: none (shell and web_fetch)` when it is cut off. A boundary like `confine_reads`, reaching the in-process tool and the sandboxed shell alike, which is why it lives here and not under `[shell]`. |
+| `network` | No | What a confined command and `web_fetch` may reach: `"host"`, the machine's network, or `"none"`. Default `"host"`. With `"none"`, Bubblewrap unshares the network namespace, Landlock refuses every TCP bind and connect (UDP has no Landlock right and stays open), `sandbox-exec` withholds its outbound rule, and `web_fetch`, which runs in the meka process where no sandbox reaches, is withheld from every session and listed by `meka tool list` as `disabled`. Windows has no mechanism for a command and warns once at startup; the tool is withheld there too. A FreeBSD jail holds the cut no more than Windows does: a command's network there is its operator's policy. An MCP server is a separate process outside the sandbox and keeps its own network: a session that must not reach the network is also given no server that can, through `[[mcp.servers]]` or a sub-agent's `allow_servers`. `unrestricted` runs the shell unsandboxed, so the setting holds `web_fetch` alone there, and the scope lines say `Network: none (web_fetch)`. A sub-agent holds its parent's setting unless its spawn narrows it with [`network`](../tools/overview.md#agent_spawn), and its scope lines say `Network: none (shell and web_fetch)` when it is cut off. A boundary like `confine_reads`, reaching the in-process tool and the sandboxed shell alike, which is why it lives here and not under `[shell]`. |
 
 A level meka does not have is refused at parse, with the line. An `enabled` list that names nothing falls back to `read` alone, with a warning, rather than to the default set, so an empty list cannot widen authority. If `default` is not in `enabled`, meka logs a warning and falls back to `read` if it's enabled, otherwise the lowest enabled level (in `none → read → workspace → unrestricted` order). Same behavior if `--permission` or `MEKA_PERMISSION` selects a disabled level: meka warns and starts at the configured default rather than refusing to launch.
 
@@ -1027,11 +1027,11 @@ Default: `true`
 sandbox = false  # disable the sandboxed shell at read
 ```
 
-The sandbox uses Bubblewrap or Landlock on Linux, chosen by [`shell.sandbox_backend`](#shellsandbox_backend), `sandbox-exec` on macOS, and a duplicated Low-integrity primary token on Windows. On platforms where no backend is usable, shell commands always require `unrestricted` regardless of this setting.
+The sandbox uses Bubblewrap or Landlock on Linux, chosen by [`shell.sandbox_backend`](#shellsandbox_backend), `sandbox-exec` on macOS, and a duplicated Low-integrity primary token on Windows. On FreeBSD the sandbox is a jail that the `jailbrokerd` you run builds (see [`shell.jailbroker_socket`](#shelljailbroker_socket)). On platforms where no backend is usable, shell commands always require `unrestricted` regardless of this setting.
 
 ### `shell.sandbox_backend`
 
-Linux-only choice between `"landlock"`, `"bubblewrap"` and `"bubblewrap-landlock"`:
+Linux-only choice between `"landlock"`, `"bubblewrap"` and `"bubblewrap-landlock"` (FreeBSD's backend is the platform's own `jailbroker` and is not settable):
 
 - **Bubblewrap** (`"bubblewrap"`) wraps the command in `bwrap` with read-only bind of `/`, tmpfs masks over `/run` / `/tmp` / `/var/tmp` / `$XDG_RUNTIME_DIR`, and `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks hide the dbus session bus and the systemd-user socket, so state-changing IPC calls like `systemctl --user start` and `dbus-send` fail. Network is intentionally not unshared so `curl http://x | pdftotext` still works. On a kernel with Landlock ABI v6 (6.12) or newer the command also runs inside meka's Landlock ruleset, enacted by `meka confine` after the mounts, which closes the abstract namespace, signals and device ioctls, and from kernel 7.1 the sockets the masks do not cover. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
 - **Bubblewrap with Landlock** (`"bubblewrap-landlock"`) is Bubblewrap with the Landlock layer inside required rather than added where the kernel allows: on a kernel below 6.12 the backend is unusable and `shell_execute` at `read` fails, so a pinned value guarantees the layer is applied. What the layer closes still follows the kernel: the abstract namespace, signals and device ioctls from 6.12, sockets on disk outside the masks from 7.1. Auto-detection never picks it; pin it on a host where that guarantee matters more than a working shell.
@@ -1044,7 +1044,7 @@ If the configured backend can't be used at runtime (bwrap not installed, user na
 Overridable for one run with `meka --sandbox-backend landlock|bubblewrap|bubblewrap-landlock`, and for a whole
 environment with `MEKA_SANDBOX_BACKEND`. Precedence is flag, then environment, then this field.
 
-Default: unset (auto-detect). Ignored on macOS and Windows.
+Default: unset (auto-detect). Ignored on macOS, Windows and FreeBSD.
 
 ```toml
 [shell]
@@ -1054,13 +1054,33 @@ sandbox_backend = "bubblewrap"  # or "landlock", or "bubblewrap-landlock" to req
 
 ### `shell.additional_readable_directories`
 
-Directories every confined command may read beyond the system directories, wherever reads are confined: with [`permissions.confine_reads`](#permissions) on, and for every sub-agent, whose reads its scope confines. Additional beyond the system directories, as the flag [`--additional-readable-directory`](./cli-options.md#--additional-readable-directory-dir) is per run. The system directories are where the operating system keeps the programs, libraries and configuration a command needs to run at all, and the list is deliberately system-level: on Linux `/bin`, `/sbin`, `/usr`, `/lib`, `/lib32`, `/lib64`, `/etc`, `/proc`, `/dev`, `/nix/store` and `/run/current-system/sw`; on macOS `/bin`, `/sbin`, `/usr`, `/etc`, `/System`, `/Library/Apple`, `/Library/Preferences`, `/Library/Filesystems/NetFSPlugins`, `/var/db`, `/opt/homebrew`, `/Library/Developer` and `/dev`, plus the active developer directory `xcode-select` records, since the developer commands in `/usr/bin` are stubs that run the real binaries from there. Each is taken only where it exists. The skill directories [`[skills].additional_directories`](#skills) names are readable too. Add here what else this machine keeps system software under: `/opt`, `/snap`, a toolchain outside the home directory. An entry is warned about and dropped when it does not resolve, when it is relative, or when it is a directory the sandbox masks (`/tmp`, `/run`, the runtime directory, the filesystem root, meka's own directories), since Bubblewrap binds the readable directories after its masks and `/run` named here would hand the session bus back to a confined command. Never in effect on Windows, where the shell's reads are not confined.
+Directories every confined command may read beyond the system directories, wherever reads are confined: with [`permissions.confine_reads`](#permissions) on, and for every sub-agent, whose reads its scope confines. Additional beyond the system directories, as the flag [`--additional-readable-directory`](./cli-options.md#--additional-readable-directory-dir) is per run. The system directories are where the operating system keeps the programs, libraries and configuration a command needs to run at all, and the list is deliberately system-level: on Linux `/bin`, `/sbin`, `/usr`, `/lib`, `/lib32`, `/lib64`, `/etc`, `/proc`, `/dev`, `/nix/store` and `/run/current-system/sw`; on macOS `/bin`, `/sbin`, `/usr`, `/etc`, `/System`, `/Library/Apple`, `/Library/Preferences`, `/Library/Filesystems/NetFSPlugins`, `/var/db`, `/opt/homebrew`, `/Library/Developer` and `/dev`, plus the active developer directory `xcode-select` records, since the developer commands in `/usr/bin` are stubs that run the real binaries from there; on FreeBSD `/bin`, `/sbin`, `/usr`, `/lib`, `/libexec`, `/etc`, `/proc`, `/dev` and `/var/db`, where `pkg` keeps its database. Each is taken only where it exists. The skill directories [`[skills].additional_directories`](#skills) names are readable too. Add here what else this machine keeps system software under: `/opt`, `/snap`, a toolchain outside the home directory. An entry is warned about and dropped when it does not resolve, when it is relative, or when it is a directory the sandbox masks (`/tmp`, `/run`, the runtime directory, the filesystem root, meka's own directories), since Bubblewrap binds the readable directories after its masks and `/run` named here would hand the session bus back to a confined command. Never in effect on Windows, where the shell's reads are not confined. On FreeBSD it widens the file tools' fence alone: a jailed command reads the mount set its operator's policy admits, not this list.
 
 Default: `[]`
 
 ```toml
 [shell]
 additional_readable_directories = ["/opt", "/snap"]
+```
+
+### `shell.jailbroker_socket`
+
+FreeBSD only, and in effect the address of the backend: the file system confinement there is a jail
+that `jailbrokerd` builds on meka's behalf, and this is the Unix socket meka sends its plans to. The
+daemon's own configuration owns that path; this key is how meka is told where it is.
+
+meka probes it once at startup, and it is the probe that decides whether `read` has a shell at all:
+a socket that is not there, not owned by root, or not under a directory chain only root can write is
+refused, and a daemon that does not answer its version's handshake is refused as well. A refused
+socket leaves `shell_execute` at `unrestricted` alone, with the reason reported in the error.
+
+Ignored on every other platform.
+
+Default: `/var/run/jailbroker.sock`.
+
+```toml
+[shell]
+jailbroker_socket = "/var/run/jailbroker.sock"
 ```
 
 ## `[tools]`: built-in tool filters

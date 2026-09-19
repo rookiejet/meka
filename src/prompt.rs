@@ -1301,6 +1301,24 @@ fn build_environment_context(
             "On this platform the shell's reads are not confined; the file tools' are.\n",
         );
     }
+    // The jail is narrower rather than stronger here: it confines a command's reads, but to
+    // the mount set its operator's policy admits, which is not this list, and it holds no
+    // network switch: the cut is the other backends' lever, and a jail keeps the stack it
+    // shares.
+    if cfg!(target_os = "freebsd") {
+        if readable.is_some() {
+            context.push_str(
+                "On this platform the shell's reads are the jail's mount set, not these roots; \
+                 the file tools' are.\n",
+            );
+        }
+        if network == crate::config::Network::None && permission != Permission::Unrestricted {
+            context.push_str(
+                "On this platform the shell's network is not cut off: a jail that shares the \
+                 host's stack still has it.\n",
+            );
+        }
+    }
 
     let now = chrono::Local::now().to_rfc2822();
     context.push_str(&format!("Date: {now}\n"));
@@ -5065,6 +5083,11 @@ mod tests {
             assert_eq!(
                 context.contains("the shell's reads are not confined"),
                 cfg!(windows),
+                "{context}"
+            );
+            assert_eq!(
+                context.contains("the jail's mount set"),
+                cfg!(target_os = "freebsd"),
                 "{context}"
             );
         }
