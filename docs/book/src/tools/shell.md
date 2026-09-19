@@ -31,7 +31,8 @@ Execute a shell command and return its output.
 
 ### Network
 
-The sandbox leaves the network open by default: the threat model is "no state mutation", and `curl http://x | pdftotext` must keep working. [`[permissions].network`](../configuration/config-file.md#permissions) narrows it for a confined command and for `web_fetch` alike. `none` cuts a command off: Bubblewrap unshares the network namespace, so not even loopback answers; Landlock handles every TCP bind and connect from ABI v4 and every UDP bind and send from ABI v10 (kernel 7.2), and grants no port, which leaves UDP open on a kernel between the two; `sandbox-exec` withholds its outbound rule under `(deny default)`, which closes every socket while the system resolver's Mach service stays reachable, so a command can still look names up; the Windows AppContainer grants no network capability. `remote` keeps a command off this machine while other machines stay reachable, which the AppContainer holds; Bubblewrap, Landlock and `sandbox-exec` hold it as `none`, cutting the command off whole, and startup says so once with the value to set that silences the warning. The Windows restricted token cannot cut a command off at all and warns once at startup. The setting reaches `web_fetch` too, which runs in the meka process where no sandbox reaches: withheld whole under `none`, and under `remote` refusing this machine's own addresses at the URL, at every redirect and at the resolver; with a proxy configured the proxy resolves the target and the resolver sees the proxy's name alone, as under `[web].refuse_private_destinations`. It never reaches an MCP server, which is a process outside the sandbox: withhold the server instead. A sub-agent holds its parent's setting unless its spawn narrows it with `network`, and the scope lines of a session whose network is narrowed name what the shell and `web_fetch` each reach, `Network: none (shell and web_fetch)` or `Network: remote (web_fetch), none (shell)`.
+The sandbox leaves the network open by default: the threat model is "no state mutation", and `curl http://x | pdftotext` must keep working. [`[permissions].network`](../configuration/config-file.md#permissions) narrows it for a confined command and for `web_fetch` alike. `none` cuts a command off: Bubblewrap unshares the network namespace, so not even loopback answers; Landlock handles every TCP bind and connect from ABI v4 and every UDP bind and send from ABI v10 (kernel 7.2), and grants no port, which leaves UDP open on a kernel between the two; `sandbox-exec` withholds its outbound rule under `(deny default)`, which closes every socket while the system resolver's Mach service stays reachable, so a command can still look names up; the Windows AppContainer grants no network capability. `remote` keeps a command off this machine while other machines stay reachable, which the AppContainer holds; Bubblewrap, Landlock and `sandbox-exec` hold it as `none`, cutting the command off whole, and startup says so once with the value to set that silences the warning. The Windows restricted token cannot cut a command off at all and warns once at startup. A
+FreeBSD jail leaves a command's network to its operator's policy instead. The setting reaches `web_fetch` too, which runs in the meka process where no sandbox reaches: withheld whole under `none`, and under `remote` refusing this machine's own addresses at the URL, at every redirect and at the resolver; with a proxy configured the proxy resolves the target and the resolver sees the proxy's name alone, as under `[web].refuse_private_destinations`. It never reaches an MCP server, which is a process outside the sandbox: withhold the server instead. A sub-agent holds its parent's setting unless its spawn narrows it with `network`, and the scope lines of a session whose network is narrowed name what the shell and `web_fetch` each reach, `Network: none (shell and web_fetch)` or `Network: remote (web_fetch), none (shell)`.
 
 ### Memory
 
@@ -65,14 +66,14 @@ At **`read`**, commands run inside a sandbox that blocks writes to the user's re
 |---|---|---|
 | Filesystem writes outside tmp / Low-integrity paths | ✓ | |
 | File metadata changes (mode, owner, timestamps, extended attributes) | Bubblewrap / macOS / Windows restricted token / Windows AppContainer, which alone still lets a command rewrite the ACL of a file the user owns, an owner right no grant withdraws | Landlock alone, on every kernel |
-| Filesystem reads of meka's config directory and store | Bubblewrap / Landlock / macOS / Windows AppContainer | Windows restricted token |
-| Filesystem reads outside the session's roots and the system directories, with [`[permissions].confine_reads`](../usage/permissions.md#the-read-boundary) on | Bubblewrap / Landlock / macOS / Windows AppContainer | Windows restricted token |
-| Filesystem reads elsewhere, with `confine_reads` off | | ✓ |
+| Filesystem reads of meka's config directory and store | Bubblewrap / Landlock / macOS / FreeBSD / Windows AppContainer | Windows restricted token |
+| Filesystem reads outside the session's roots and the system directories, with [`[permissions].confine_reads`](../usage/permissions.md#the-read-boundary) on | Bubblewrap / Landlock / macOS / Windows AppContainer | Windows restricted token (anywhere) / FreeBSD's shell (the jail's mount set) |
+| Filesystem reads elsewhere, with `confine_reads` off | | ✓ (FreeBSD's shell: wherever the jail's mount set reaches) |
 | Unix sockets the Bubblewrap masks do not cover (`$HOME`, `/var/lib`, the abstract namespace) | Landlock, and Bubblewrap on kernel 7.1+ (6.12+ for the abstract namespace) | Bubblewrap on older kernels / Windows |
 | Program execution | | ✓ |
 | Outbound network, with [`[permissions].network`](../configuration/config-file.md#permissions) at its default `host` | | ✓ |
-| Outbound network, with `[permissions].network = "none"` | Bubblewrap (the namespace is unshared) / Landlock (every TCP port from ABI v4 and every UDP port from ABI v10; UDP stays open below v10) / macOS / Windows AppContainer | Windows restricted token |
-| Outbound network to this machine, with `[permissions].network = "remote"` (other machines stay reachable) | Windows AppContainer; Bubblewrap / Landlock / macOS hold it as `none` and cut the command off whole | Windows restricted token |
+| Outbound network, with `[permissions].network = "none"` | Bubblewrap (the namespace is unshared) / Landlock (every TCP port from ABI v4 and every UDP port from ABI v10; UDP stays open below v10) / macOS / Windows AppContainer | Windows restricted token / FreeBSD's shell (the jail keeps the stack it shares) |
+| Outbound network to this machine, with `[permissions].network = "remote"` (other machines stay reachable) | Windows AppContainer; Bubblewrap / Landlock / macOS hold it as `none` and cut the command off whole | Windows restricted token / FreeBSD's shell (the jail keeps the stack it shares) |
 | dbus / systemd-user state mutations | Bubblewrap / macOS / Landlock | Windows |
 | Mach IPC state mutation (launchd, pasteboard, LaunchServices) | macOS | Linux / Windows |
 | The user's clipboard, other windows' handles and messages, input injection, global atoms, system parameters, display settings and desktop switches (Windows) | Windows, on both backends: the job's UI restrictions, with the IME and injection bits from the builds that have them | |
@@ -88,11 +89,12 @@ Whether a confined command has somewhere to write temporary files differs by bac
 | Backend | Scratch space | Effect |
 |---|---|---|
 | Bubblewrap (`read`) | Private `/tmp` tmpfs, gone with the sandbox | `mktemp`, Python's `tempfile`, `gcc`, `patch` and `pip` builds all work |
-| Landlock (`read` and `workspace`) | None outside the roots | Those tools fail with `Permission denied` |
+| Landlock (`read` and `workspace`) | A private directory per command, named by `TMPDIR`, `TMP` and `TEMP`, removed when the command ends | The same tools work; a program with a literal `/tmp` in it is still refused |
+| FreeBSD jailbroker (both levels) | Private `/tmp` and `/var/tmp` tmpfs | `mktemp`, `git`, `python`, `gpg`, `pip` all work |
 | Windows `workspace` | None outside the roots | `New-TemporaryFile` is denied (measured) |
 | macOS Seatbelt (`read`) | Per-backend; see below | |
 
-Under Bubblewrap the child writes into an in-memory `/tmp` that exists only inside the sandbox's mount namespace, so nothing real is touched. Landlock can only decide which real paths a process may touch, and the only temporary directory meka could offer there would be a real one under the real `/tmp`; below `unrestricted` meka writes to nothing but its own store, so it offers none. A tool that needs temp files under Landlock is the reason to install Bubblewrap. `git` needs none of this: its lock file lives inside the repository, which is read-only under both backends alike.
+Under Bubblewrap the child writes into an in-memory `/tmp` that vanishes with the sandbox, so nothing real is touched; the FreeBSD jailbroker's jail likewise gets a private writable `/tmp` and `/var/tmp`, so `mktemp` succeeds and the write goes nowhere real. Landlock can only decide which real paths a process may touch, so meka creates an owner-only directory under the temp directory for each command, grants it in the ruleset, points `TMPDIR` at it and removes it afterwards; a directory a crash left behind is swept a day later. `git` needs none of this: its lock file lives inside the repository, which is read-only under all three backends alike.
 
 The practical cost is diagnostic: the failure is a bare `Permission denied` naming a path in `/tmp` (or `%TEMP%` on Windows), with nothing in the message connecting it to the sandbox. If a command fails that way and you expected it to work, add the directory it wants as a writable root at `workspace`.
 
@@ -167,6 +169,59 @@ See [Permissions](../usage/permissions.md#per-platform-enforcement) for the full
 #### When the configured backend is unavailable
 
 If the configured backend can't be used (`bwrap` isn't on `$PATH`, user namespaces are denied, the Windows build lacks the AppContainer API, or the value belongs to another platform), `shell_execute` at `read` returns a hard error rather than silently falling back. The error names the configured backend, the specific failure reason and the key to fix. Either install what is missing, set `sandbox_backend` to a value this platform can use, or switch to `unrestricted` (Shift+Tab).
+
+#### FreeBSD
+
+FreeBSD's confinement is not in meka. `jailbrokerd`, a privileged daemon you run, builds a jail per
+command and runs it there as your own uid; meka sends it a plan over a Unix socket and reads its
+events. The platform has no unprivileged mechanism that refuses a write outside a set of paths that
+would fit in a process (Capsicum removes pathname lookup rather than write access, and a jail needs
+root and is a separate filesystem tree), so the privileged part lives in one small daemon rather
+than in meka.
+
+The only thing to configure here is where that daemon listens:
+
+```toml
+[shell]
+jailbroker_socket = "/var/run/jailbroker.sock"   # the default
+```
+
+`jailbrokerd` and the policy it enforces are set up separately, and that policy is the operator's
+rather than meka's: it names which host paths exist in a jail and which of them may be written. What
+the two levels mean once it is listening:
+
+- **`read`** runs the command in a jail whose filesystem is the host as that policy admits it, by
+  default `/` read-only with any path the policy denies left out. Nothing is mounted read-write.
+  Reads are bounded by that mount set, which is the one place this backend is narrower than the
+  others: a path outside it is not there. `/tmp` and `/var/tmp` are masked empty and world-writable
+  so a command has a scratch directory (a file another tool left in the host's `/tmp` is not visible
+  to it), and meka's config directory, data directory and command captures are masked last, exactly
+  as they are on the other backends. The host's `/var/run` is left alone, because it holds the
+  loader's hint file and a mask over that directory takes everything in it, after which every
+  program from packages fails to start. What keeps a command out of the daemon's own socket is the
+  daemon's rule, which refuses any request that comes from inside a jail it built.
+- **`workspace`** is the same jail plus the session's roots, mounted read-write. A root the policy
+  grants only for reading is refused by name rather than mounted read-only, and a denied path
+  *inside* a root is cut out of it, so the command can write anywhere in that root except there.
+  meka warns when a workspace session comes back with part of a root cut out.
+
+So a `workspace` root has to sit under a path the policy grants for writing, and so does the
+session's working directory, which counts as a root because the file tools may write there too. A
+policy that grants nothing leaves `read` working everywhere and refuses every `workspace` command;
+meka says so at startup. A refusal names the resolved path and the prefix that decided it, and
+nothing is created, so the session you get is never narrower than the level you asked for.
+
+meka refuses a socket that is not root-owned under a root-owned chain of directories. The daemon
+takes orders from whoever can connect, and every plan carries a command's environment and its write
+boundary, so a socket another user could have put there is one whose answers are not the broker's.
+If nothing is listening, `read` has no shell at all and `shell_execute` at `read` returns the
+reason; `unrestricted` runs a command with no jail, as it does everywhere.
+
+The alternative is to run meka itself inside a jail: every command it spawns is then confined by the
+jail's filesystem, network and process view, so `unrestricted` becomes a reasonable level to run at.
+The session's roots have to be mounted into the jail at the paths the session uses, meka's config
+and data directories have to live inside it, and its store should be treated as the only copy of
+anything the agent may write.
 
 #### Disabling the sandbox entirely
 

@@ -131,6 +131,11 @@ what Windows grants every AppContainer, the system directories. The restricted t
 neither token mechanism confines reads, so there the file tools keep it, a command does not, the
 agent is told so in its environment block, and startup warns once when `confine_reads` is on.
 
+On FreeBSD the shell is confined by its jail, but not to this set: a command reads the mount set
+`jailbrokerd`'s policy admits, which the switch does not shape and which is chosen at the daemon,
+not here. The file tools keep this boundary exactly whatever the policy says, and the agent is
+told so in its environment block.
+
 If `[shell].sandbox = false`, `shell_execute` is refused at `workspace` rather than run
 unconfined. Nothing else would be holding the boundary, and half a boundary reported as a whole one
 is worse than an error that says so. Use `unrestricted` for those turns.
@@ -151,7 +156,9 @@ Four limits, stated plainly because none of them is visible from the inside:
   config keys, not by this one.
 - **Reads are not confined unless `[permissions].confine_reads` is on.** The boundary alone is
   "this cannot change things outside the workspace", not "this cannot see them"; the switch adds
-  the second half, as [the read boundary](#the-read-boundary) describes.
+  the second half, as [the read boundary](#the-read-boundary) describes. A jail is the one
+  exception, and it is narrower rather than stronger: inside one, a command reads the mount set
+  its operator admitted and nothing else.
 - **The in-process fence resolves paths, it does not pin them.** `file_write` and `file_edit`
   resolve every existing component of a target before judging it, so a symlink already planted on
   the path is caught. What is left open is the race: a directory checked and then swapped for a
@@ -169,6 +176,7 @@ Four limits, stated plainly because none of them is visible from the inside:
 | macOS | `sandbox-exec` | Yes: writable subpath per workspace directory | Yes: data reads and executable mappings per readable path instead of everywhere; existence and metadata stay global so paths resolve |
 | Windows | AppContainer (preferred) | Yes: a read-write grant per workspace directory in the environment, meka's directories denied | Yes: read-only grants on the readable paths instead of on every drive; a path outside is neither readable nor listable |
 | Windows | restricted token (fallback) | Yes: writes are permitted only where a workspace capability has an ACE | No: the file tools hold the boundary, a command reads anywhere, and the fallback warning says so |
+| FreeBSD | `jailbrokerd`, a jail per command | Yes: the host as its operator admits it, plus a mount per workspace directory | Yes, switch or not: a jail's reads are the mount set its operator admitted, not the readable paths |
 
 Under Bubblewrap, `/tmp`, `/run` and `/var/tmp` are masked with a tmpfs, so paths there are not
 merely unwritable but invisible. A workspace directory under `/tmp` is bound after the mask and stays
@@ -195,6 +203,19 @@ at `read` can still read the config directory and the store, account credentials
 workspace directory containing them can write them; see
 [Shell](../tools/shell.md#windows-pick-a-backend). Only `unrestricted` writes there on the other
 backends.
+
+
+On FreeBSD the confinement is a jail a separate daemon builds, so the boundary is a mount set rather
+than a filter over your filesystem: at `read` the command sees the host as that daemon's operator
+admits it and writes nothing of it (a `tmpfs` over `/tmp` and `/var/tmp` is scratch that goes
+nowhere), and at `workspace` it also writes in the session's roots. Three consequences follow from
+that policy being the operator's rather than meka's. A workspace root the policy does not grant for
+writing is refused rather than mounted read-only. A denied path inside a root is cut out of it, which
+meka reports rather than passing off as the root you asked for. And the network is not restricted, whatever
+[`[permissions].network`](../configuration/config-file.md#permissions) says: the cut is the
+other backends' lever, and a jail that shares the host's stack still has it. The [shell
+page](../tools/shell.md#freebsd) covers the two levels and what meka checks about the socket it talks
+to.
 
 The Windows restricted token works differently enough to be worth stating; none of this applies
 under the AppContainer backend, where the environment grants the workspace directories and nothing
@@ -493,7 +514,7 @@ Commands like `ls`, `cat`, `git log`, `df`, `ps`, and `uname` work normally. Com
 Two things the sandbox deliberately does **not** restrict, on every backend:
 
 - **Reads**, on a root session unless [`[permissions].confine_reads`](#the-read-boundary) is on. A sandboxed command can otherwise read anything your user can, including `~/.ssh` and `~/.aws/credentials`, and on Windows under the restricted token meka's own store. `read` protects the machine from being *changed*, not from being *read*. A sub-agent's reads are confined to its scope whatever the switch says.
-- **The network**, unless [`[permissions].network`](../configuration/config-file.md#permissions) narrows it: `none` cuts a command off, which Bubblewrap, Landlock, `sandbox-exec` and the Windows AppContainer hold and the Windows restricted token cannot; `remote` keeps it off this machine alone, which the AppContainer holds and the others hold as `none`, cutting the command off whole. Open, a command at `read` can still send what it read. Provider API keys are scrubbed from the child's environment, but that is one vector, not a boundary.
+- **The network**, unless [`[permissions].network`](../configuration/config-file.md#permissions) narrows it: `none` cuts a command off, which Bubblewrap, Landlock, `sandbox-exec` and the Windows AppContainer hold and the Windows restricted token and a FreeBSD jail cannot; `remote` keeps it off this machine alone, which the AppContainer holds and the others hold as `none`, cutting the command off whole. Open, a command at `read` can still send what it read. Provider API keys are scrubbed from the child's environment, but that is one vector, not a boundary.
 
 On Windows under the restricted token, `workspace` extends that first point to meka's own process. Its `WRITE_RESTRICTED` token restricts writes only, and unlike `read` it deliberately leaves the integrity label at the parent's level, so a confined command can open meka with `PROCESS_VM_READ` and read its memory. Measured on Windows 11: `OpenProcess` succeeds and `ReadProcessMemory` returns data. This is the one respect in which `workspace` confines less than `read`, whose Low-integrity token Windows blocks from opening a medium-integrity process at all. It grants nothing that reading `meka.db` would not, which a command at either level can already do, but it is worth knowing if you were treating `workspace` as strictly wider than `read` in every direction. They are not ordered that way; see the ladder note above.
 
