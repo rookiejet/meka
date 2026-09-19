@@ -164,7 +164,13 @@ jobs:
           # At 4096 the VM is killed part-way through the build, with no compiler output and only a
           # SIGKILL to show for it; the dependency tree needs the headroom.
           mem: 8192
+          # The guest's `target/` directory is several gigabytes and nothing after this step reads
+          # it, so syncing the workspace back to the runner is pure cost.
+          copyback: false
           prepare: |
+            # The guest is sized from this host unless `cpu` is given, so the number is worth
+            # having in the log rather than inferred.
+            sysctl -n hw.ncpu
             # python3 is what the MCP test fixtures are written in, and the VM carries none.
             pkg install -y curl ca_root_nss python3
             # The toolchain goes where both the installer (root) and the builder below can reach it.
@@ -184,11 +190,17 @@ jobs:
             cd /home/runner/work/meka/meka || cd /github/workspace
             cargo clippy --locked --all-targets -- -D warnings
             RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items
-            # One test at a time: the PTY suite drives a whole meka per test and reads the rows it
-            # has drawn, and under the load of this VM a row can be missing when it looks. Serially
-            # it passes, so what the parallel run reported is the harness timing rather than the
-            # code under it.
-            cargo test --locked --features mock-provider -- --test-threads=1'
+            # Every test target is built once, before any of them runs, so the two runs below
+            # measure the suite rather than the compiler.
+            cargo test --locked --features mock-provider --no-run
+            # Everything but the PTY suite, in parallel: this is where the time goes otherwise,
+            # and these suites wait on child processes rather than on a core.
+            cargo test --locked --features mock-provider --bins --test acp --test cli --test layering --test multiprocess --test serve
+            # The PTY suite, one test at a time: it drives a whole meka per test and reads the rows
+            # it has drawn, and under the load of this VM a row can be missing when it looks.
+            # Serially it passes, so a parallel failure here reports the harness timing rather than
+            # the code under it.
+            cargo test --locked --features mock-provider --test repl_pty -- --test-threads=1'
 
   docs:
     runs-on: ubuntu-latest
