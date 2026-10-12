@@ -100,9 +100,9 @@ struct Run {
     /// The terminal as each of `screens` stood, for what a row's text does not say: the colors of
     /// its cells.
     terminals: Vec<vt100::Screen>,
-    /// The status the child exited with on its own by the time the driver gave up on it, or
-    /// `None` when it had to be killed.
-    exit: Option<i32>,
+    /// The status the child left with on its own: its exit code, or -1 when a signal took it. A
+    /// child that never leaves fails the run before this exists.
+    exit: i32,
     /// Whether the child asked the terminal for the kitty keyboard protocol's disambiguated
     /// keys, which it does only where the terminal says it speaks it.
     enhanced: bool,
@@ -162,20 +162,28 @@ fn drive_run_sized(
     keep_master_here(master);
     let mut run = pump(master, inputs, kitty, columns);
     // SAFETY: `master` is the fd `forkpty` handed back and is still open here, and `pid` is the
-    // child it forked, reaped here and nowhere else.
+    // child it forked, reaped here and nowhere else. Closing the master is part of what makes
+    // the child leave, so it is waited for with the same patience `terminal_taken_away` waits
+    // with rather than checked once: an exit is not owed within the one syscall the close takes.
     run.exit = unsafe {
         libc::close(master);
         let mut status = 0;
-        if libc::waitpid(pid, &mut status, libc::WNOHANG) == pid {
-            Some(if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else {
-                -1
-            })
-        } else {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, &mut status, 0);
-            None
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if libc::waitpid(pid, &mut status, libc::WNOHANG) == pid {
+                break if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    -1
+                };
+            }
+            if Instant::now() > deadline {
+                let account = hang_account(pid);
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+                panic!("the session never left when it was asked to; the child was:\n{account}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     };
     run
@@ -188,6 +196,26 @@ fn keep_master_here(master: RawFd) {
     // SAFETY: `master` is the fd `forkpty` just handed back.
     let flagged = unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) };
     assert!(flagged == 0, "close-on-exec on the master");
+}
+
+/// The kernel's account of where a driven session stood when the driver gave up waiting for it to
+/// leave: what it is doing and what it holds open, for a give-up that means the run under test
+/// hung. Best effort and cross-platform: a tool that is missing simply notes itself in the text.
+/// The account rides the failure that accompanies it out of the test harness — it must never
+/// touch the working tree.
+fn hang_account(pid: i32) -> String {
+    let cmd = format!(
+        "ps -o pid,stat,wchan,command -p {pid}
+        procstat -t {pid}
+        procstat -f {pid} | head -30
+        timeout 3 truss -p {pid} 2>&1 | tail -30"
+    );
+    let Ok(out) = std::process::Command::new("sh").arg("-c").arg(cmd).output() else {
+        return format!("nothing: the tools that read what child {pid} holds did not run");
+    };
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    text
 }
 
 /// A `meka` command line with everything its exec needs laid out ahead of the fork: the child of
@@ -215,7 +243,9 @@ impl PreparedExec {
             .args(args)
             .current_dir(install.work_dir())
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            // /usr/local/bin holds pkg's python3 on the BSDs, and the MCP fixtures spawn it:
+            // without the directory the spawn failed as if the fixture were broken.
+            .env("PATH", "/usr/bin:/bin:/usr/local/bin")
             .env("TERM", "xterm-256color")
             // The sandbox advisories are facts about the kernel the suite runs on, and would be
             // rows of their own on the screen. The two `rmcp` directives are Meka's defaults,
@@ -312,11 +342,46 @@ fn pump(master: RawFd, inputs: &[&str], kitty: bool, columns: u16) -> Run {
     // the agent works. The last row is left out of the comparison and the working row is read
     // as one row for that reason.
     let mut settled = settled_rows(&parser);
+    // Nothing is typed before the child has drawn. Until it takes its terminal into its own
+    // hands the pty is still canonical, and the canonical line discipline takes the submit's
+    // carriage return for a line break, so the composer receives a newline where an Enter was
+    // meant and the turn never opens: the marker behind the next input then never arrives, and
+    // the loss is found screens away as a capture that holds too little. What is typed before
+    // the draw is echoed back over the very rows a capture is about to read.
+    let mut drawn = false;
     // The first send waits longer: the child has a store to migrate before it draws anything.
     let mut quiet_needed = Duration::from_millis(2500);
-    let deadline = Instant::now() + Duration::from_secs(90);
+    // Patience is kept per input and not for the drive: one input can sit behind a whole slow
+    // chain, a store to migrate, a streamed reply, a server coming up, and the slowest of those
+    // chains measures past a minute and a half under this suite's slowest machine. The single
+    // span of ninety seconds the drive used to keep cut captures short mid-chain, and a capture
+    // cut short surfaces as an index error in whatever test asked for it, far from what went
+    // wrong. A wait that runs out says so instead: the input, the row it waited for, and the
+    // screen it stood on. Twice the slowest chain is the margin.
+    let patience = Duration::from_secs(300);
+    let mut sent = Instant::now();
 
-    while Instant::now() < deadline {
+    loop {
+        if sent.elapsed() > patience {
+            let Some(line) = pending.last() else {
+                // Every input is in and the child has not settled: what it has drawn is what
+                // there is to capture.
+                break;
+            };
+            let why = awaited(line).map_or(
+                "the screen never stood still long enough to type".to_string(),
+                |(row, _)| format!("no row ever held {row:?}"),
+            );
+            panic!(
+                "the drive waited {patience:?} to send {:?} (input {} of {}) and gave up: {}; \
+                 the screen stood:\n{}",
+                line,
+                inputs.len() - pending.len() + 1,
+                inputs.len(),
+                why,
+                rows_of(&parser).join("\n"),
+            );
+        }
         // SAFETY: `master` is open, and the buffer outlives the call.
         let read = unsafe {
             let mut poll = libc::pollfd {
@@ -354,9 +419,12 @@ fn pump(master: RawFd, inputs: &[&str], kitty: bool, columns: u16) -> Run {
         } else if read == 0 {
             break;
         }
+        if !drawn {
+            drawn = rows_of(&parser).iter().any(|row| !row.trim().is_empty());
+        }
         // Judged whether or not bytes arrived: the working row's spinner has the child writing
         // every frame of a turn, and a capture mid-turn is what some tests are for.
-        if last_activity.elapsed() > quiet_needed {
+        if drawn && last_activity.elapsed() > quiet_needed {
             if let Some((row_text, _)) = pending.last().and_then(|line| awaited(line))
                 && !rows_of(&parser).iter().any(|row| row.contains(row_text))
             {
@@ -382,6 +450,7 @@ fn pump(master: RawFd, inputs: &[&str], kitty: bool, columns: u16) -> Run {
                     }
                     last_activity = Instant::now();
                     quiet_needed = Duration::from_millis(1500);
+                    sent = Instant::now();
                 }
                 // Everything sent and the child has gone quiet: it has exited or is idle, and
                 // either way there is nothing left to capture.
@@ -393,7 +462,8 @@ fn pump(master: RawFd, inputs: &[&str], kitty: bool, columns: u16) -> Run {
     Run {
         screens,
         terminals,
-        exit: None,
+        // Replaced by the reap in `drive_run_sized`; a run only reaches a test past it.
+        exit: 0,
         enhanced,
         clipboard: last_clipboard_write(&raw),
         left: rows_of(&parser),
@@ -2153,7 +2223,7 @@ fn leaving_during_a_typed_turn_opens_no_turn_on_what_waits() {
     let until_running = format!("{AWAITED}TYPED_RUNNING{AWAITED}/exit");
     let run = drive_run(&install, &["TYPED_PROMPT", &until_running], false);
     let item = player.join().expect("the item was planted");
-    assert_eq!(run.exit, Some(0), "{:#?}", run.screens);
+    assert_eq!(run.exit, 0, "{:#?}", run.screens);
     assert_turns_left_the_item_unread(&install, &["client"], &item, &run);
 }
 
@@ -2183,7 +2253,7 @@ fn leaving_during_an_inbox_turn_opens_no_turn_on_what_arrived_meanwhile() {
     let until_running = format!("{AWAITED}FIRST_RUNNING{AWAITED}/exit");
     let run = drive_run(&install, &[&until_running], false);
     let item = player.join().expect("the item was planted");
-    assert_eq!(run.exit, Some(0), "{:#?}", run.screens);
+    assert_eq!(run.exit, 0, "{:#?}", run.screens);
     assert_turns_left_the_item_unread(&install, &["client", "inbox"], &item, &run);
 }
 
@@ -2289,9 +2359,9 @@ fn leaving_during_a_turn_stops_it() {
     let install = screen_install("read", "", "");
     install.write_script(LONG_TURN);
     let run = drive_run(&install, &["go", "/exit"], false);
-    assert!(
-        run.exit.is_some(),
-        "Meka was still running the turn after the screen left: {:#?}",
+    assert_eq!(
+        run.exit, 0,
+        "the turn was stopped and the run left cleanly rather than working on headless: {:#?}",
         run.screens
     );
 }
@@ -2303,7 +2373,7 @@ fn the_third_interrupt_press_leaves_with_status_130() {
     let install = screen_install("read", "", "");
     install.write_script(TWO_TURNS);
     let run = drive_run(&install, &["\x03", "\x03", "\x03"], false);
-    assert_eq!(run.exit, Some(130), "{:#?}", run.screens);
+    assert_eq!(run.exit, 130, "{:#?}", run.screens);
 }
 
 /// Where the terminal speaks the kitty keyboard protocol, the screen asks for its disambiguated
@@ -2602,7 +2672,7 @@ fn esc_stops_a_running_shell_command() {
         "the command was killed rather than waited out: {:?}",
         started.elapsed()
     );
-    assert_eq!(run.exit, Some(0), "{rows:#?}");
+    assert_eq!(run.exit, 0, "{rows:#?}");
 }
 
 /// The terminal going away is a hangup: the screen leaves the way it does on a key, so the
@@ -2865,13 +2935,17 @@ fn terminal_taken_away(detached: bool) -> (Option<i32>, Vec<i32>, Screens) {
 
 /// The pids whose command line carries `marker`.
 fn processes_running(marker: &str) -> Vec<i32> {
-    // `/proc` where there is one; macOS has none, and `ps` answers the same question there.
+    // `/proc` where it is mounted; macOS has none, and `ps` answers the same question there.
+    // An unmounted procfs is an empty directory, and reading that as "no processes at all" is
+    // how this check lied on FreeBSD, so the scan only counts when pids are in it.
     if let Ok(entries) = std::fs::read_dir("/proc") {
         let mut found = Vec::new();
+        let mut pids = 0;
         for entry in entries.flatten() {
             let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
                 continue;
             };
+            pids += 1;
             let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
                 continue;
             };
@@ -2882,10 +2956,16 @@ fn processes_running(marker: &str) -> Vec<i32> {
                 found.push(pid);
             }
         }
-        return found;
+        if pids > 0 {
+            return found;
+        }
     }
+    // `-x` is not decoration: the commands being looked for run in their own sessions without
+    // a controlling terminal, and BSD ps drops every process without one however the other
+    // flags are spelled. The keywords come without `=headers` because BSD ps reads everything
+    // after `=` as header text: `pid=,args=` is one column whose rows carry no command at all.
     let Ok(listed) = std::process::Command::new("ps")
-        .args(["-A", "-o", "pid=,args="])
+        .args(["-Ax", "-o", "pid,args"])
         .output()
     else {
         return Vec::new();
@@ -3148,7 +3228,7 @@ fn a_bare_resume_opens_the_picker_and_enter_attaches_the_pick() {
             .any(|row| row.starts_with("• Resuming session ")),
         "and the resume is announced: {rows:#?}"
     );
-    assert_eq!(run.exit, Some(0), "{rows:#?}");
+    assert_eq!(run.exit, 0, "{rows:#?}");
 }
 
 /// The picker is a table: the facts stand in columns of their own at the right edge, the same
@@ -3205,7 +3285,7 @@ fn a_picker_is_a_table_with_the_facts_in_their_columns() {
             "the age column ends one column short of the edge: {row:?}"
         );
     }
-    assert_eq!(run.exit, Some(0), "{opening:#?}");
+    assert_eq!(run.exit, 0, "{opening:#?}");
 }
 
 /// On a terminal wider than the wire's title allows for, a picker row still fills: the title
@@ -3240,7 +3320,7 @@ fn an_ultrawide_picker_row_holds_more_of_a_title_than_the_wire_carries() {
         usize::from(WIDE) - 1,
         "the facts end one column short of the edge: {row:?}"
     );
-    assert_eq!(run.exit, Some(0), "{opening:#?}");
+    assert_eq!(run.exit, 0, "{opening:#?}");
 }
 
 /// `/resume` from a running session switches the screen to the pick: the picked session's rows
@@ -3270,7 +3350,7 @@ fn resume_switches_the_running_screen_to_the_pick() {
         !rows.iter().any(|row| row == "▎ hello"),
         "the session left behind is off the screen: {rows:#?}"
     );
-    assert_eq!(run.exit, Some(0), "{rows:#?}");
+    assert_eq!(run.exit, 0, "{rows:#?}");
     // The run is on the pick from then on, so it leaves the pick, and the lock and the watchers
     // it keeps are the pick's.
     let listed = install
@@ -3381,7 +3461,7 @@ fn resume_runs_the_session_under_its_own_directory_s_instructions() {
         "and the session moved back to under its own: {:#?}",
         run.screens
     );
-    assert_eq!(run.exit, Some(0), "{:#?}", run.screens);
+    assert_eq!(run.exit, 0, "{:#?}", run.screens);
 }
 
 /// A switch is refused while the session on screen still runs a background task, by `/resume`
@@ -3464,7 +3544,7 @@ fn a_switch_is_refused_while_a_background_task_runs() {
         reported > 0,
         "the session read what the command printed: {rows:#?}"
     );
-    assert_eq!(run.exit, Some(0), "{rows:#?}");
+    assert_eq!(run.exit, 0, "{rows:#?}");
 }
 
 /// After `/resume`, the second Ctrl+C sent from outside stops the background tasks of the session
@@ -3633,7 +3713,7 @@ fn a_change_after_resume_lands_on_the_resumed_session() {
         left.ends_with("work"),
         "the session left keeps its own: {left}"
     );
-    assert_eq!(run.exit, Some(0), "{rows:#?}");
+    assert_eq!(run.exit, 0, "{rows:#?}");
 }
 
 /// `/resume` shows the checklist the session it moves to was left with, as `meka -r` does, when the
@@ -3692,7 +3772,7 @@ fn resume_shows_the_checklist_the_session_was_left_with_past_its_first_page() {
             .any(|row| row.contains("» ask Sam (waiting on Sam)")),
         "and shows the list it was left with: {rows:#?}"
     );
-    assert_eq!(run.exit, Some(0), "{rows:#?}");
+    assert_eq!(run.exit, 0, "{rows:#?}");
 }
 
 /// `/resume` back to a session says a background report on its first page as the live run said
@@ -3760,7 +3840,7 @@ fn resume_names_the_task_a_report_on_the_first_page_came_from() {
         said,
         "the first page after `/resume` says it as the live run did: {rows:#?}"
     );
-    assert_eq!(run.exit, Some(0), "{rows:#?}");
+    assert_eq!(run.exit, 0, "{rows:#?}");
 }
 
 /// What opening a session warns of is on the screen after `/resume` moves to it, as it is after
@@ -3794,7 +3874,7 @@ fn resume_keeps_what_opening_the_session_warned_of() {
         drawn.contains("which no longer exists; opening in"),
         "the warning the opening raised is shown: {rows:#?}"
     );
-    assert_eq!(run.exit, Some(0), "{rows:#?}");
+    assert_eq!(run.exit, 0, "{rows:#?}");
 }
 
 /// A switch asked for right behind `/task cancel --all` is made: a task that has been told to
@@ -3848,7 +3928,7 @@ fn a_switch_right_after_the_tasks_were_canceled_is_made() {
         .expect("the task's row");
     assert_eq!(status, "canceled", "{rows:#?}");
     assert!(survivors.is_empty(), "the command was ended: {survivors:?}");
-    assert_eq!(run.exit, Some(0), "{rows:#?}");
+    assert_eq!(run.exit, 0, "{rows:#?}");
 }
 
 /// Words sent right behind a `/resume`, before the host has ended the switch, open a turn on the
@@ -3902,7 +3982,7 @@ fn words_sent_during_a_switch_run_on_the_session_moved_to() {
         left_waiting, 0,
         "nothing was left for the session let go: {rows:#?}"
     );
-    assert_eq!(run.exit, Some(0), "{rows:#?}");
+    assert_eq!(run.exit, 0, "{rows:#?}");
 }
 
 /// A command the host answers is refused while a turn runs, in a panel naming the command, and
