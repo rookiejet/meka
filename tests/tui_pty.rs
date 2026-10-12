@@ -67,9 +67,9 @@ fn drive(install: &Install, inputs: &[&str]) -> Screens {
 /// What one driven session came to.
 struct Run {
     screens: Screens,
-    /// The status the child exited with on its own by the time the driver gave up on it, or
-    /// `None` when it had to be killed.
-    exit: Option<i32>,
+    /// The status the child left with on its own: its exit code, or -1 when a signal took it. A
+    /// child that never leaves fails the run before this exists.
+    exit: i32,
     /// Whether the child asked the terminal for the kitty keyboard protocol's disambiguated
     /// keys, which it does only where the terminal says it speaks it.
     enhanced: bool,
@@ -125,20 +125,28 @@ fn drive_run_sized(
     keep_master_here(master);
     let (screens, enhanced, clipboard) = pump(master, inputs, kitty, columns);
     // SAFETY: `master` is the fd `forkpty` handed back and is still open here, and `pid` is the
-    // child it forked, reaped here and nowhere else.
+    // child it forked, reaped here and nowhere else. Closing the master is part of what makes
+    // the child leave, so it is waited for with the same patience `terminal_taken_away` waits
+    // with rather than checked once: an exit is not owed within the one syscall the close takes.
     let exit = unsafe {
         libc::close(master);
         let mut status = 0;
-        if libc::waitpid(pid, &mut status, libc::WNOHANG) == pid {
-            Some(if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else {
-                -1
-            })
-        } else {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, &mut status, 0);
-            None
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if libc::waitpid(pid, &mut status, libc::WNOHANG) == pid {
+                break if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    -1
+                };
+            }
+            if Instant::now() > deadline {
+                let account = hang_account(pid);
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+                panic!("the session never left when it was asked to; the child was:\n{account}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     };
     Run {
@@ -156,6 +164,26 @@ fn keep_master_here(master: RawFd) {
     // SAFETY: `master` is the fd `forkpty` just handed back.
     let flagged = unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) };
     assert!(flagged == 0, "close-on-exec on the master");
+}
+
+/// The kernel's account of where a driven session stood when the driver gave up waiting for it to
+/// leave: what it is doing and what it holds open, for a give-up that means the run under test
+/// hung. Best effort and cross-platform: a tool that is missing simply notes itself in the text.
+/// The account rides the failure that accompanies it out of the test harness — it must never
+/// touch the working tree.
+fn hang_account(pid: i32) -> String {
+    let cmd = format!(
+        "ps -o pid,stat,wchan,command -p {pid}
+        procstat -t {pid}
+        procstat -f {pid} | head -30
+        timeout 3 truss -p {pid} 2>&1 | tail -30"
+    );
+    let Ok(out) = std::process::Command::new("sh").arg("-c").arg(cmd).output() else {
+        return format!("nothing: the tools that read what child {pid} holds did not run");
+    };
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    text
 }
 
 /// A `meka` command line with everything its exec needs laid out ahead of the fork: the child of
@@ -1047,9 +1075,9 @@ fn leaving_during_a_turn_stops_it() {
     let install = screen_install("read", "", "");
     install.write_script(LONG_TURN);
     let run = drive_run(&install, &["go", "/exit"], false);
-    assert!(
-        run.exit.is_some(),
-        "meka was still running the turn after the screen left: {:#?}",
+    assert_eq!(
+        run.exit, 0,
+        "the turn was stopped and the run left cleanly rather than working on headless: {:#?}",
         run.screens
     );
 }
@@ -1061,7 +1089,7 @@ fn the_third_interrupt_press_leaves_with_status_130() {
     let install = screen_install("read", "", "");
     install.write_script(TWO_TURNS);
     let run = drive_run(&install, &["\x03", "\x03", "\x03"], false);
-    assert_eq!(run.exit, Some(130), "{:#?}", run.screens);
+    assert_eq!(run.exit, 130, "{:#?}", run.screens);
 }
 
 /// Where the terminal speaks the kitty keyboard protocol, the screen asks for its disambiguated
@@ -1176,7 +1204,7 @@ fn esc_stops_a_running_shell_command() {
         "the command was killed rather than waited out: {:?}",
         started.elapsed()
     );
-    assert_eq!(run.exit, Some(0), "{rows:#?}");
+    assert_eq!(run.exit, 0, "{rows:#?}");
 }
 
 /// The terminal going away is a hangup: the screen leaves the way it does on a key, so the
@@ -1290,13 +1318,17 @@ fn terminal_taken_away(detached: bool) -> (Option<i32>, Vec<i32>, Screens) {
 
 /// The pids whose command line carries `marker`.
 fn processes_running(marker: &str) -> Vec<i32> {
-    // `/proc` where there is one; macOS has none, and `ps` answers the same question there.
+    // `/proc` where it is mounted; macOS has none, and `ps` answers the same question there.
+    // An unmounted procfs is an empty directory, and reading that as "no processes at all" is
+    // how this check lied on FreeBSD, so the scan only counts when pids are in it.
     if let Ok(entries) = std::fs::read_dir("/proc") {
         let mut found = Vec::new();
+        let mut pids = 0;
         for entry in entries.flatten() {
             let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
                 continue;
             };
+            pids += 1;
             let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
                 continue;
             };
@@ -1307,10 +1339,16 @@ fn processes_running(marker: &str) -> Vec<i32> {
                 found.push(pid);
             }
         }
-        return found;
+        if pids > 0 {
+            return found;
+        }
     }
+    // `-x` is not decoration: the commands being looked for run in their own sessions without
+    // a controlling terminal, and BSD ps drops every process without one however the other
+    // flags are spelled. The keywords come without `=headers` because BSD ps reads everything
+    // after `=` as header text: `pid=,args=` is one column whose rows carry no command at all.
     let Ok(listed) = std::process::Command::new("ps")
-        .args(["-A", "-o", "pid=,args="])
+        .args(["-Ax", "-o", "pid,args"])
         .output()
     else {
         return Vec::new();
@@ -1485,7 +1523,7 @@ fn a_bare_resume_opens_the_picker_and_enter_attaches_the_pick() {
             .any(|row| row.starts_with("• Resuming session ")),
         "and the resume is announced: {rows:#?}"
     );
-    assert_eq!(run.exit, Some(0), "{rows:#?}");
+    assert_eq!(run.exit, 0, "{rows:#?}");
 }
 
 /// The picker is a table: the facts stand in columns of their own at the right edge, the same
@@ -1542,7 +1580,7 @@ fn a_picker_is_a_table_with_the_facts_in_their_columns() {
             "the age column ends one column short of the edge: {row:?}"
         );
     }
-    assert_eq!(run.exit, Some(0), "{opening:#?}");
+    assert_eq!(run.exit, 0, "{opening:#?}");
 }
 
 /// On a terminal wider than the wire's title allows for, a picker row still fills: the title
@@ -1577,7 +1615,7 @@ fn an_ultrawide_picker_row_holds_more_of_a_title_than_the_wire_carries() {
         usize::from(WIDE) - 1,
         "the facts end one column short of the edge: {row:?}"
     );
-    assert_eq!(run.exit, Some(0), "{opening:#?}");
+    assert_eq!(run.exit, 0, "{opening:#?}");
 }
 
 /// `/resume` from a running session switches the screen to the pick: the picked session's rows
@@ -1607,7 +1645,7 @@ fn resume_switches_the_running_screen_to_the_pick() {
         !rows.iter().any(|row| row == "> hello"),
         "the session left behind is off the screen: {rows:#?}"
     );
-    assert_eq!(run.exit, Some(0), "{rows:#?}");
+    assert_eq!(run.exit, 0, "{rows:#?}");
 }
 
 /// A command the host answers is refused while a turn runs, in a panel naming the command, and
