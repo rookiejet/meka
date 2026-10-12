@@ -1346,7 +1346,12 @@ fn an_interrupted_json_oneshot_run_still_reports() {
 fn an_interrupted_wait_stops_the_background_task_it_was_waiting_for() {
     fn a_process_lists(needle: &str) -> bool {
         let listing = std::process::Command::new("ps")
-            .args(["-eo", "args"])
+            // `-x` is not decoration: the command being looked for is detached (its own session,
+            // no controlling terminal), and BSD ps's default selection drops every process
+            // without one however the flags are spelled. Without the flag this wait times out on
+            // FreeBSD no matter what the command does. On ps that already lists detached
+            // processes the flag is a no-op.
+            .args(["-exo", "args"])
             .output()
             .expect("ps runs");
         String::from_utf8_lossy(&listing.stdout).contains(needle)
