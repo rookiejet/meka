@@ -194,19 +194,23 @@ jobs:
             export CARGO_INCREMENTAL=0
             export CARGO_PROFILE_TEST_DEBUG=0
             cd /home/runner/work/meka/meka || cd /github/workspace
-            cargo clippy --locked --all-targets -- -D warnings
-            RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items
+            # Every command runs and every failure is kept: `su -c` would otherwise report only
+            # the last line of this script, which is how a red suite went green for a week.
+            status=0
+            cargo clippy --locked --all-targets -- -D warnings || status=1
+            RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items || status=1
             # Every test target is built once, before any of them runs, so the two runs below
             # measure the suite rather than the compiler.
-            cargo test --locked --features mock-provider --no-run
+            cargo test --locked --features mock-provider --no-run || status=1
             # Everything but the PTY suite, in parallel: this is where the time goes otherwise,
             # and these suites wait on child processes rather than on a core.
-            cargo test --locked --features mock-provider --bins --test acp --test cli --test layering --test multiprocess --test serve
+            cargo test --locked --features mock-provider --bins --test acp --test cli --test layering --test multiprocess --test serve || status=1
             # The PTY suite, one test at a time: it drives a whole meka per test and reads the rows
             # it has drawn, and under the load of this VM a row can be missing when it looks.
             # Serially it passes, so a parallel failure here reports the harness timing rather than
             # the code under it.
-            cargo test --locked --features mock-provider --test repl_pty -- --test-threads=1'
+            cargo test --locked --features mock-provider --test tui_pty -- --test-threads=1 || status=1
+            exit $status'
 
   docs:
     runs-on: ubuntu-latest
