@@ -124,20 +124,28 @@ fn drive_run_sized(
     keep_master_here(master);
     let (screens, enhanced, clipboard) = pump(master, inputs, kitty, columns);
     // SAFETY: `master` is the fd `forkpty` handed back and is still open here, and `pid` is the
-    // child it forked, reaped here and nowhere else.
+    // child it forked, reaped here and nowhere else. Closing the master is part of what makes
+    // the child leave, so it is waited for with the same patience `terminal_taken_away` waits
+    // with rather than checked once: an exit is not owed within the one syscall the close takes.
     let exit = unsafe {
         libc::close(master);
         let mut status = 0;
-        if libc::waitpid(pid, &mut status, libc::WNOHANG) == pid {
-            Some(if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else {
-                -1
-            })
-        } else {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, &mut status, 0);
-            None
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if libc::waitpid(pid, &mut status, libc::WNOHANG) == pid {
+                break Some(if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    -1
+                });
+            }
+            if Instant::now() > deadline {
+                recorded_hang(pid);
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     };
     Run {
@@ -155,6 +163,25 @@ fn keep_master_here(master: RawFd) {
     // SAFETY: `master` is the fd `forkpty` just handed back.
     let flagged = unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) };
     assert!(flagged == 0, "close-on-exec on the master");
+}
+
+/// Where a driven session stood when the driver gave up waiting for it to leave: the kernel's
+/// account of what it is doing and what it holds open, for a give-up that is a bug rather than
+/// timing. Best effort and cross-platform: a tool that is missing simply notes itself in the
+/// file. Written under `.gates/`, where the logs of a run are kept anyway.
+fn recorded_hang(pid: i32) {
+    let cmd = format!(
+        "ps -o pid,stat,wchan,command -p {pid}
+        procstat -t {pid}
+        procstat -f {pid} | head -30
+        timeout 3 truss -p {pid} 2>&1 | tail -30"
+    );
+    if let Ok(out) = std::process::Command::new("sh").arg("-c").arg(cmd).output() {
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        let _ = std::fs::create_dir_all(".gates");
+        let _ = std::fs::write(format!(".gates/hang-{pid}.txt"), text);
+    }
 }
 
 /// A `meka` command line with everything its exec needs laid out ahead of the fork: the child of
@@ -1282,13 +1309,17 @@ fn terminal_taken_away(detached: bool) -> (Option<i32>, Vec<i32>, Screens) {
 
 /// The pids whose command line carries `marker`.
 fn processes_running(marker: &str) -> Vec<i32> {
-    // `/proc` where there is one; macOS has none, and `ps` answers the same question there.
+    // `/proc` where it is mounted; macOS has none, and `ps` answers the same question there.
+    // An unmounted procfs is an empty directory, and reading that as "no processes at all" is
+    // how this check lied on FreeBSD, so the scan only counts when pids are in it.
     if let Ok(entries) = std::fs::read_dir("/proc") {
         let mut found = Vec::new();
+        let mut pids = 0;
         for entry in entries.flatten() {
             let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
                 continue;
             };
+            pids += 1;
             let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
                 continue;
             };
@@ -1299,10 +1330,16 @@ fn processes_running(marker: &str) -> Vec<i32> {
                 found.push(pid);
             }
         }
-        return found;
+        if pids > 0 {
+            return found;
+        }
     }
+    // `-x` is not decoration: the commands being looked for run in their own sessions without
+    // a controlling terminal, and BSD ps drops every process without one however the other
+    // flags are spelled. The keywords come without `=headers` because BSD ps reads everything
+    // after `=` as header text: `pid=,args=` is one column whose rows carry no command at all.
     let Ok(listed) = std::process::Command::new("ps")
-        .args(["-A", "-o", "pid=,args="])
+        .args(["-Ax", "-o", "pid,args"])
         .output()
     else {
         return Vec::new();
