@@ -25,7 +25,7 @@ use crate::{
 /// Bytes of a tool's output or result kept for display. Shell output can run to the 64 MiB bound
 /// the tool itself imposes, and a transcript holding every byte of it would be as slow to draw as
 /// it is pointless to read; the tail is what a person looks at.
-const TOOL_TEXT_KEEP_BYTES: usize = 64 * 1024;
+pub(super) const TOOL_TEXT_KEEP_BYTES: usize = 64 * 1024;
 
 /// What the UI starts from, taken from the config once.
 #[derive(Debug, Clone)]
@@ -459,26 +459,15 @@ impl Transcript {
     /// A compaction's row and its contents: the checkpoint's steps, as the transcript draws a
     /// turn's, then `summary` unless it is blank.
     fn compaction_entries(&mut self, record: &crate::conversation::CompactionRecord) -> Vec<Entry> {
-        let mut contents = compaction_steps(record);
-        let summary = record.written_summary.trim();
-        if !summary.is_empty() {
-            contents.push(Item::CompactionSummary {
-                text: summary.to_string(),
-            });
-        }
-        let head = self.entry(Item::Compaction {
-            headline: record.headline().to_string(),
-            departures: record
-                .departures()
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-        });
-        let id = head.id;
-        let mut entries = vec![head];
-        for item in contents {
+        let mut entries = Vec::new();
+        let mut head = 0;
+        for item in compaction_items(record) {
             let mut entry = self.entry(item);
-            entry.compaction = Some(id);
+            if entries.is_empty() {
+                head = entry.id;
+            } else {
+                entry.compaction = Some(head);
+            }
             entries.push(entry);
         }
         entries
@@ -2084,7 +2073,7 @@ fn edge_turns(page: &crate::store::LogPage) -> (Option<Uuid>, Option<Uuid>) {
 /// file read as an image, which the count says; the tools a load made callable, which its row
 /// names; the directions around a large output kept in the scratchpad. The notice of a call sent
 /// to the background is the call's to say; see [`settle_call`].
-fn result_text(content: &[ToolResultContent]) -> (String, usize) {
+pub(super) fn result_text(content: &[ToolResultContent]) -> (String, usize) {
     let images = content
         .iter()
         .filter(|part| matches!(part, ToolResultContent::Image { .. }))
@@ -2115,7 +2104,7 @@ fn result_text(content: &[ToolResultContent]) -> (String, usize) {
 /// Close a call with its result, live or replayed, so the two read alike: the text, the images,
 /// how it ended and what the log records of it for the screen. A result that records nothing
 /// shows the change the call's arguments describe, unless it failed, which changed nothing.
-fn settle_call(
+pub(super) fn settle_call(
     item: &mut Item,
     text: String,
     images: usize,
@@ -2171,6 +2160,29 @@ fn background_row(started: &crate::conversation::BackgroundStart) -> String {
         ),
         None => format!("Background task {}", started.short_task()),
     }
+}
+
+/// A compaction's rows as items: its own row first, then the contents the screen folds under it —
+/// the checkpoint's steps, as a turn's are drawn, then `summary` unless it is blank. The screen
+/// places these as entries of its own; the append renderer prints them whole, which is the only
+/// shape a row printed once can give them.
+pub(super) fn compaction_items(record: &crate::conversation::CompactionRecord) -> Vec<Item> {
+    let mut items = vec![Item::Compaction {
+        headline: record.headline().to_string(),
+        departures: record
+            .departures()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    }];
+    items.extend(compaction_steps(record));
+    let summary = record.written_summary.trim();
+    if !summary.is_empty() {
+        items.push(Item::CompactionSummary {
+            text: summary.to_string(),
+        });
+    }
+    items
 }
 
 /// What a compaction's row shows it did: the checkpoint's rounds, or, on a boundary that recorded
