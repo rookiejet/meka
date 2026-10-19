@@ -29,6 +29,7 @@ mod background;
 mod checklist;
 mod cli;
 mod config;
+mod console;
 mod conversation;
 mod entry;
 mod error;
