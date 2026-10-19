@@ -426,3 +426,61 @@ takes typed answers, one field at a time; Esc declines. While any of these is op
 it rather than stopping the turn; Ctrl+C stops the turn, which withdraws the question. Questions
 are put one at a time: when two tool calls dispatched together both ask, the second waits until
 the first is answered.
+
+## Append mode
+
+`--renderer append`, or [`display.renderer = "append"`](../configuration/config-file.md#displayrenderer)
+in the config, opens the same session on the append renderer instead of the screen. It takes
+nothing away from the terminal: no alternate screen, no mouse capture, no redraws. Every row
+prints once under the prompt and stays where it printed, in the terminal's own buffer, so the
+terminal's scrollback, its own text selection and its copy keys all keep working, and a slow
+`ssh` link sees each row arrive once rather than watch a screen being repainted.
+
+The rows read like the screen's transcript in one column: `>` what you sent, `•` something the
+agent or meka did, `!` a warning, `■` an error, and nothing for the answer itself. An answer
+streams in as it arrives, a paragraph at a time — each prints when the blank line under it settles
+it — and once a row has printed nothing moves it: what the agent sends next adds rows below. Tool
+calls print when they settle, their arguments as a tree and their diff under them; a call still
+running when the turn ends prints as ended without a result. A prompt sent mid-turn is queued for
+the running turn and marked `(steer, waiting)` until it is delivered.
+
+A permission prompt is rows of the same transcript: the call and its arguments as a tree, the four
+answers spelled out, and a `>` line to answer on. `y` grants, `a` grants for the session, `n`
+denies and the fourth answer denies for the session; Esc denies. An answer is a single keypress
+held for a moment, so a stray key does not grant. A question the agent asks prints the same way,
+with its choices; Esc withdraws it. An MCP form is declined with a note, since a form has nowhere
+to type in an append. A `!command` is refused the same way: run it in a shell.
+
+The composer is one line at the bottom. **Enter** sends; while a turn runs it queues the line for
+the running turn, the way the screen's `Alt+S` modes do. **Up** and **Down** walk what you sent
+before, and `Ctrl+A`/`Ctrl+E`, `Ctrl+K`/`Ctrl+U` and `Ctrl+W` edit the line.
+**Alt+Enter** or **Ctrl+J** types a line break, and so does **Shift+Enter** on a terminal that
+speaks the kitty keyboard protocol, which append asks for only where the terminal says it does.
+A multi-line paste (the terminal's bracketed paste, which append turns on) lands in the line as one
+paste, each line break shown as `↵` and sent as the line break it is, so a pasted paragraph is one
+prompt that **Enter** sends. An answer line takes the same paste with the breaks as spaces.
+[Images](#images) attach by pasting or dragging a path to an image file; append never reads the
+system clipboard, so there is no **Ctrl+V** here. Each waiting image shows as `[image 1  name]` in
+front of the `>`, **Backspace** on an empty line drops the last, and **Enter** sends them with the
+words as an `• image` row per image.
+`Ctrl+C` and `Esc` run the same interrupt ladder as the screen: stop the turn, then the background
+tasks, then leave. `Ctrl+D` leaves on the empty composer of an idle run, as does `/exit`. The
+slash commands are the screen's, and answer as rows; `/help` lists them with the keys above. The
+pickers need a name: `/resume SESSION`, `/skill NAME`, `/memory NAME`, since there is no panel to
+pick them in.
+
+Under the composer's input line sits the screen's status row: the permission level always opens
+it, then whatever [`display.status_row`](../configuration/config-file.md#displaystatus_row) lists
+— the working directory, the profile, the model, the context gauge, the running-work counts. It
+is redrawn in place along with the line being typed, the one thing a run like this redraws, so it
+never prints into the terminal's buffer and never scrolls the transcript. The hints the screen
+hangs on the row's right edge print here as rows of their own instead.
+
+A continued or resumed session reads its turns back as rows, oldest first, and the new rows print
+after them — everything the log holds, with one row per compaction and per rewind.
+
+What append does not do is what the screen owns and rows cannot: scrolling a resumed session back
+into view above what loaded, expanding and collapsing blocks, searching the transcript, mouse
+pickers and text selection through meka, and the `!command` shell escape. The
+turn-end row prints, if
+[`display.turn_end_summary`](../configuration/config-file.md#displayturn_end_summary) names one.

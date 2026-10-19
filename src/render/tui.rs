@@ -292,6 +292,82 @@ pub(crate) fn is_blank(line: &Line<'static>) -> bool {
     line.spans.iter().all(|span| span.content.trim().is_empty())
 }
 
+/// The rows as strings for a terminal nothing is drawing on: one styled string per row.
+pub(crate) fn lines_to_ansi(lines: &[Line<'_>]) -> Vec<String> {
+    lines.iter().map(line_to_ansi).collect()
+}
+
+/// One row as bytes for the write-once renderer: each span's styles applied to it and closed with
+/// it, so a row is a string a writer can print and forget. A screen redraws at another width; a
+/// row printed once cannot take a style back, so every span closes its own.
+pub(crate) fn line_to_ansi(line: &Line<'_>) -> String {
+    use crossterm::style::Stylize;
+    let mut row = String::new();
+    for span in &line.spans {
+        let mut styled = span.content.as_ref().with(match span.style.fg {
+            Some(color) => terminal_color(color),
+            None => crossterm::style::Color::Reset,
+        });
+        if let Some(background) = span.style.bg {
+            styled = styled.on(terminal_color(background));
+        }
+        for attribute in terminal_attributes(span.style.add_modifier) {
+            styled = styled.attribute(attribute);
+        }
+        row.push_str(&styled.to_string());
+    }
+    row
+}
+
+/// A ratatui color as the terminal's own.
+fn terminal_color(color: Color) -> crossterm::style::Color {
+    match color {
+        Color::Reset => crossterm::style::Color::Reset,
+        Color::Black => crossterm::style::Color::Black,
+        Color::Red => crossterm::style::Color::DarkRed,
+        Color::Green => crossterm::style::Color::DarkGreen,
+        Color::Yellow => crossterm::style::Color::DarkYellow,
+        Color::Blue => crossterm::style::Color::DarkBlue,
+        Color::Magenta => crossterm::style::Color::DarkMagenta,
+        Color::Cyan => crossterm::style::Color::DarkCyan,
+        Color::Gray => crossterm::style::Color::Grey,
+        Color::DarkGray => crossterm::style::Color::DarkGrey,
+        Color::LightRed => crossterm::style::Color::Red,
+        Color::LightGreen => crossterm::style::Color::Green,
+        Color::LightYellow => crossterm::style::Color::Yellow,
+        Color::LightBlue => crossterm::style::Color::Blue,
+        Color::LightMagenta => crossterm::style::Color::Magenta,
+        Color::LightCyan => crossterm::style::Color::Cyan,
+        Color::White => crossterm::style::Color::White,
+        Color::Rgb(red, green, blue) => crossterm::style::Color::Rgb {
+            r: red,
+            g: green,
+            b: blue,
+        },
+        Color::Indexed(index) => crossterm::style::Color::AnsiValue(index),
+    }
+}
+
+/// The attributes a ratatui modifier asks for, one per bit it holds.
+fn terminal_attributes(modifier: Modifier) -> Vec<crossterm::style::Attribute> {
+    use crossterm::style::Attribute;
+    [
+        (Modifier::BOLD, Attribute::Bold),
+        (Modifier::DIM, Attribute::Dim),
+        (Modifier::ITALIC, Attribute::Italic),
+        (Modifier::UNDERLINED, Attribute::Underlined),
+        (Modifier::SLOW_BLINK, Attribute::SlowBlink),
+        (Modifier::RAPID_BLINK, Attribute::RapidBlink),
+        (Modifier::REVERSED, Attribute::Reverse),
+        (Modifier::HIDDEN, Attribute::Hidden),
+        (Modifier::CROSSED_OUT, Attribute::CrossedOut),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| modifier.contains(*bit))
+    .map(|(_, attribute)| attribute)
+    .collect()
+}
+
 /// A fenced block's body, highlighted for `language` in the screen's code theme, one row per source
 /// line, left for the caller to fold at its width.
 pub(crate) fn code_lines(body: &[String], language: Option<&str>) -> Vec<Line<'static>> {

@@ -14,6 +14,10 @@ pub(crate) mod panel;
 pub(crate) mod screen;
 pub(crate) mod view;
 
+/// The append renderer: the same host loop below, with the screen task swapped for one that
+/// prints rows once to the normal buffer.
+pub(crate) mod append;
+
 use self::frontend::{HostEvent, Ui, UiEvent};
 use super::{terminal::*, *};
 
@@ -100,10 +104,11 @@ pub(crate) async fn run_interactive(
 
     // What the screen opens with: the banner where the log has nothing to show, the resume row,
     // then the conversation as far back as the log goes.
-    let mut transcript = model::Transcript::new(model::Settings {
+    let settings = model::Settings {
         show_session_id_on_create: config.show_session_id_on_create,
         turn_end_summary: config.turn_end_summary.clone(),
-    });
+    };
+    let mut transcript = model::Transcript::new(settings.clone());
     if let Some(id) = session_id {
         match store.turn_store().load_turns(id).await {
             Ok(turns) => transcript.set_turn_records(turns),
@@ -183,7 +188,14 @@ pub(crate) async fn run_interactive(
             })
             .expect("a fresh channel accepts its first send");
     }
-    let frontend = Arc::new(frontend::TuiFrontend::new(ui.clone()));
+    // The frontend the agent asks through. The append renderer answers the same questions over
+    // the same channel; what differs is the task at the other end and the rows it prints.
+    let frontend: Arc<dyn crate::frontend::Frontend> =
+        if matches!(config.renderer, crate::config::Renderer::Append) {
+            Arc::new(append::AppendFrontend::new(ui.clone()))
+        } else {
+            Arc::new(frontend::TuiFrontend::new(ui.clone()))
+        };
 
     // The status row's context gauge: the agent writes it after each turn and the screen reads it
     // each frame. The window is seeded from the process default and corrected to the session's own
@@ -317,53 +329,73 @@ pub(crate) async fn run_interactive(
         }
     }
     // Opened once there is an agent to answer it, which is what makes every refusal above final.
+    // The renderer's own task: the screen draws and reads keys, the append renderer prints rows
+    // once to the normal buffer. Either way the loop below is the same host.
     let screen_watch = (host_sender.clone(), cancel.clone());
-    let screen_handle = tokio::spawn(screen::run_screen(screen::ScreenLaunch {
-        ui_receiver,
-        ui: ui.clone(),
-        log_end,
-        host: host_sender,
-        logs: screen_logs,
-        transcript,
-        shared_permission: shared_permission.clone(),
-        sandbox_state,
-        cwd: cwd.clone(),
-        launch_cwd: launch_cwd.clone(),
-        status_row: config.status_row.clone(),
-        context: context_indicator,
-        history,
-        completer: input::Completer {
-            mcp_server_names: config
-                .mcp_servers
-                .iter()
-                .map(|server| server.name.clone())
-                .collect(),
-            skill_names: Arc::new(std::sync::RwLock::new(Vec::new())),
-            profile_names: config
-                .profile_summaries
-                .iter()
-                .map(|profile| profile.name.clone())
-                .collect(),
+    let renderer_task = if matches!(config.renderer, crate::config::Renderer::Append) {
+        tokio::spawn(append::run_append(append::AppendLaunch {
+            ui_receiver,
+            host: host_sender,
+            logs: screen_logs,
+            transcript,
+            log_end,
+            settings,
+            shared_permission: shared_permission.clone(),
+            sandbox_state,
             cwd: cwd.clone(),
-        },
-        skill_roots: config.skill_roots(),
-        current_profile: Arc::clone(&current_profile),
-        configured_profiles: config.profile_summaries.clone(),
-        schedule: config.schedule.clone(),
-        store: store.clone(),
-        agent: Arc::clone(&agent),
-        running_subagents: shared.running_subagents.clone(),
-        cancel: cancel.clone(),
-        send_class: inbox_class(config.send_class),
-        mouse: config.mouse,
-        busy: initial_turn_pending,
-        pick_session: config.request.session_resume == Some(crate::config::SessionResume::Pick),
-    }));
-    // Ends the host loop when the screen stops on its own, a panic included: the loop otherwise
-    // waits for an exit only the screen sends, and the signal listener's sender keeps the
-    // channel open. The turn is stopped with it, since nothing shows it any more.
+            launch_cwd: launch_cwd.clone(),
+            history,
+            skill_roots: config.skill_roots(),
+            current_profile: Arc::clone(&current_profile),
+            status_row: config.status_row.clone(),
+            context: context_indicator,
+            configured_profiles: config.profile_summaries.clone(),
+            running_subagents: shared.running_subagents.clone(),
+            schedule: config.schedule.clone(),
+            memory_inline_max_bytes: config.memory_inline_max_bytes,
+            completer: completer(&config, &cwd),
+            store: store.clone(),
+            agent: Arc::clone(&agent),
+            cancel: cancel.clone(),
+            send_class: inbox_class(config.send_class),
+            busy: initial_turn_pending,
+            pick_session: config.request.session_resume == Some(crate::config::SessionResume::Pick),
+        }))
+    } else {
+        tokio::spawn(screen::run_screen(screen::ScreenLaunch {
+            ui_receiver,
+            ui: ui.clone(),
+            log_end,
+            host: host_sender,
+            logs: screen_logs,
+            transcript,
+            shared_permission: shared_permission.clone(),
+            sandbox_state,
+            cwd: cwd.clone(),
+            launch_cwd: launch_cwd.clone(),
+            status_row: config.status_row.clone(),
+            context: context_indicator,
+            history,
+            completer: completer(&config, &cwd),
+            skill_roots: config.skill_roots(),
+            current_profile: Arc::clone(&current_profile),
+            configured_profiles: config.profile_summaries.clone(),
+            schedule: config.schedule.clone(),
+            store: store.clone(),
+            agent: Arc::clone(&agent),
+            running_subagents: shared.running_subagents.clone(),
+            cancel: cancel.clone(),
+            send_class: inbox_class(config.send_class),
+            mouse: config.mouse,
+            busy: initial_turn_pending,
+            pick_session: config.request.session_resume == Some(crate::config::SessionResume::Pick),
+        }))
+    };
+    // Ends the host loop when the renderer stops on its own, a panic included: the loop otherwise
+    // waits for an exit only it sends, and the signal listener's sender keeps the channel open.
+    // The turn is stopped with it, since nothing shows it any more.
     let screen_handle = tokio::spawn(async move {
-        let outcome = screen_handle.await;
+        let outcome = renderer_task.await;
         let (host, cancel) = screen_watch;
         cancel.cancel(crate::store::turns::CancelReason::Client);
         if host.send(HostEvent::Exit { interrupted: false }).is_err() {
@@ -372,7 +404,7 @@ pub(crate) async fn run_interactive(
         match outcome {
             Ok(result) => result,
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => Err(anyhow::anyhow!("the screen task was canceled: {error}")),
+            Err(error) => Err(anyhow::anyhow!("the renderer task was canceled: {error}")),
         }
     });
 
@@ -678,6 +710,24 @@ pub(crate) async fn run_interactive(
 /// The inbox class a configured send class names. Two enums for one set of words, because the
 /// config is read below the store; this is where they meet, and the test below holds them to the
 /// same spellings.
+/// The slash-command completer both renderers offer: the names the config and the disk know.
+fn completer(config: &ResolvedConfig, cwd: &crate::workspace::SharedCwd) -> input::Completer {
+    input::Completer {
+        mcp_server_names: config
+            .mcp_servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect(),
+        skill_names: Arc::new(std::sync::RwLock::new(Vec::new())),
+        profile_names: config
+            .profile_summaries
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect(),
+        cwd: cwd.clone(),
+    }
+}
+
 fn inbox_class(class: crate::config::SendClass) -> crate::store::inbox::InboxClass {
     match class {
         crate::config::SendClass::Steer => crate::store::inbox::InboxClass::Steer,

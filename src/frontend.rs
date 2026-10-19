@@ -133,6 +133,11 @@ pub(crate) trait Frontend: Send + Sync {
         false
     }
 
+    /// Forget the answers given "for the rest of the session" so far, for a host that has moved
+    /// this frontend onto another session: what was answered about the one being left ends with
+    /// it. A frontend that remembers none has nothing to forget.
+    fn forget_session_answers(&self) {}
+
     /// Handle an MCP `elicitation/create` request: the server asked the user for input (either a
     /// structured form or a URL-consent flow). The frontend is responsible for prompting the user
     /// and returning their response. The default impl declines and says so through a

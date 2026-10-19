@@ -1139,6 +1139,17 @@ pub(crate) struct Cli {
     #[arg(long = "no-stream")]
     pub(crate) no_stream: bool,
 
+    #[arg(
+        long = "renderer",
+        value_name = "RENDERER",
+        help = listed(
+            "Interactive renderer (see `[display] renderer`)",
+            crate::config::Renderer::ALL.iter().map(|renderer| renderer.name()),
+            ""
+        )
+    )]
+    pub(crate) renderer: Option<crate::config::Renderer>,
+
     /// Standing instructions for this run, replacing the discovered ones
     #[arg(long = "instructions", value_name = "STRING")]
     pub(crate) instructions: Option<String>,
@@ -1195,6 +1206,7 @@ impl Cli {
             additional_workspace_directories: self.additional_workspace_directory.clone(),
             additional_readable_directories: self.additional_readable_directory.clone(),
             no_stream: self.no_stream,
+            renderer: self.renderer,
             resume: self.resume.clone(),
             continue_last: self.continue_last,
             prompt: self.prompt.clone(),

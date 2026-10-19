@@ -346,6 +346,17 @@ Disable streaming for this run. The agent waits for the complete response before
 meka --no-stream
 ```
 
+### `--renderer <RENDERER>`
+
+Which renderer draws this run's interactive session: `screen` (the default) or `append`, the
+append-only one that prints rows into the terminal's normal buffer and redraws nothing.
+[`display.renderer`](./config-file.md#displayrenderer) is the standing form. A one-shot run is not
+interactive and draws nothing.
+
+```bash
+meka --renderer append
+```
+
 ### `--instructions <STRING>`
 
 Standing [instructions](../usage/instructions.md) for this run, replacing the `instructions.md` file and both `MEKA_INSTRUCTIONS*` environment variables. Takes the text itself, not a path; use `"$(cat file.md)"` to read one.

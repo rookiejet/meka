@@ -36,6 +36,9 @@ const RANKS: &[(&str, u32)] = &[
     ("cli", 2),
     // Presentation, reached only from the layers that own a terminal.
     ("relay", 2),
+    // The write-once rows the append renderer prints: below the hosts that drive it, above the
+    // render layer that dresses the rows.
+    ("console", 3),
     ("render", 4),
     ("agent", 5),
     // The JSON shapes both hosts print, converted from the domain types below them.
@@ -538,6 +541,12 @@ const PROCESS_STARTERS: &[(&str, &str)] = &[
         "the screen's `!command`, through `process::spawn`; the browser it opens for a URL a \
          server asks for (`open::that`) is the user's own and stays outside, since a job would \
          close it with the call",
+    ),
+    (
+        "src/host/tui/append.rs",
+        "the browser it opens for a URL a server asks for (`open::that`), the user's own and \
+         outside the door for the screen's reason; append mode refuses `!command`, so this is the \
+         only process it starts",
     ),
     (
         "src/scheduler.rs",

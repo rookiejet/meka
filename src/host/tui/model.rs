@@ -25,7 +25,7 @@ use crate::{
 /// Bytes of a tool's output or result kept for display. Shell output can run to the 64 MiB bound
 /// the tool itself imposes, and a transcript holding every byte of it would be as slow to draw as
 /// it is pointless to read; the tail is what a person looks at.
-const TOOL_TEXT_KEEP_BYTES: usize = 64 * 1024;
+pub(super) const TOOL_TEXT_KEEP_BYTES: usize = 64 * 1024;
 
 /// What the UI starts from, taken from the config once.
 #[derive(Debug, Clone)]
@@ -1465,7 +1465,7 @@ fn edge_turns(page: &crate::store::LogPage) -> (Option<Uuid>, Option<Uuid>) {
 }
 
 /// The readable part of a tool result, tail-capped, and how many images it carried.
-fn result_text(content: &[ToolResultContent]) -> (String, usize) {
+pub(super) fn result_text(content: &[ToolResultContent]) -> (String, usize) {
     let mut text = String::new();
     let mut images = 0;
     for part in content {

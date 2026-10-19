@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The append renderer: `--renderer append`, or `[display].renderer = "append"`, runs the session
+  as rows that print once into the terminal's normal buffer. Its scrollback and selection keep
+  working, nothing is redrawn, and no mouse is captured.
+- The append composer carries the screen's status row under its input line: the permission level
+  always opens it, then whatever `[display.status_row]` lists, redrawn in place with the line
+  being typed and never printed into the terminal's buffer.
+- The append composer takes a multi-line paste as one prompt (bracketed paste), sent intact,
+  instead of sending a line per pasted line. Alt+Enter and Ctrl+J type a line break.
+- The append composer grows a row for each line of a multi-line prompt, indented under the
+  first, and shrinks back as lines are deleted. Past the terminal's height it shows the lines
+  around the cursor.
+- The append composer shows a working row above its input while a turn runs: the spinner, what
+  the agent is doing, the seconds it has run and the key that stops it. It says the turn is
+  waiting for an answer while a question is open, and clears when the turn ends.
+- The append composer attaches images by a pasted path to an image file, shown as
+  `[image N  name]` before the prompt glyph and sent with the next prompt. It never reads the
+  system clipboard.
+- Append asks for the kitty keyboard protocol where the terminal speaks it, so Shift+Enter types
+  a line break there.
+- Append mode folds MCP tool progress reports onto the call's own row, as the screen does.
+- Append mode completes slash commands and their arguments on Tab, as the screen does.
 - Three `opencode-go` backends, one per protocol, for OpenCode Go's subscription.
 - OpenCode Go requests carry the required `x-opencode-session` header per conversation.
 - `meka account usage` reports an OpenCode Go subscription's dollar-budget windows.
