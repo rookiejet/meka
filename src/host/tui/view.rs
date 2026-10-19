@@ -154,8 +154,9 @@ fn copied_rows_of(
 /// The color of the bar down a sent prompt's left edge: its turn's permission level, as the
 /// composer's bar is the level's now; red for a `!command`, as the composer's is in the shell
 /// mode; and gray while nothing says the level, for a turn the log has no record of or one that
-/// has not opened yet.
-fn ran_under_color(ran_under: RanUnder) -> Color {
+/// has not opened yet. The append renderer's left-aligned prompt status line wears it on its
+/// icon in place of the bar.
+pub(crate) fn ran_under_color(ran_under: RanUnder) -> Color {
     match ran_under {
         RanUnder::Level(level) => color(level.indicator_color()),
         RanUnder::Shell => Color::Red,

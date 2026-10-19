@@ -773,9 +773,77 @@ impl From<TurnEndFact> for String {
     }
 }
 
+/// How the interactive chat draws. The screen owns the terminal and repaints it; the append
+/// renderer prints to the normal buffer once per row, where the terminal's own scrollback works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum Renderer {
+    /// The retained terminal screen.
+    Screen,
+    /// Rows appended to the normal buffer, never redrawn.
+    Append,
+}
+
+impl Renderer {
+    /// Every renderer, in the order the documentation lists them.
+    pub(crate) const ALL: [Renderer; 2] = [Self::Screen, Self::Append];
+
+    /// The word the config file and the docs use for the renderer.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Screen => "screen",
+            Self::Append => "append",
+        }
+    }
+}
+
+impl std::fmt::Display for Renderer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for Renderer {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|renderer| renderer.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a renderer. Supported: {}",
+                    Self::ALL
+                        .iter()
+                        .map(|renderer| renderer.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for Renderer {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<Renderer> for String {
+    fn from(renderer: Renderer) -> Self {
+        renderer.name().to_string()
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DisplayConfig {
+    /// How the interactive chat draws: the retained `screen`, or `append` rows to the normal
+    /// buffer. `--renderer` overrides it for one run.
+    pub(crate) renderer: Option<Renderer>,
     /// What the status row under the composer shows, in the order each side shows its own. Unset
     /// shows [`StatusFact::DEFAULT_ROW`].
     pub(crate) status_row: Option<Vec<StatusFact>>,
@@ -2139,6 +2207,8 @@ pub(crate) struct CliOverrides {
     pub(crate) additional_workspace_directories: Vec<std::path::PathBuf>,
     pub(crate) additional_readable_directories: Vec<std::path::PathBuf>,
     pub(crate) no_stream: bool,
+    /// `--renderer` on the run.
+    pub(crate) renderer: Option<Renderer>,
     pub(crate) resume: Option<Option<String>>,
     pub(crate) continue_last: bool,
     pub(crate) prompt: Option<String>,
@@ -2265,6 +2335,8 @@ pub(crate) struct ResolvedConfig {
     pub(crate) show_session_id_on_create: bool,
     pub(crate) show_session_id_on_resume: bool,
     pub(crate) show_session_id_on_exit: bool,
+    /// Resolved `[display].renderer`, as `--renderer` left it.
+    pub(crate) renderer: Renderer,
     /// Resolved `[display].mouse`.
     pub(crate) mouse: bool,
     /// Resolved `[display].wheel_rows`.
@@ -3397,6 +3469,10 @@ impl ResolvedConfig {
             show_session_id_on_create: file_display.show_session_id_on_create.unwrap_or(false),
             show_session_id_on_resume: file_display.show_session_id_on_resume.unwrap_or(false),
             show_session_id_on_exit: file_display.show_session_id_on_exit.unwrap_or(true),
+            renderer: overrides
+                .renderer
+                .or(file_display.renderer)
+                .unwrap_or(Renderer::Screen),
             mouse: file_display.mouse.unwrap_or(true),
             wheel_rows: file_display.wheel_rows.unwrap_or(1),
             send_class: file_display.send_class.unwrap_or_default(),
@@ -7400,7 +7476,8 @@ refuse_private_destinations = true
         assert!(!resolution.auto_resolved);
         assert!(resolution.fallback_from.is_none());
 
-        let resolution = resolve_sandbox_backend(Some(SandboxBackend::Bubblewrap), ignored_socket());
+        let resolution =
+            resolve_sandbox_backend(Some(SandboxBackend::Bubblewrap), ignored_socket());
         assert_eq!(resolution.backend, SandboxBackend::Bubblewrap);
         assert!(!resolution.auto_resolved);
     }

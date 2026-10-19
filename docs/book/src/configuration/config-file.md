@@ -1402,9 +1402,51 @@ max_redirects = 0
 
 ## `[display]`
 
-Settings for the interactive screen: the two rows it composes, whether finished steps fold and
-streaming thinking shows open, the session id lines, what Enter does while a turn runs, the mouse,
+Settings for the interactive session: which renderer draws it, the two rows the screen composes,
+whether finished steps fold, the session id lines, what Enter does while a turn runs, the mouse,
 and `stream`, which also decides how a one-shot run asks the provider.
+
+### `display.renderer`
+
+Which renderer draws the interactive session:
+
+| Value | |
+|-------|---|
+| `screen` (default) | The full-screen renderer. It owns the terminal while it runs: the alternate screen, the mouse when [`display.mouse`](#displaymouse) is on, a transcript it redraws and moves through. |
+| `append` | The append renderer. Rows print once under the prompt and stay in the terminal's own buffer — the normal screen, its scrollback, and the terminal's own text selection. Nothing that has printed is ever redrawn, nothing scrolls on its own, and no mouse is captured whatever `display.mouse` says. |
+
+Append mode is the session for terminals where the screen fights the user: over `ssh` on a link
+whose round trip makes every redraw visible, on terminals without the escape sequences the screen
+wants, and in any workflow that treats the transcript as text to select and copy mid-run. It keeps
+its own one-line editor with history, prints everything as transcript rows — streamed answers
+paragraph by paragraph as each settles, tool calls when they settle, permission prompts inline
+with their arguments and a one-line answer — and leaves `Ctrl+C` to stop a turn and `Ctrl+D` to
+leave. See [Append mode](../usage/interactive-mode.md#append-mode).
+
+What append does not do is what a screen owns and an append cannot: scrolling a resumed session
+back into view above what loaded, expanding or collapsing blocks, searching the transcript, mouse
+pickers, and attaching images. The [usage page](../usage/interactive-mode.md#append-mode) has the
+full list. [`display.turn_end_summary`](#displayturn_end_summary) still applies to the row that
+closes a turn, and [`display.status_row`](#displaystatus_row) composes the row under the
+composer's input line, redrawn in place with it rather than printed.
+
+Rows print flush left, with no gutter: each row's text sits where a copy of it would land — past
+the gutter and a code block's margin, a line the width folded whole again — so the terminal's own
+selection copies what is on the screen. What the gutter said stays as status lines in the stream,
+in the color their kind wears over the dim that marks the screen's own words: an act `•`, an error
+`■`, a warning its `!`, a prompt `>`, and a boundary its `→←`. A tool call's result prints flush
+under its call's status line, where the tree's elbow held it; a list's hang and a quote's bar
+stay, since they are the text's own shape. A prompt's status line names the level it ran under and
+the class it rode in as, where the bar down its edge says it in color alone.
+
+The `--renderer` flag overrides this for one run.
+
+```toml
+[display]
+renderer = "append"
+```
+
+Default: `screen`
 
 ### `display.status_row`
 
@@ -1424,11 +1466,14 @@ the context gauge and the running work stand against the right edge.
 - `tasks`: `2 background tasks`, while any run
 - `subagents`: `1 sub-agent`, while any run
 
-Where the row is narrow, the level stays whole and the readings give way to it, each shown whole or
-not at all, from the last, since a reading cut short reads as another number; the facts after the
-level give way from the last too: the one that no longer fits is cut (a path from its start), or
-dropped when too little of it would show. A word that is not one of these, or one listed twice, is
-refused by name.
+A hint (`Copied 3 rows`, `The question was withdrawn`) takes the status row's right side while it
+stands, whatever the list says. Where the row is narrow, the level stays whole and the readings give
+way to it, each shown whole or not at all, from the last, since a reading cut short reads as another
+number; the facts after the level give way from the last too: the one that no longer fits is cut
+(a path from its start), or dropped when too little of it would show. A word that is not one of
+these, or one listed twice, is refused by name. On the [append renderer](#displayrenderer) the row
+is the one under the composer's input line, redrawn in place with it; the hints print there as rows
+of their own, so the row carries none.
 
 ```toml
 [display]
@@ -1568,7 +1613,8 @@ send_class = "followup"
 Whether the interactive screen captures the mouse. With it on, the wheel scrolls the transcript and
 a click expands or collapses a block; the terminal's own click-and-drag then needs its modifier key
 (Shift in most terminals, Option in iTerm2) to select text. With it off the mouse is the terminal's,
-and the keyboard still scrolls and toggles. See
+and the keyboard still scrolls and toggles. The [append renderer](#displayrenderer) captures no
+mouse at all, so the key is the screen's alone. See
 [Scrolling and the mouse](../usage/interactive-mode.md#scrolling-and-the-mouse).
 
 Default: `true`

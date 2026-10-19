@@ -181,7 +181,9 @@ pub(crate) fn streaming_rows(text: &str, width: usize, reasoning: bool) -> Vec<R
 const MIN_NESTED_WIDTH: usize = 10;
 /// The columns between two cells of a table, and under them in its rule.
 const TABLE_GAP: usize = 2;
-const BULLET: char = '•';
+/// The mark an unordered list item opens with: a dash rather than the `•` an act wears, so a
+/// list's rows never read as tool calls where both sit at column 0.
+const BULLET: char = '–';
 const QUOTE_BAR: char = '▐';
 const RULE: char = '―';
 const TABLE_RULE: char = '─';
@@ -739,6 +741,82 @@ pub(crate) fn is_blank(line: &Line<'static>) -> bool {
         .all(|span| span.content.trim().is_empty() && !has_background(span.style))
 }
 
+/// The rows as strings for a terminal nothing is drawing on: one styled string per row.
+pub(crate) fn lines_to_ansi(lines: &[Line<'_>]) -> Vec<String> {
+    lines.iter().map(line_to_ansi).collect()
+}
+
+/// One row as bytes for the write-once renderer: each span's styles applied to it and closed with
+/// it, so a row is a string a writer can print and forget. A screen redraws at another width; a
+/// row printed once cannot take a style back, so every span closes its own.
+pub(crate) fn line_to_ansi(line: &Line<'_>) -> String {
+    use crossterm::style::Stylize;
+    let mut row = String::new();
+    for span in &line.spans {
+        let mut styled = span.content.as_ref().with(match span.style.fg {
+            Some(color) => terminal_color(color),
+            None => crossterm::style::Color::Reset,
+        });
+        if let Some(background) = span.style.bg {
+            styled = styled.on(terminal_color(background));
+        }
+        for attribute in terminal_attributes(span.style.add_modifier) {
+            styled = styled.attribute(attribute);
+        }
+        row.push_str(&styled.to_string());
+    }
+    row
+}
+
+/// A ratatui color as the terminal's own.
+fn terminal_color(color: Color) -> crossterm::style::Color {
+    match color {
+        Color::Reset => crossterm::style::Color::Reset,
+        Color::Black => crossterm::style::Color::Black,
+        Color::Red => crossterm::style::Color::DarkRed,
+        Color::Green => crossterm::style::Color::DarkGreen,
+        Color::Yellow => crossterm::style::Color::DarkYellow,
+        Color::Blue => crossterm::style::Color::DarkBlue,
+        Color::Magenta => crossterm::style::Color::DarkMagenta,
+        Color::Cyan => crossterm::style::Color::DarkCyan,
+        Color::Gray => crossterm::style::Color::Grey,
+        Color::DarkGray => crossterm::style::Color::DarkGrey,
+        Color::LightRed => crossterm::style::Color::Red,
+        Color::LightGreen => crossterm::style::Color::Green,
+        Color::LightYellow => crossterm::style::Color::Yellow,
+        Color::LightBlue => crossterm::style::Color::Blue,
+        Color::LightMagenta => crossterm::style::Color::Magenta,
+        Color::LightCyan => crossterm::style::Color::Cyan,
+        Color::White => crossterm::style::Color::White,
+        Color::Rgb(red, green, blue) => crossterm::style::Color::Rgb {
+            r: red,
+            g: green,
+            b: blue,
+        },
+        Color::Indexed(index) => crossterm::style::Color::AnsiValue(index),
+    }
+}
+
+/// The attributes a ratatui modifier asks for, one per bit it holds.
+fn terminal_attributes(modifier: Modifier) -> Vec<crossterm::style::Attribute> {
+    use crossterm::style::Attribute;
+    [
+        (Modifier::BOLD, Attribute::Bold),
+        (Modifier::DIM, Attribute::Dim),
+        (Modifier::ITALIC, Attribute::Italic),
+        (Modifier::UNDERLINED, Attribute::Underlined),
+        (Modifier::SLOW_BLINK, Attribute::SlowBlink),
+        (Modifier::RAPID_BLINK, Attribute::RapidBlink),
+        (Modifier::REVERSED, Attribute::Reverse),
+        (Modifier::HIDDEN, Attribute::Hidden),
+        (Modifier::CROSSED_OUT, Attribute::CrossedOut),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| modifier.contains(*bit))
+    .map(|(_, attribute)| attribute)
+    .collect()
+}
+
 /// A fenced block's body, highlighted for `language` in the screen's code theme, one row per source
 /// line, left for the caller to fold at its width.
 pub(crate) fn code_lines(body: &[String], language: Option<&str>) -> Vec<Line<'static>> {
@@ -1107,6 +1185,195 @@ pub(crate) fn edge_rows(rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
             line
         })
         .collect()
+}
+
+/// The mark a status line opens with: the `•` the gutter's act always wore, kept at column 0 where
+/// no gutter runs. A list's bullet wears a dash of its own, so the two are told apart by their
+/// first character alone.
+pub(crate) const STATUS_ACT: &str = "•";
+/// The mark a status line of an error opens with: the `■` the gutter's error always wore, kept at
+/// column 0 where no gutter runs.
+pub(crate) const STATUS_ERROR: &str = "■";
+
+/// Rows as the left-aligned print-once renderer prints them: each row's text where the screen's
+/// copy model puts it — past the gutter and a code block's margin, without the shading's trailing
+/// fill, a folded code line whole again where the width broke it — and what the gutter said kept
+/// as status lines in the stream: an act opens with [`STATUS_ACT`], an error with
+/// [`STATUS_ERROR`], a warning its `!`, a run its fold glyph and a boundary its own icon, each at
+/// column 0 in the color its kind wears, over the dim that says a row is the screen's own rather
+/// than words said in the conversation. What hangs under a tool call's row prints at column 0
+/// with the call's row above holding the link, while a list's hang and a quote's bar stay, since
+/// they are the text's own shape.
+pub(crate) fn flush_rows(rows: Vec<Row>) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(rows.len());
+    for (line, copy) in rows {
+        match copy {
+            // The screen's own and no text: a block's padding prints as the blank row it is.
+            RowCopy::Padding => out.push(Line::default()),
+            RowCopy::Code {
+                from,
+                columns,
+                continues,
+            } => {
+                let code = take_columns(line.spans, from, Some(columns));
+                // A line the width folded prints whole again: the terminal wraps it, and a
+                // selection then copies the line that was written rather than its fold.
+                if continues && let Some(last) = out.last_mut() {
+                    last.spans.extend(code);
+                } else {
+                    out.push(Line::from(code));
+                }
+            }
+            RowCopy::Text => out.push(flush_text_row(line)),
+        }
+    }
+    out
+}
+
+/// [`flush_rows`] for rows that all copy as text.
+pub(crate) fn flush_text_rows(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    flush_rows(
+        lines
+            .into_iter()
+            .map(|line| (line, RowCopy::Text))
+            .collect(),
+    )
+}
+
+/// A row of text as it prints flush: the gutter gone, and with it the lead a tool call draws its
+/// tree with — the call's status line above the result holds that link — while a list's hang and
+/// a quote's bar, which begin past the gutter, stay. The shading's trailing fill goes with the
+/// gutter, since a row copies as its text and nothing after it.
+fn flush_text_row(line: Line<'static>) -> Line<'static> {
+    let spans = line.spans;
+    match gutter_mark(&spans) {
+        Some(ACT_GLYPH) => status_row(spans, STATUS_ACT, Style::default().fg(ACCENT)),
+        Some(WARNING_GLYPH) => status_row(spans, WARNING_GLYPH, Style::default().fg(Color::Yellow)),
+        Some(ERROR_GLYPH) => status_row(spans, STATUS_ERROR, Style::default().fg(Color::Red)),
+        Some(FOLDED_GLYPH | OPENED_GLYPH) if spans.iter().any(is_rule) => {
+            boundary_status_row(spans)
+        }
+        Some(FOLDED_GLYPH) => status_row(spans, FOLDED_GLYPH, gray()),
+        Some(OPENED_GLYPH) => status_row(spans, OPENED_GLYPH, gray()),
+        _ => {
+            let lead = if tree_lead(&spans) {
+                connector_indent()
+            } else {
+                TEXT_EDGE
+            };
+            Line::from(trim_trailing_blanks(take_columns(spans, lead, None)))
+        }
+    }
+}
+
+/// The gutter's mark a row carries, its kind told by the glyph the lead opens with: a marked row
+/// opens with the glyph at its first column, where a row of text opens with the gutter's blanks.
+fn gutter_mark(spans: &[Span<'static>]) -> Option<&'static str> {
+    let lead = spans.first()?.content.as_ref();
+    [
+        ACT_GLYPH,
+        WARNING_GLYPH,
+        ERROR_GLYPH,
+        FOLDED_GLYPH,
+        OPENED_GLYPH,
+    ]
+    .into_iter()
+    .find(|glyph| lead.starts_with(*glyph))
+}
+
+/// Whether the row's lead is the one a tool call draws its tree with: the elbow or bar a result
+/// hangs on, a program's `$`, or the blank under them — [`connector_indent`] columns where the
+/// gutter takes [`TEXT_EDGE`].
+fn tree_lead(spans: &[Span<'static>]) -> bool {
+    let Some(lead) = spans.first().map(|span| span.content.as_ref()) else {
+        return false;
+    };
+    lead == "    "
+        || ["│", "$", "└"]
+            .iter()
+            .any(|glyph| lead == format!("  {glyph} "))
+}
+
+/// Whether the span is the rule a boundary draws across the width: the screen's fill, as the
+/// shading's trailing blanks are. Both rule glyphs count — a boundary draws the table's, and a
+/// fold the screen's own.
+fn is_rule(span: &Span<'static>) -> bool {
+    !span.content.is_empty()
+        && span
+            .content
+            .chars()
+            .all(|character| character == RULE || character == TABLE_RULE)
+}
+
+/// A marked row as a status line: the gutter's mark replaced by `icon` in `icon_style`, the words
+/// past the gutter kept with the colors their kind wears, and what stands in the terminal's own
+/// color dimmed, so a status line reads as the screen's own wherever its kind has no color.
+fn status_row(spans: Vec<Span<'static>>, icon: &str, icon_style: Style) -> Line<'static> {
+    let words = trim_trailing_blanks(take_columns(spans, TEXT_EDGE, None));
+    let mut words = dim_status(words);
+    let mut out = Vec::with_capacity(words.len() + 1);
+    out.push(Span::styled(format!("{icon} "), icon_style));
+    out.append(&mut words);
+    Line::from(out)
+}
+
+/// A boundary's row as a status line: the rules it drew across the width go with the shading's
+/// fill, its fold glyph says nothing a row that never redraws can hold, and the icon and words
+/// between the rules are the line.
+fn boundary_status_row(spans: Vec<Span<'static>>) -> Line<'static> {
+    let words: Vec<Span<'static>> = spans.into_iter().filter(|span| !is_rule(span)).collect();
+    let words = trim_trailing_blanks(take_columns(words, TEXT_EDGE, None));
+    let mut words = dim_status(words);
+    if let Some(first) = words.first_mut() {
+        let trimmed = first.content.trim_start();
+        if trimmed.len() != first.content.len() {
+            first.content = trimmed.to_string().into();
+        }
+    }
+    Line::from(words)
+}
+
+/// Spans dimmed where they stand in the terminal's own color; a kind's own color stays, since it
+/// is what says the kind.
+fn dim_status(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    for span in &mut spans {
+        if span.style.fg.is_none() && span.style.bg.is_none() {
+            span.style = gray();
+        }
+    }
+    spans
+}
+
+/// Spans without the blanks their row ends in: the shading's fill and any trailing space, which
+/// the copy model drops together with the gutter.
+fn trim_trailing_blanks(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    while spans
+        .last()
+        .is_some_and(|span| span.content.trim().is_empty())
+    {
+        spans.pop();
+    }
+    if let Some(last) = spans.last_mut() {
+        let trimmed = last.content.trim_end();
+        if trimmed.len() != last.content.len() {
+            last.content = trimmed.to_string().into();
+        }
+    }
+    spans
+}
+
+/// Spans without their first `skip` columns and, where `keep` says so, past their next `keep`: the
+/// cut [`RowCopy`] describes, whole characters and their styles kept. A lead's columns leave it
+/// whole, since a lead is drawn to the columns its row cuts at.
+fn take_columns(spans: Vec<Span<'static>>, skip: usize, keep: Option<usize>) -> Vec<Span<'static>> {
+    let characters = characters_of(&spans);
+    let front = front_columns(&characters, skip);
+    let rest = characters.get(front.len()..).unwrap_or_default();
+    let kept = match keep {
+        Some(keep) => front_columns(rest, keep),
+        None => rest,
+    };
+    join_characters(kept).spans
 }
 
 /// Rows an image is drawn in at most, two pixels to a row.
@@ -2416,18 +2683,18 @@ mod tests {
             vec![
                 "Today",
                 "",
-                "• One: first thing.",
+                "– One: first thing.",
                 "",
-                "• Two: second thing.",
+                "– Two: second thing.",
                 "",
                 "Next",
                 "",
-                "• Three",
+                "– Three",
             ],
             "{rows:?}"
         );
         let tight = plain(&markdown_lines("- **A**: one\n- **B**: two\n", 60));
-        assert_eq!(tight, vec!["• A: one", "• B: two"]);
+        assert_eq!(tight, vec!["– A: one", "– B: two"]);
     }
 
     /// A bullet that does not fit keeps its hanging indent on the rows it wraps onto, which is the
@@ -2439,9 +2706,9 @@ mod tests {
             30,
         ));
         assert!(rows.len() >= 2, "{rows:?}");
-        assert!(rows[0].trim_start().starts_with('•'), "{rows:?}");
+        assert!(rows[0].trim_start().starts_with('–'), "{rows:?}");
         assert!(
-            rows[1].starts_with("  ") && !rows[1].trim_start().starts_with('•'),
+            rows[1].starts_with("  ") && !rows[1].trim_start().starts_with('–'),
             "the continuation row is indented under the text, not the bullet: {rows:?}"
         );
         assert!(rows.iter().all(|row| display_width(row) <= 30), "{rows:?}");
@@ -2495,7 +2762,7 @@ mod tests {
         assert_eq!(rows, vec![
             "1. one",
             "",
-            "   • a nested bullet that runs",
+            "   – a nested bullet that runs",
             "     past the width",
             "",
             "   a later paragraph of the",
@@ -2544,7 +2811,7 @@ mod tests {
         assert_eq!(rows, vec![
             "▐ A quote.",
             "▐",
-            "▐ • an item in it that runs",
+            "▐ – an item in it that runs",
             "▐   past the width",
         ]);
     }
@@ -3585,5 +3852,139 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].contains('\u{1b}'), "{rows:?}");
         assert!(rows[0].contains("file_read"), "{rows:?}");
+    }
+
+    /// The rows of a left-aligned run as text: what [`flush_rows`] prints.
+    fn flush_plain(rows: Vec<Row>) -> Vec<String> {
+        plain(&flush_rows(rows))
+    }
+
+    /// A marked row prints as a status line: its gutter mark replaced by the status mark in its
+    /// kind's color, the words past the gutter kept, and the shading's fill dropped with the
+    /// gutter.
+    #[test]
+    fn a_marked_row_prints_as_a_status_line() {
+        let row = Line::from(vec![
+            Span::styled(format!("{ACT_GLYPH:<TEXT_EDGE$}"), gray()),
+            Span::styled("shell", Style::default().fg(ACCENT)),
+            Span::styled("  ", Style::default().bg(RUN_BACKGROUND)),
+        ]);
+        let rows = flush_rows(vec![(row, RowCopy::Text)]);
+        let cells: Vec<(&str, Option<Color>)> = rows[0]
+            .spans
+            .iter()
+            .map(|span| (span.content.as_ref(), span.style.fg))
+            .collect();
+        assert_eq!(cells.len(), 2, "{cells:?}");
+        assert_eq!(cells[0].0, format!("{STATUS_ACT} "), "{cells:?}");
+        assert_eq!(cells[0].1, Some(ACCENT), "{cells:?}");
+        assert_eq!(cells[1], ("shell", Some(ACCENT)), "{cells:?}");
+        // A warning keeps its `!` and an error gets a mark of its own, each in its color.
+        let marked = |glyph: &str, style: Style| {
+            vec![(
+                Line::from(vec![
+                    Span::styled(format!("{glyph:<TEXT_EDGE$}"), gray()),
+                    Span::styled("failed", style),
+                ]),
+                RowCopy::Text,
+            )]
+        };
+        assert_eq!(
+            flush_plain(marked(WARNING_GLYPH, Style::default().fg(Color::Yellow))),
+            vec![format!("{WARNING_GLYPH} failed")]
+        );
+        assert_eq!(
+            flush_plain(marked(ERROR_GLYPH, Style::default().fg(Color::Red))),
+            vec![format!("{STATUS_ERROR} failed")]
+        );
+    }
+
+    /// A boundary prints its icon and words: the rules it drew across the width go with the
+    /// shading's fill, and its fold glyph with them.
+    #[test]
+    fn a_boundary_prints_its_icon_and_words_without_its_rules() {
+        let row = boundary_row(FOLDED_GLYPH, "→←", "Context compacted", 80);
+        let out = flush_plain(vec![(row, RowCopy::Text)]);
+        assert_eq!(out, vec!["→← Context compacted"]);
+        assert!(
+            !out[0].contains(TABLE_RULE) && !out[0].contains(FOLDED_GLYPH),
+            "{out:?}"
+        );
+    }
+
+    /// What hangs under a tool call's row prints at column 0 with the call's row above holding
+    /// the link: the elbow and bar of the tree, and a program's `$`.
+    #[test]
+    fn a_tool_s_tree_prints_at_the_column_zero() {
+        let leaded = |lead: &str, text: &str| {
+            (
+                Line::from(vec![
+                    Span::styled(lead.to_string(), gray()),
+                    Span::styled(text.to_string(), Style::default()),
+                ]),
+                RowCopy::Text,
+            )
+        };
+        assert_eq!(
+            flush_plain(vec![
+                leaded("  └ ", "output"),
+                leaded("    ", "continued"),
+                leaded("  │ ", "argument"),
+                leaded("  $ ", "program"),
+            ]),
+            vec!["output", "continued", "argument", "program"]
+        );
+    }
+
+    /// A list's hang and a quote's bar begin past the gutter and stay with their text: only the
+    /// gutter is cut.
+    #[test]
+    fn a_list_hang_and_a_quote_bar_stay_with_their_text() {
+        let rows = vec![
+            (
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("– ".to_string(), Style::default()),
+                    Span::raw("item"),
+                ]),
+                RowCopy::Text,
+            ),
+            (
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(QUOTE_BAR.to_string(), Style::default()),
+                    Span::raw(" "),
+                    Span::raw("A quote."),
+                ]),
+                RowCopy::Text,
+            ),
+        ];
+        assert_eq!(flush_plain(rows), vec!["– item", "▐ A quote."]);
+    }
+
+    /// A line the width folded prints whole again, since the terminal wraps it and a selection
+    /// copies the line that was written; the block's padding prints as the blank row it is.
+    #[test]
+    fn a_folded_code_line_prints_whole_again() {
+        let line = "x".repeat(70);
+        let (first, rest) = line.split_at(36);
+        let code = |text: &str, columns: usize, continues: bool| {
+            (
+                Line::from(vec![Span::raw("   "), Span::raw(text.to_string())]),
+                RowCopy::Code {
+                    from: 3,
+                    columns,
+                    continues,
+                },
+            )
+        };
+        assert_eq!(
+            flush_plain(vec![
+                code(first, 36, false),
+                code(rest, 34, true),
+                (Line::default(), RowCopy::Padding),
+            ]),
+            vec![line, String::new()]
+        );
     }
 }
