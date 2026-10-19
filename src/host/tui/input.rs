@@ -18,7 +18,7 @@ use crate::store::history::{CommandLineMatch, HistoryFilter, HistoryOrder, Histo
 pub(crate) const COMPOSER_BACKGROUND: Color = Color::Indexed(236);
 
 /// Entries loaded into memory when a walk through the history begins.
-const HISTORY_WALK_ENTRIES: usize = 500;
+pub(super) const HISTORY_WALK_ENTRIES: usize = 500;
 
 /// Matches shown for a history search.
 const HISTORY_SEARCH_MATCHES: i64 = 50;

@@ -420,6 +420,16 @@ Disable streaming for this run. The agent waits for the complete response before
 meka --no-stream
 ```
 
+### `--renderer <RENDERER>`
+
+Which renderer draws this run's interactive session: `screen` (the default) or `append`, the
+append-only one that prints rows into the terminal's normal buffer and redraws nothing.
+[`display.renderer`](./config-file.md#displayrenderer) is the standing form. A one-shot run is not
+interactive and draws nothing.
+
+```bash
+meka --renderer append
+```
 ### `--format <FORMAT>`
 
 What a `--oneshot` run writes to stdout: `plain` (the default) streams the answer as text; `json` prints nothing during the turn and one object when it ends. See [One-shot mode](../usage/one-shot-mode.md#json-output) for the object's fields. The flag applies to `--oneshot` alone; a run without it is refused. `meka account usage`, `whoami` and `stats` take the same flag and values, and `meka session export --format` takes `markdown` or `json`.

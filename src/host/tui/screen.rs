@@ -73,7 +73,7 @@ impl Selection {
     }
 }
 /// What the status row says when a question is taken off the screen unanswered.
-const QUESTION_WITHDRAWN_HINT: &str = "the question was withdrawn";
+pub(super) const QUESTION_WITHDRAWN_HINT: &str = "the question was withdrawn";
 /// How often the status row's count of running work is read back from the store.
 const WORK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// The sessions the picker offers: the newest, since an older one is reached by `/resume <id>`.
@@ -189,7 +189,7 @@ struct UrlQuestion {
 }
 
 /// What the URL picker offers, in the order drawn, and what each answers the server with.
-const URL_CHOICES: [(&str, Option<char>); 3] = [
+pub(super) const URL_CHOICES: [(&str, Option<char>); 3] = [
     ("Open in the browser", Some('y')),
     ("Skip", Some('s')),
     ("Decline", Some('n')),
@@ -198,7 +198,7 @@ const URL_CHOICES: [(&str, Option<char>); 3] = [
 /// A question from the agent's side waiting for the one on screen to be answered: two tool calls
 /// dispatched together can both ask, and a form can arrive while an approval is open, and an
 /// answer meant for one must not land on another.
-enum Question {
+pub(super) enum Question {
     Approval(ApprovalRequest),
     Elicitation {
         prompt: ElicitationPrompt,
@@ -208,7 +208,7 @@ enum Question {
 
 impl Question {
     /// Answer the question the safe way without putting it, for a turn the user has stopped.
-    fn withdraw(self) {
+    pub(super) fn withdraw(self) {
         let answered = match self {
             Question::Approval(request) => request.responder.send(ApprovalDecision::Deny).is_ok(),
             Question::Elicitation { responder, .. } => {
@@ -221,7 +221,7 @@ impl Question {
     }
 
     /// Whether the turn that asked has moved on, so the question is not worth putting.
-    fn is_withdrawn(&self) -> bool {
+    pub(super) fn is_withdrawn(&self) -> bool {
         match self {
             Question::Approval(request) => {
                 request.cancellation.is_cancelled() || request.responder.is_closed()
@@ -305,13 +305,13 @@ impl Elicitation {
 
 /// A server-supplied string on one row of meka's own, cut at `columns` the way every cut on the
 /// screen is made: at the end, with the marker.
-fn one_line(text: &str, columns: usize) -> String {
+pub(super) fn one_line(text: &str, columns: usize) -> String {
     draw::cut_text(&crate::text::sanitize_to_line(text, usize::MAX), columns)
 }
 
 /// A picker row's description: the first line of what something says about itself, or nothing
 /// when it says nothing.
-fn description_of(text: &str) -> Option<String> {
+pub(super) fn description_of(text: &str) -> Option<String> {
     let line = one_line(text, 120);
     (!line.trim().is_empty()).then_some(line)
 }
@@ -336,7 +336,7 @@ fn field_value(kind: &str, value: String) -> serde_json::Value {
 }
 
 /// The four answers an approval prompt offers, in the order drawn.
-const APPROVAL_CHOICES: [(&str, Option<char>, ApprovalDecision); 4] = [
+pub(super) const APPROVAL_CHOICES: [(&str, Option<char>, ApprovalDecision); 4] = [
     ("Allow", Some('y'), ApprovalDecision::Allow),
     (
         "Allow for the session",
@@ -2998,7 +2998,7 @@ fn png_from_rgba(width: usize, height: usize, pixels: Vec<u8>) -> Result<Vec<u8>
 /// The image file a paste names, when the whole paste is one path to one: a drag from a file
 /// manager lands as the path, quoted or escaped where it has spaces, and a typed path is the
 /// same thing on purpose.
-fn pasted_image_path(text: &str) -> Option<PathBuf> {
+pub(super) fn pasted_image_path(text: &str) -> Option<PathBuf> {
     let text = text.trim();
     if text.is_empty() || text.contains('\n') {
         return None;
@@ -3028,7 +3028,7 @@ fn pasted_image_path(text: &str) -> Option<PathBuf> {
 
 /// A log line as the row its level asks for: a warning and an error in their glyphs, the rest,
 /// which only `-v` lets through, dimmed with the module that wrote them.
-fn log_item(line: crate::relay::LogLine) -> Item {
+pub(super) fn log_item(line: crate::relay::LogLine) -> Item {
     match line.level {
         tracing::Level::ERROR => Item::Error(line.message),
         tracing::Level::WARN => Item::Notice {

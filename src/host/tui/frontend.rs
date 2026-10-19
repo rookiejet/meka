@@ -232,16 +232,16 @@ impl TuiFrontend {
             sticky: StickyApprovals::default(),
         }
     }
-
-    /// Forget the `always` and `never` answers given so far, for a host that has moved this
-    /// frontend onto another session.
-    pub(crate) fn forget_session_answers(&self) {
-        self.sticky.clear();
-    }
 }
 
 #[async_trait]
 impl Frontend for TuiFrontend {
+    /// Forget the `always` and `never` answers given so far, for a host that has moved this
+    /// frontend onto another session.
+    fn forget_session_answers(&self) {
+        self.sticky.clear();
+    }
+
     /// Reasoning is kept on the transcript whether or not it is shown, so a retried attempt would
     /// deliver it twice.
     fn retains_reasoning(&self) -> bool {
