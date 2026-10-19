@@ -18,7 +18,7 @@ use crate::store::recall::{CommandLineMatch, RecallFilter, RecallOrder, RecallSt
 pub(crate) const COMPOSER_BACKGROUND: Color = Color::Indexed(234);
 
 /// Entries loaded into memory when a walk through the recall entries begins.
-const RECALL_WALK_ENTRIES: usize = 500;
+pub(super) const RECALL_WALK_ENTRIES: usize = 500;
 
 /// Matches shown for a recall search.
 const RECALL_SEARCH_MATCHES: i64 = 50;
