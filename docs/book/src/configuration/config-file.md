@@ -386,7 +386,7 @@ Claude-only. How the request encodes extended thinking, and whether it asks for 
 | Value | Wire shape |
 |-------|-----------|
 | `adaptive` (default) | `thinking: {"type": "adaptive"}`: the model sets its own budget. Claude 4.6+ |
-| `budgeted` | `thinking: {"type": "enabled", "budget_tokens": N}`, with N from [`thinking_budget`](#thinking_budget), else [`[thinking].budget`](#thinkingbudget), else 16000. Required by pre-4.6 Claude, and the form most third-party Anthropic-compatible servers implement |
+| `budgeted` | `thinking: {"type": "enabled", "budget_tokens": N}`, with N from [`thinking_budget`](#thinking_budget), else [`[thinking].budget`](#thinkingbudget), else 16000. Required by pre-4.6 Claude, and the form most third-party Anthropic-compatible servers implement. On Sonnet 5.5 and Haiku 5.5 meka also removes the reasoning from earlier turns, since those models refuse the binding that would let the API drop it |
 | `off` | No `thinking` field |
 
 One knob rather than two: it replaces both the old on/off switch and the encoding meka used to infer from the model name. The right value depends on the model *and* on what the endpoint implements, which meka can't determine, so the profile states it, and a profile whose `model` later changes is yours to keep correct.

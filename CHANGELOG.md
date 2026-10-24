@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Builds on FreeBSD.
+- Adaptive thinking no longer fails with "Invalid signature in thinking block" after the request
+  prefix changes: the Messages provider sends `block_binding` under its beta header, so the
+  API can bind reasoning blocks to the turns they came from.
+- Budgeted thinking on Sonnet 5.5 and Haiku 5.5 strips reasoning from past turns, since the API
+  accepts `block_binding` on those models only with adaptive thinking.
 - Compaction requests send no reasoning blocks, so the summarizer no longer fails when it sends
   no tools.
 

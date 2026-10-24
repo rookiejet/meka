@@ -493,7 +493,15 @@ impl ClaudeSubscriptionProvider {
         } else {
             super::shared::CacheBreakpoint::OneHour
         };
-        let claude_messages = convert_messages_to_claude_content(messages, Some(breakpoint));
+        let mut claude_messages = convert_messages_to_claude_content(messages, Some(breakpoint));
+        // Budgeted thinking on these models cannot carry `block_binding`, and Claude Code's capture
+        // covers no such request, so the stale reasoning is removed here rather than sent to be
+        // refused; see `shared::drop_past_turn_reasoning`.
+        if matches!(self.effective_thinking(thinking), ThinkingMode::Budgeted)
+            && shared::binding_needs_adaptive(&self.model)
+        {
+            shared::drop_past_turn_reasoning(&mut claude_messages);
+        }
 
         let metadata_user_id = serde_json::json!({
             "device_id": self.device_id,
@@ -1127,6 +1135,69 @@ mod tests {
             .max_request_bytes(None),
         )
         .expect("build test provider")
+    }
+
+    /// The subscription door gets the same removal as the direct one on budgeted Sonnet 5.5, and
+    /// its body keeps the past turn's reasoning under budgeted Opus 5.5, which accepts the binding.
+    #[test]
+    fn budgeted_sonnet_5_5_drops_past_turn_reasoning_from_the_body() {
+        use crate::conversation::{ContentBlock, Role};
+
+        let history = vec![
+            Message::user("first"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "old".to_string(),
+                        opaque: Some(crate::conversation::OpaqueReasoning::Signed {
+                            signature: "sig".to_string(),
+                        }),
+                    },
+                    ContentBlock::Text {
+                        text: "answer".to_string(),
+                    },
+                ],
+            },
+            Message::user("second"),
+        ];
+        let body_for = |model: &str| {
+            ClaudeSubscriptionProvider::new(
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::ClaudeSubscription,
+                    AuthCredential::ApiKey("test-key".to_string()),
+                    model.to_string(),
+                )
+                .client_id(None)
+                .oauth_token_url(None)
+                .token_store(None)
+                .credential_key(Some("test".to_string()))
+                .thinking(ThinkingMode::Budgeted, 10000)
+                .device_id("a".repeat(64))
+                .thinking_display(crate::config::ThinkingDisplay::Summarized)
+                .max_output_tokens(None)
+                .max_request_bytes(None),
+            )
+            .expect("build test provider")
+            .build_request_body(
+                "system prompt",
+                &history,
+                &[],
+                false,
+                ThinkingOverride::Inherit,
+                &conversation_attribution(),
+            )
+        };
+
+        let stripped = body_for("claude-sonnet-5-5");
+        assert_eq!(
+            stripped["messages"][1]["content"],
+            serde_json::json!([{ "type": "text", "text": "answer" }])
+        );
+        assert!(stripped["thinking"].get("block_binding").is_none());
+
+        let kept = body_for("claude-opus-5-5");
+        assert_eq!(kept["messages"][1]["content"][0]["type"], "thinking");
     }
 
     #[test]
