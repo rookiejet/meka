@@ -186,6 +186,7 @@ Nothing in meka depends on that order. `patch_request_body` finds the `cch=00000
 
 - `metadata.user_id`: JSON-encoded `{"device_id": "...", "account_uuid": "...", "session_id": "..."}` (`device_id` from the account's `device_id`; `account_uuid` from the OAuth token, empty until one is known; `session_id` is per-process).
 - `context_management.edits = [{type: "clear_thinking_20251015", keep: "all"}]`: present when thinking is enabled on a context-management-capable model. Mirrors Claude Code's `apiMicrocompact`.
+- Under `thinking = "budgeted"` on Sonnet 5.5 and Haiku 5.5, the reasoning blocks of earlier turns are left out of `messages`, and the current turn keeps its own. Those models refuse `thinking.block_binding` under `enabled`, and Claude Code's capture has no such request, so this is meka's own removal rather than a mirrored one.
 - `output_config.effort`: see [Reasoning effort](#reasoning-effort).
 - `thinking.display`: see [`thinking_display`](#thinking_display); absent with thinking off and under `redacted`.
 - `diagnostics.previous_message_id`: the id of the previous response's message in this conversation, `null` on the first request, after a resume, and after a compaction that summarized that response away; absent on a compaction request, which is a side query. Pairs with the `cache-diagnosis-2026-04-07` beta.

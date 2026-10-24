@@ -182,6 +182,73 @@ pub(super) fn insert_thinking_fields(
     }
 }
 
+/// Ask the API to drop, rather than reject, a replayed thinking block whose signature no longer
+/// matches the prefix it was made under. The prefix moves whenever the system prompt, the tools
+/// array or an earlier message changes: a `tool_load` appends to the array, an MCP server
+/// withdraws a tool, and a compaction that keeps recent turns rewrites what comes before them.
+/// Without this the whole request fails with "Invalid `signature` in `thinking` block". The
+/// dropped reasoning is the only loss; the rest of the history goes out unchanged. Needs the
+/// `thinking-binding-controls-2026-08-01` beta header, which the caller sends alongside it.
+pub(super) fn bind_thinking_blocks(body: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(thinking) = body
+        .get_mut("thinking")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        thinking.insert(
+            "block_binding".to_string(),
+            serde_json::json!({ "prefix_mismatch_behavior": "drop_block" }),
+        );
+    }
+}
+
+/// Whether `thinking.block_binding` is refused outside adaptive thinking on this model. Sonnet 5.5
+/// and Haiku 5.5 take the field only with `adaptive`; under `enabled` the request is a 400, so
+/// budgeted sessions on these models cannot ask the API to drop a stale block and must drop it
+/// themselves. See [`drop_past_turn_reasoning`].
+pub(super) fn binding_needs_adaptive(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    (lower.contains("sonnet") || lower.contains("haiku"))
+        && parse_model_version(&lower) == Some((5, 5))
+}
+
+/// Removes the reasoning blocks of every assistant turn before the current one, for the models in
+/// [`binding_needs_adaptive`] under budgeted thinking. A replayed block signed under a prefix that
+/// has since moved fails the whole request, and with no binding field the API cannot drop it.
+/// The current turn starts at the last user message that carries no tool result, so its tool loop
+/// keeps the reasoning the API requires it to replay. Older turns lose only their reasoning.
+pub(super) fn drop_past_turn_reasoning(claude_messages: &mut [serde_json::Value]) {
+    let is_user_turn = |message: &serde_json::Value| {
+        let has_tool_result = message
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"));
+        message["role"] == "user" && !has_tool_result
+    };
+    let current_turn_start = claude_messages.iter().rposition(is_user_turn).unwrap_or(0);
+    for message in claude_messages.iter_mut().take(current_turn_start) {
+        if message["role"] != "assistant" {
+            continue;
+        }
+        let Some(blocks) = message["content"].as_array_mut() else {
+            continue;
+        };
+        blocks.retain(|block| {
+            !matches!(
+                block["type"].as_str(),
+                Some("thinking" | "redacted_thinking")
+            )
+        });
+        // A turn that was only reasoning would go out with no content, which the API refuses; the
+        // placeholder the converter uses for an empty message stands in.
+        if blocks.is_empty() {
+            blocks.push(serde_json::json!({
+                "type": "text",
+                "text": "[No message content]"
+            }));
+        }
+    }
+}
+
 /// The thinking object with Claude Code's `display` added when the backend asks for one.
 fn with_display(mut thinking: serde_json::Value, display: Option<&str>) -> serde_json::Value {
     if let (Some(display), Some(object)) = (display, thinking.as_object_mut()) {
@@ -2997,5 +3064,85 @@ mod tests {
                 .expect("happy path");
         assert_eq!(body, "{}");
         assert!(notice.is_none());
+    }
+
+    /// Only Sonnet 5.5 and Haiku 5.5 refuse the binding field under budgeted thinking; the other
+    /// models, and the older 5.x and 4.x lines of the same families, are left as they were.
+    #[test]
+    fn budgeted_binding_is_refused_on_sonnet_and_haiku_5_5_only() {
+        for model in [
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-sonnet-5-5-20261001",
+        ] {
+            assert!(super::binding_needs_adaptive(model), "{model}");
+        }
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+            "claude-3-5-sonnet-20241022",
+        ] {
+            assert!(!super::binding_needs_adaptive(model), "{model}");
+        }
+    }
+
+    /// Past turns lose their reasoning; the current turn, including the tool loop it runs, keeps
+    /// all of it, because the API requires the last assistant turn's reasoning to be replayed.
+    #[test]
+    fn past_turn_reasoning_is_dropped_and_the_current_tool_loop_keeps_its_own() {
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": [{"type": "text", "text": "first"}]}),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "old", "signature": "s1"},
+                {"type": "text", "text": "answer"},
+            ]}),
+            serde_json::json!({"role": "user", "content": [{"type": "text", "text": "second"}]}),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "loop", "signature": "s2"},
+                {"type": "tool_use", "id": "t1", "name": "read", "input": {}},
+            ]}),
+            serde_json::json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+            ]}),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "redacted_thinking", "data": "r"},
+                {"type": "text", "text": "done"},
+            ]}),
+        ];
+        let current_loop = messages[3].clone();
+        let current_end = messages[5].clone();
+
+        super::drop_past_turn_reasoning(&mut messages);
+
+        assert_eq!(
+            messages[1],
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "text", "text": "answer"},
+            ]})
+        );
+        assert_eq!(messages[3], current_loop);
+        assert_eq!(messages[5], current_end);
+    }
+
+    /// A past turn that was only reasoning gets the converter's placeholder rather than an empty
+    /// content array, which the API refuses.
+    #[test]
+    fn a_past_turn_of_only_reasoning_keeps_a_non_empty_content() {
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": [{"type": "text", "text": "first"}]}),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "alone", "signature": "s"},
+            ]}),
+            serde_json::json!({"role": "user", "content": [{"type": "text", "text": "second"}]}),
+        ];
+
+        super::drop_past_turn_reasoning(&mut messages);
+
+        assert_eq!(
+            messages[1]["content"],
+            serde_json::json!([{"type": "text", "text": "[No message content]"}])
+        );
     }
 }
