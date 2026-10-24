@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Builds on FreeBSD.
+- Compaction requests send no reasoning blocks, so the summarizer and checkpoint no longer
+  fail when they change the tools array.
 
 ### Changed
 

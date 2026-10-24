@@ -387,6 +387,25 @@ fn summarize_all_but_a_trailing_prompt(view: &[Message]) -> (Vec<Message>, Vec<M
         _ => (view.to_vec(), Vec::new()),
     }
 }
+
+/// Drop the reasoning blocks from a message bound for a compaction request.
+///
+/// Anthropic binds each replayed thinking block to the prefix it was produced under: the system
+/// prompt, the tools array and the messages before it. A checkpoint sends a narrower tools array
+/// than the turns it summarizes, and the summarizer sends none, so replaying those blocks fails
+/// with "Invalid `signature` in `thinking` block" and the compaction falls over. Neither request
+/// needs the model's earlier reasoning to write a summary, so the blocks stay behind. Providers
+/// that do not sign reasoning are unaffected. An assistant message left with no content is
+/// handled by each provider's existing empty-content path.
+pub(super) fn strip_reasoning(content: &mut Vec<ContentBlock>) {
+    content.retain(|block| {
+        !matches!(
+            block,
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+        )
+    });
+}
+
 /// Cap a checkpoint tool result at the size a normal turn would allow inline.
 ///
 /// A normal turn spills anything larger to the scratchpad
@@ -866,6 +885,7 @@ impl Agent {
         let mut checkpoint_messages: Vec<Message> = messages.to_vec();
         for message in &mut checkpoint_messages {
             strip_images(&mut message.content);
+            strip_reasoning(&mut message.content);
         }
 
         // Deliver the instruction as a trailing text block on an existing user message when the
@@ -1066,6 +1086,7 @@ impl Agent {
         let mut compact_messages = to_summarize;
         for message in &mut compact_messages {
             strip_images_and_truncate(&mut message.content);
+            strip_reasoning(&mut message.content);
         }
 
         // Append a user message so the conversation ends with a user turn.
@@ -3004,6 +3025,31 @@ mod tests {
             "the checkpoint was handed a cut conversation"
         );
         assert_eq!(sent[0].text_content(), "question 0");
+    }
+
+    /// A signed thinking block replayed into a request whose tools array differs is rejected by
+    /// Anthropic ("Invalid `signature` in `thinking` block"), so compaction must not send one.
+    /// Everything else in the reply stays, in its order.
+    #[test]
+    fn a_compaction_request_carries_no_reasoning_blocks() {
+        let mut content = vec![
+            ContentBlock::Thinking {
+                thinking: "private".to_string(),
+                opaque: Some(crate::conversation::OpaqueReasoning::Signed {
+                    signature: "sig".to_string(),
+                }),
+            },
+            ContentBlock::RedactedThinking {
+                data: "opaque".to_string(),
+            },
+            ContentBlock::Text {
+                text: "answer".to_string(),
+            },
+        ];
+        strip_reasoning(&mut content);
+        assert_eq!(content, vec![ContentBlock::Text {
+            text: "answer".to_string()
+        }]);
     }
 
     /// The seed that stands in for a measurement after a compaction has to count what the
