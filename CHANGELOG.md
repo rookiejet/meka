@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Builds on FreeBSD.
+- Compaction requests send no reasoning blocks, so the summarizer no longer fails when it sends
+  no tools.
 
 ## [0.85.0] - 2026-10-28
 
