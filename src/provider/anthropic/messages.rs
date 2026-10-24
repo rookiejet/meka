@@ -115,6 +115,10 @@ impl AnthropicMessagesProvider {
         if self.interleaved_thinking && self.thinking.is_on() {
             parts.push("interleaved-thinking-2025-05-14");
         }
+        // The beta that `thinking.block_binding` needs; sent exactly when the body carries it.
+        if matches!(self.thinking, ThinkingMode::Adaptive) {
+            parts.push("thinking-binding-controls-2026-08-01");
+        }
         // No `context-1m-2025-08-07`: on the direct Messages API, 1M context is the *default* for
         // the current large-context models (Opus 4.6+, Sonnet 4.6, Fable 5) with no beta header,
         // so the 1M window is already what the request gets. See
@@ -137,11 +141,17 @@ impl AnthropicMessagesProvider {
         // The API's own TTL. The one-hour breakpoint needs a beta this backend does not send, and
         // this endpoint is whatever `base_url` names. Whether a breakpoint goes out at all is the
         // profile's to say: a gateway may turn it into a paid cache of the whole prompt per turn.
-        let claude_messages = convert_messages_to_claude_content(
+        let mut claude_messages = convert_messages_to_claude_content(
             messages,
             self.cache_control
                 .then_some(super::shared::CacheBreakpoint::Ephemeral),
         );
+        let mode = self.thinking;
+        // Budgeted thinking on these models cannot carry `block_binding`, so the stale reasoning
+        // is removed here; see `drop_past_turn_reasoning`.
+        if matches!(mode, ThinkingMode::Budgeted) && shared::binding_needs_adaptive(&self.model) {
+            shared::drop_past_turn_reasoning(&mut claude_messages);
+        }
 
         let mut body = serde_json::Map::new();
         body.insert("model".to_string(), serde_json::json!(self.model));
@@ -152,11 +162,16 @@ impl AnthropicMessagesProvider {
 
         shared::insert_thinking_fields(
             &mut body,
-            self.thinking,
+            mode,
             self.thinking_budget_tokens,
             self.max_output_tokens,
             None,
         );
+        // Adaptive only: the setting is documented to work there. Budgeted and off requests keep
+        // the body they always had.
+        if matches!(mode, ThinkingMode::Adaptive) {
+            shared::bind_thinking_blocks(&mut body);
+        }
 
         body.insert("stream".to_string(), serde_json::json!(stream));
 
@@ -539,17 +554,103 @@ mod tests {
             )
             .expect("provider")
         };
-        assert_eq!(build(false).compute_betas(false), None);
+        // Adaptive thinking still carries the binding beta its `block_binding` field needs.
+        assert_eq!(
+            build(false).compute_betas(false).as_deref(),
+            Some("thinking-binding-controls-2026-08-01")
+        );
         // The deferred-tools beta rides only on a request that declares one, whatever the
         // account says about thinking.
         assert_eq!(
             build(false).compute_betas(true).as_deref(),
-            Some("advanced-tool-use-2025-11-20")
+            Some("advanced-tool-use-2025-11-20,thinking-binding-controls-2026-08-01")
         );
         assert_eq!(
             build(true).compute_betas(false).as_deref(),
-            Some("interleaved-thinking-2025-05-14")
+            Some("interleaved-thinking-2025-05-14,thinking-binding-controls-2026-08-01")
         );
+    }
+
+    /// A replayed thinking block whose prefix moved is dropped by the API, not fatal, but only
+    /// when the request asks for it, and only under adaptive thinking, where the setting works.
+    /// Budgeted and off requests keep the body they had.
+    #[test]
+    fn adaptive_thinking_asks_the_api_to_drop_a_stale_block() {
+        let build = |mode: ThinkingMode| {
+            AnthropicMessagesProvider::from_settings(
+                "test-key".to_string(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::AnthropicMessages,
+                    crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                    "claude-opus-5-5".to_string(),
+                )
+                .thinking(mode, 10000),
+            )
+            .expect("provider")
+        };
+        let binding = |mode: ThinkingMode| {
+            build(mode).build_request_body("be nice", &[], &[], false)["thinking"]
+                .get("block_binding")
+                .cloned()
+        };
+        assert_eq!(
+            binding(ThinkingMode::Adaptive),
+            Some(serde_json::json!({ "prefix_mismatch_behavior": "drop_block" }))
+        );
+        assert_eq!(binding(ThinkingMode::Budgeted), None);
+        assert_eq!(binding(ThinkingMode::Off), None);
+    }
+
+    /// Budgeted thinking on Sonnet 5.5 cannot ask for the binding, so the past turn's reasoning is
+    /// removed from the body instead. The same history under budgeted Opus 5.5 keeps it.
+    #[test]
+    fn budgeted_sonnet_5_5_drops_past_turn_reasoning_from_the_body() {
+        use crate::conversation::{ContentBlock, Role};
+
+        let history = vec![
+            Message::user("first"),
+            Message {
+                role: Role::Assistant,
+                provider_fields: None,
+                content: vec![
+                    ContentBlock::reasoning(
+                        "old",
+                        Some(crate::conversation::OpaqueReasoning::Signed {
+                            signature: "sig".to_string(),
+                        }),
+                    ),
+                    ContentBlock::Text {
+                        text: "answer".to_string(),
+                        provider_fields: None,
+                    },
+                ],
+            },
+            Message::user("second"),
+        ];
+        let body_for = |model: &str| {
+            AnthropicMessagesProvider::from_settings(
+                "test-key".to_string(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::AnthropicMessages,
+                    crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                    model.to_string(),
+                )
+                .thinking(ThinkingMode::Budgeted, 10000),
+            )
+            .expect("provider")
+            .build_request_body("be nice", &history, &[], false)
+        };
+
+        let stripped = body_for("claude-sonnet-5-5");
+        assert_eq!(
+            stripped["messages"][1]["content"],
+            serde_json::json!([{ "type": "text", "text": "answer" }])
+        );
+        assert_eq!(stripped["thinking"]["type"], "enabled");
+        assert!(stripped["thinking"].get("block_binding").is_none());
+
+        let kept = body_for("claude-opus-5-5");
+        assert_eq!(kept["messages"][1]["content"][0]["type"], "thinking");
     }
 
     #[test]
