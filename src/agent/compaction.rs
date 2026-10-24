@@ -464,6 +464,23 @@ fn bounded_argument(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Drop the reasoning blocks from a message bound for a compaction request.
+///
+/// Anthropic binds each replayed thinking block to the prefix it was produced under: the system
+/// prompt, the tools array and the messages before it. The summarizer sends no tools, so
+/// replaying those blocks fails with "Invalid `signature` in `thinking` block" and the compaction
+/// falls over. The request does not need the model's earlier reasoning to write a summary, so the
+/// blocks stay behind. Providers that do not sign reasoning are unaffected. An assistant message
+/// left with no content is handled by each provider's existing empty-content path.
+pub(super) fn strip_reasoning(content: &mut Vec<ContentBlock>) {
+    content.retain(|block| {
+        !matches!(
+            block,
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+        )
+    });
+}
+
 /// Cap a checkpoint tool result at the size a normal turn would allow inline.
 ///
 /// A normal turn spills anything larger to the scratchpad
@@ -1438,6 +1455,7 @@ impl Agent {
         let mut compact_messages = to_summarize;
         for message in &mut compact_messages {
             strip_images_and_truncate(&mut message.content);
+            strip_reasoning(&mut message.content);
         }
 
         // Append a user message so the conversation ends with a user turn.
@@ -1464,17 +1482,17 @@ impl Agent {
                         &unfired,
                     )
                     .await;
-                // The thinking goes out with the rest, since leaving it out unasked would cost the
-                // summary whatever the model reads from it. This request has its own system prompt
-                // and no tools, though, so every block in it is bound to another conversation, and
-                // an account that enforces Claude's check rejects it. The copy is thrown away
-                // after, so retrying without the thinking costs this one summary alone.
+                // The reasoning is stripped before the request (see [`strip_reasoning`]), since
+                // this request has its own system prompt and no tools and every block in it is
+                // bound to another conversation, which an account that enforces Claude's check
+                // rejects. A rejection that names the signature is still answered with a retry
+                // without the thinking, whatever the strip left to remove: one request spent on a
+                // summary beats failing the compaction over a body that claims to hold no thinking
+                // at all. The copy is thrown away after, so the retry costs this one summary
+                // alone.
                 match completed {
-                    Err(error)
-                        if error.rejects_thinking_signature()
-                            && !thinking_removed
-                            && remove_claude_thinking(&mut compact_messages) =>
-                    {
+                    Err(error) if error.rejects_thinking_signature() && !thinking_removed => {
+                        remove_claude_thinking(&mut compact_messages);
                         thinking_removed = true;
                         tracing::warn!(
                             "provider rejected a thinking block's signature; summarizing without the \
@@ -3240,14 +3258,25 @@ mod tests {
         assert!(the_summary_message(&messages).contains("the summary"));
 
         let sent = provider.completions();
-        let carries_signed = |messages: &[Message]| {
-            messages
-                .iter()
-                .any(|message| message.without_claude_thinking().is_some())
+        let carries_reasoning = |messages: &[Message]| {
+            messages.iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+                    )
+                })
+            })
         };
         assert_eq!(sent.len(), 2, "the rejected summary and the one after it");
-        assert!(carries_signed(&sent[0]), "sent with the thinking first");
-        assert!(!carries_signed(&sent[1]), "and again without it");
+        assert!(
+            !carries_reasoning(&sent[0]),
+            "the summarizer is sent no reasoning to be rejected over"
+        );
+        assert!(
+            !carries_reasoning(&sent[1]),
+            "and the retry carries none either"
+        );
     }
 
     /// A checkpoint rejected over a thinking block's signature carries on without the thinking
@@ -4256,6 +4285,31 @@ mod tests {
             "the checkpoint was handed a cut conversation"
         );
         assert_eq!(sent[0].text_content(), "question 0");
+    }
+
+    /// A signed thinking block replayed into a request whose tools array differs is rejected by
+    /// Anthropic ("Invalid `signature` in `thinking` block"), so compaction must not send one.
+    /// Everything else in the reply stays, in its order.
+    #[test]
+    fn a_compaction_request_carries_no_reasoning_blocks() {
+        let mut content = vec![
+            ContentBlock::Thinking {
+                thinking: "private".to_string(),
+                opaque: Some(crate::conversation::OpaqueReasoning::Signed {
+                    signature: "sig".to_string(),
+                }),
+            },
+            ContentBlock::RedactedThinking {
+                data: "opaque".to_string(),
+            },
+            ContentBlock::Text {
+                text: "answer".to_string(),
+            },
+        ];
+        strip_reasoning(&mut content);
+        assert_eq!(content, vec![ContentBlock::Text {
+            text: "answer".to_string()
+        }]);
     }
 
     /// The seed that stands in for a measurement after a compaction has to count what the
