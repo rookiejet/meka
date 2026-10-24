@@ -3574,6 +3574,10 @@ pub(crate) fn write_message_markdown(
 /// shortcut reference link only when a matching definition exists, and none does.
 pub(crate) const REDACTED_THINKING: &str = "[redacted thinking]";
 
+/// The text block that stands in for an assistant message left with no content, which every wire
+/// refuses: the converter's placeholder for an empty message.
+pub(crate) const NO_MESSAGE_CONTENT: &str = "[No message content]";
+
 #[cfg(test)]
 mod tests {
     use super::*;
