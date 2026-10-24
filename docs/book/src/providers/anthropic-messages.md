@@ -48,6 +48,8 @@ meka sends the reasoning-effort control as `output_config.effort` in the request
 
 `adaptive` (the default) sends `thinking: {"type": "adaptive"}` and lets the model set its own budget; `budgeted` sends the older `{"type": "enabled", "budget_tokens": N}` form, taking N from the profile's `thinking_budget` and falling back to [`[thinking].budget`](../configuration/config-file.md#thinkingbudget); `off` sends no thinking field. Pre-4.6 Claude models require `budgeted`.
 
+Under `adaptive`, meka sends `thinking.block_binding` (with the `thinking-binding-controls-2026-08-01` beta), which asks the API to drop a replayed reasoning block whose signature no longer matches the prefix it was made under. A changed system prompt, tool list or compacted history then costs that reasoning, not the request. Sonnet 5.5 and Haiku 5.5 refuse the field under `budgeted`, so there meka removes the reasoning from earlier turns itself. The current turn keeps all of its reasoning, tool loop included.
+
 ## Supported models
 
 Any model available through the Claude Messages API; meka forwards the model string verbatim and doesn't gate which strings are valid. For the current line-up and their retirement dates, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview); `meka profile add` suggests `claude-opus-5-5` for a profile on a Claude account.
