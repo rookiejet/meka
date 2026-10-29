@@ -521,7 +521,10 @@ impl Provider for OpenAiChatCompletionsProvider {
                     self.client
                         .post(format!("{}/chat/completions", self.base_url))
                         .header("Authorization", crate::text::bearer(&self.api_key))
-                        .header(reqwest::header::CONTENT_TYPE, "application/json"),
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        // Identity: an SSE body that fails in the decompressor looks exactly
+                        // like one the gateway truncated.
+                        .header("accept-encoding", "identity"),
                     &attribution,
                     self.opencode,
                 )

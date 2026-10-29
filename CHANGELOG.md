@@ -56,6 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Inline memory bodies share a 32 KiB budget, `[memory] inline_max_bytes`; it was 4 KiB and fixed.
 - A memory write that would take the inline bodies past the budget is refused, at every door alike.
 - An inline body is shown whole or listed by description; the memory section says which and why.
+- Streaming replies are asked for uncompressed, so a stream error can never be the decompressor's.
+- A provider connection is dropped from the pool before a gateway's idle close can leave it
+  half-closed, and a pooled one is probed so a dead peer is found before the next request.
 
 ## [0.83.0] - 2026-10-21
 
