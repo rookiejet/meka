@@ -126,19 +126,24 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
    degraded resend and a reported failure. A rejection that `MekaError::rejects_thinking_signature` names, Claude rejecting a
    thinking block sent back, is answered first, by a resend of the conversation since the last
    compaction with `Message::without_claude_thinking` applied, recorded as an `Event::Unsign` that
-   names no message; a compaction's checkpoint and summarizer do the same to their own copies. Once a profile's retries are spent on an error that says
-   the profile cannot serve (`MekaError::is_profile_unavailable`), `agent::fallback` opens that
-   profile's breaker in the `ProviderRegistry`, binds the next profile in its chain the turn has not
-   tried, breaker or not, and re-sends under the retry's own no-output guard; the turn's end restores the named
-   profile and its row records the one that served. The published profile cell holds both the named
-   profile and the one serving, so a worker spawned mid-turn binds to the named one and a repin ends
-   the substitution. Compaction runs when the context gauge says so, when the
-   model asks through `context_compact`, or when the user asks. A checkpoint's request carries the
-   turn's own tool list, so it shares the turn's cached prefix; its guidance names the subset it may
-   call, and a call to the rest is refused at dispatch. Every summary, from the checkpoint or the
-   summarizer, has the same four sections: rules and authorizations, commitments and their state,
-   facts established, next action; a compaction-specific focus adds emphasis within them and drops
-   none. The messages received during the summarized turns are copied into the summary message by
+   names no message; a compaction's checkpoint and summarizer do the same to their own copies. A
+   stream cut after output reached the frontend is recorded as failed. If it contains answer text,
+   the model sees the partial reply and a nudge to continue, without any unrun calls. Otherwise
+   the cut stays out of the model's context and the unfinished round is retried with the same
+   conversation, including completed tool results. Both paths share one per-turn recovery budget
+   (`stream_continuations`) and use cancellable backoff. Once a profile's ordinary retries are
+   spent on an error that says it cannot serve (`MekaError::is_profile_unavailable`),
+   `agent::fallback` opens that profile's breaker in the `ProviderRegistry`, binds the next profile
+   in its chain the turn has not tried, and re-sends under the retry's no-output guard. The turn's
+   end restores the named profile, and its row records the one that served. The published profile
+   cell holds both the named profile and the one serving, so a worker spawned mid-turn binds to
+   the named one and a repin ends the substitution. Compaction runs when the context gauge says
+   so, when the model asks through `context_compact`, or when the user asks. A checkpoint's request
+   carries the turn's own tool list, so it shares the turn's cached prefix; its guidance names the
+   subset it may call, and a call to the rest is refused at dispatch. Every summary, from the
+   checkpoint or the summarizer, has the same four sections: rules and authorizations, commitments
+   and their state, facts established, next action; a compaction-specific focus adds emphasis and
+   drops none. The messages received during the summarized turns are copied into the summary by
    code, newest first within a third of the verbatim budget when there are any, so what a person
    sent never depends on the summary. A checkpoint that ends without calling `context_replace` falls
    back to the summarizer; its closing text is never taken as the summary. Every compaction restores

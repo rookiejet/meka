@@ -145,6 +145,10 @@ turn the same way, so the scrollback says when each one ended. A reply inside th
 calls and stopped the same way says so in a row of its own, `Reply hit the output limit`, since its
 calls run and the turn goes on.
 
+A reply that a connection failure cuts off mid-answer does not end the turn: what arrived is kept
+and the agent is asked to continue where it stopped, up to three times in one turn. Past that the
+turn ends `Failed` with the partial answers kept.
+
 ## Expanding and collapsing
 
 Reasoning shows as one dimmed `â€¢ Thinking Â· â€¦` row: the first words of the block once it has
@@ -498,9 +502,11 @@ Worth knowing what a retry can cost. When the failure was a body that could not 
 
 One failure is not retried, because the next attempt is known not to be worth making: a request Meka could not build, which points at whatever went into it, most often a `base_url` that is not a URL or a stored credential carrying a character that cannot go in a header. A redirect is never followed at all: the endpoint's answer is reported with where it pointed, and the fix is to set `base_url` to that endpoint. A reply, or one streamed event, larger than 64 MiB is refused for the same reason: an endpoint answering with something that size is not answering the request.
 
-Retrying is bounded by time as well as by count, and the time bound is the one that usually decides. A failure that takes the full idle timeout to arrive costs five minutes, which spends the whole budget, so a stream that hung is reported rather than tried again: retrying is for a failure that was cheap, and a provider that went silent for five minutes has already taken more of your turn than a second silence is worth. Without the bound at all, three slow failures would be fifteen minutes of waiting on a turn that fails anyway.
+Before model output reaches the frontend, the ordinary retry budget is bounded by time as well as count. A failure that takes the full five-minute idle timeout to arrive spends that budget, so it does not get another ordinary retry on the same profile.
 
-The bound stops a *new* attempt starting rather than capping the total, so the worst case is a failure arriving just under the five minutes and permitting one more full-length attempt after it, for about ten in total.
+This time bound stops a *new* ordinary attempt from starting rather than capping the total. A failure arriving just under five minutes can still permit another full-length attempt.
+
+If a stream breaks after the frontend has received model output, Meka keeps the cut reply in the transcript. When answer text arrived, it asks the model to continue from that text. If only reasoning or unrun tool calls arrived, it retries the unfinished round without asking you again. Tools from an earlier round are not rerun, and tools in the cut reply are not executed. A turn can recover from up to three such cuts, waiting 1s, 2s and 4s, respectively. Stop cancels the wait; if the cuts persist, the turn reports the provider's error.
 
 ### `/fork`
 
