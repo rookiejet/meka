@@ -9,6 +9,9 @@ pub(crate) fn nudge_direction(message: &crate::conversation::Message) -> Option<
         Some((crate::conversation::NudgeKind::Checklist, _)) => {
             Some("Checklist: items still open, continuing")
         }
+        Some((crate::conversation::NudgeKind::Continuation, _)) => {
+            Some("Reply cut off mid-answer, continuing where it left off")
+        }
         Some((crate::conversation::NudgeKind::VisibleReply, _)) | None => None,
     }
 }
@@ -34,5 +37,13 @@ mod tests {
             crate::conversation::THINKING_ONLY_NUDGE,
         );
         assert_eq!(nudge_direction(&thinking), None);
+        let continuation = crate::conversation::Message::nudge_message(
+            crate::conversation::NudgeKind::Continuation,
+            crate::conversation::CONTINUATION_NUDGE,
+        );
+        assert_eq!(
+            nudge_direction(&continuation),
+            Some("Reply cut off mid-answer, continuing where it left off")
+        );
     }
 }
