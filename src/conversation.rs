@@ -33,6 +33,12 @@ fn opens_turn(message: &Message) -> bool {
 pub(crate) const THINKING_ONLY_NUDGE: &str = "[Your previous response contained no visible output. Please \
                                    continue and produce a user-visible response.]";
 
+/// What the loop writes to ask for the rest of a reply the stream cut mid-answer: the text of a
+/// [`NudgeKind::Continuation`] nudge, kept beside the kind, below every reader that builds one.
+pub(crate) const CONTINUATION_NUDGE: &str = "[Your previous response was cut off mid-answer. \
+                                             Continue it exactly where the text stops: write only \
+                                             what follows, without repeating anything.]";
+
 /// Which strategy wrote a compaction's summary. The two differ in fidelity, not just mechanism:
 /// the checkpoint turn is the agent summarizing itself, with its tools, and the standalone
 /// summarizer knows nothing but the transcript.
@@ -2047,24 +2053,28 @@ pub(crate) enum OpaqueReasoning {
     /// Chat Completions. The reasoning is the block's parts, and nothing else goes back with it.
     Verbatim,
 }
-/// Why the loop wrote a nudge: the reply it answers had no visible text, or left checklist items
-/// open. What a surface shows for a replayed nudge depends on it, and the wire carries it.
+/// Why the loop wrote a nudge: the reply it answers had no visible text, left checklist items
+/// open, or was cut off mid-answer. What a surface shows for a replayed nudge depends on it, and
+/// the wire carries it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(try_from = "String", into = "String")]
 pub(crate) enum NudgeKind {
     VisibleReply,
     Checklist,
+    Continuation,
 }
 
 impl NudgeKind {
     /// Every value, in the order a refusal lists them.
-    pub(crate) const ALL: [NudgeKind; 2] = [Self::VisibleReply, Self::Checklist];
+    pub(crate) const ALL: [NudgeKind; 3] =
+        [Self::VisibleReply, Self::Checklist, Self::Continuation];
 
     /// The kind's one spelling, in the stored block, on the wire and in an archive.
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::VisibleReply => "visible_reply",
             Self::Checklist => "checklist",
+            Self::Continuation => "continuation",
         }
     }
 }
@@ -6117,9 +6127,9 @@ mod tests {
         );
         crate::text::assert_one_spelling(
             &NudgeKind::ALL,
-            &["visible_reply", "checklist"],
+            &["visible_reply", "checklist", "continuation"],
             "visibleReply",
-            "visible_reply, checklist",
+            "visible_reply, checklist, continuation",
         );
         crate::text::assert_one_spelling(
             &Role::ALL,

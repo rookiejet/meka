@@ -127,6 +127,10 @@ turn the same way, so the scrollback says when each one ended. A reply inside th
 calls and stopped the same way says so in a row of its own, `Reply hit the output limit`, since its
 calls run and the turn goes on.
 
+A reply that a connection failure cuts off mid-answer does not end the turn: what arrived is kept
+and the agent is asked to continue where it stopped, up to three times in one turn. Past that the
+turn ends `Failed` with the partial answers kept.
+
 ## Expanding and collapsing
 
 Reasoning shows as one dimmed `• Thinking · …` row: the first words of the block once it has
