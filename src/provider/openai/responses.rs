@@ -163,7 +163,10 @@ impl super::responses_wire::ResponsesBackend for OpenAiResponsesProvider {
         Ok(crate::provider::opencode::apply_request_headers(
             request
                 .header("Authorization", crate::text::bearer(&self.api_key))
-                .header("Accept", "text/event-stream"),
+                .header("Accept", "text/event-stream")
+                // Identity: an SSE body that fails in the decompressor looks exactly like one
+                // the gateway truncated.
+                .header("accept-encoding", "identity"),
             attribution,
             self.opencode,
         ))

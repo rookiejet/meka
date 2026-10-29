@@ -107,8 +107,15 @@ pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long to wait for the TCP + TLS handshake before giving up on a provider endpoint.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How often an HTTP/2 connection with a request in flight pings its peer, and how long an
-/// unanswered PING is waited for before the connection is declared dead.
+/// How long a connection may sit idle in the pool before it is dropped, kept under the idle
+/// closes gateways run (a minute and up), so no request is started on a connection the peer has
+/// already half-closed: that failure arrives mid-request in the same shape as a truncated stream,
+/// and nothing downstream can tell the two apart.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often an HTTP/2 connection pings its peer — a request in flight, or one idling in the pool
+/// under `http2_keep_alive_while_idle` — and how long an unanswered PING is waited for before the
+/// connection is declared dead.
 ///
 /// A dead peer is found by the transport, never by a clock on the reply. A whole reply is silent
 /// from the moment the request is sent until the model has finished it, and nothing on this side
@@ -135,9 +142,10 @@ const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// deadline would kill a legitimate long turn, which is the one thing the harness must not do, and
 /// a read timeout does the same to a whole reply, because reqwest runs it across the wait for the
 /// response headers, which for a non-streaming request is the whole generation. A dead connection
-/// is found by the keepalives instead (reqwest's TCP defaults and [`HTTP2_KEEPALIVE_INTERVAL`]); a
-/// stream that carries nothing is bounded by [`STREAM_IDLE_TIMEOUT`] at the SSE layer, the one
-/// place silence means something; and a stop drops a pending request in
+/// is found by the keepalives instead (reqwest's TCP defaults and [`HTTP2_KEEPALIVE_INTERVAL`]),
+/// and a pooled one is evicted before a gateway's idle close can leave it half-closed
+/// ([`POOL_IDLE_TIMEOUT`]); a stream that carries nothing is bounded by [`STREAM_IDLE_TIMEOUT`] at
+/// the SSE layer, the one place silence means something; and a stop drops a pending request in
 /// `crate::oauth::send_with_one_refresh` and its body in `crate::error::read_whole_reply`, where
 /// every request a turn or an account call makes is sent and its whole reply read. A token
 /// exchange, a revocation and an MCP auth probe run their own bounded requests outside a turn.
@@ -153,8 +161,10 @@ pub(crate) fn build_http_client(
     configure(
         reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .http2_keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
             .http2_keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT)
+            .http2_keep_alive_while_idle(true)
             .redirect(reqwest::redirect::Policy::none()),
     )
     .build()

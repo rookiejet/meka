@@ -50,6 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   what arrived, up to three times, and reported only past that.
 - A stream failure says what cut the connection (dropped, timed out, truncated) instead of only
   'error decoding response body'.
+- Streaming replies are asked for uncompressed, so a stream error can never be the decompressor's.
+- A provider connection is dropped from the pool before a gateway's idle close can leave it
+  half-closed, and a pooled one is probed so a dead peer is found before the next request.
 
 ## [0.85.0] - 2026-10-28
 
