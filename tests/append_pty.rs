@@ -922,8 +922,7 @@ fn a_line_break_in_the_composer_opens_a_row_for_the_next_line() {
         "the next line is on the row under it, indented to the text: {rows:#?}"
     );
     assert!(
-        rows.get(top + 2)
-            .is_some_and(|row| row.contains("read · ")),
+        rows.get(top + 2).is_some_and(|row| row.contains("read · ")),
         "the status row is under the input rows: {rows:#?}"
     );
     assert_eq!(run.exit, 0, "the run left on its own");
@@ -958,8 +957,7 @@ fn backspacing_over_a_line_break_shrinks_the_composer() {
         "and it is drawn once: {rows:#?}"
     );
     assert!(
-        rows.get(top + 1)
-            .is_some_and(|row| row.contains("read · ")),
+        rows.get(top + 1).is_some_and(|row| row.contains("read · ")),
         "the status row is straight under the one input row: {rows:#?}"
     );
     assert_eq!(run.exit, 0, "the run left on its own");
