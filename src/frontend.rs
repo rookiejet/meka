@@ -1095,6 +1095,9 @@ pub(crate) enum NoticeKind {
     StageDirection,
 }
 
+/// The continuation notice shared by the live turn and its replay.
+pub(crate) const CONTINUATION_NOTICE: &str = "The reply was cut off mid-answer; resuming the task.";
+
 /// User-visible advisory surfaced during a request. Frontends format the message themselves; the
 /// one structured payload is for the agent, not for display.
 #[derive(Debug, Clone)]

@@ -149,8 +149,21 @@ pub(super) struct TurnRecovery {
     /// provider that cannot handle this body. Once per turn, on the first rejection that could
     /// be either, because a second would only re-measure what the first already answered.
     pub(super) outage_reprieve_used: bool,
+    /// A cut can cost another provider round but must not give a failing stream an unlimited
+    /// number of chances. Both retrying an unfinished round and continuing partial text spend
+    /// this budget, which survives successful rounds within the turn.
+    pub(super) stream_continuations: u32,
 }
 impl TurnRecovery {
+    /// Spend a post-output stream recovery, returning its one-based attempt number for backoff.
+    pub(super) fn next_stream_recovery(&mut self) -> Option<u32> {
+        if self.stream_continuations >= super::turn::MAX_STREAM_CONTINUATIONS {
+            return None;
+        }
+        self.stream_continuations += 1;
+        Some(self.stream_continuations)
+    }
+
     /// Compact and retry after the provider reported an overflow the local pre-send estimate missed
     /// (it under-counts, having no view of tool schemas). Returns the overflow the turn should fail
     /// with when the compaction itself failed, since re-sending would be rejected identically.
@@ -628,6 +641,27 @@ impl TurnRecovery {
         Ok(())
     }
 
+    /// Append a partial answer and its continuation nudge as one unit. A cut reply must not
+    /// resend calls that have no results, even though the transcript records what arrived.
+    pub(super) async fn nudge_continuation(
+        &self,
+        agent: &Agent,
+        session_id: Uuid,
+        messages: &mut Conversation,
+        reply: &crate::conversation::RecordedMessage,
+    ) -> Result<()> {
+        self.append_nudge(
+            agent,
+            session_id,
+            messages,
+            reply,
+            crate::conversation::NudgeKind::Continuation,
+            crate::conversation::CONTINUATION_NUDGE.to_string(),
+            None,
+        )
+        .await
+    }
+
     /// Append `reply` and the nudge that answers it as one unit, with what arrived
     /// while the reply was written riding behind the nudge: a nudge round is a round boundary like
     /// a tool round's results, and reads what arrived the same way. Memory moves only once the
@@ -636,7 +670,7 @@ impl TurnRecovery {
     /// order the message holds them.
     #[allow(clippy::too_many_arguments)]
     async fn append_nudge(
-        &mut self,
+        &self,
         agent: &Agent,
         session_id: Uuid,
         messages: &mut Conversation,
@@ -645,23 +679,30 @@ impl TurnRecovery {
         text: String,
         said: Option<crate::frontend::Notice>,
     ) -> Result<()> {
+        use crate::conversation::Event;
+        let (mut rows, view) = if let Some(record) = &reply.reply
+            && record.cut.is_some()
+        {
+            let Some(cut) = super::turn::cut_reply_rows(&reply.message, record.clone(), true)
+            else {
+                return Ok(());
+            };
+            cut
+        } else {
+            (
+                vec![crate::store::RecordedEvent {
+                    event: Event::Append(reply.message.clone()),
+                    reply: reply.reply.clone(),
+                }],
+                None,
+            )
+        };
         let mut nudge = Message::nudge_message(kind, text.clone());
         let arrivals = agent.take_arrivals(session_id, &self.inbox_ids).await;
         nudge.content.extend(arrivals.blocks());
-        agent
-            .save_carrying(
-                session_id,
-                vec![
-                    crate::store::RecordedEvent {
-                        event: crate::conversation::Event::Append(reply.message.clone()),
-                        reply: reply.reply.clone(),
-                    },
-                    crate::conversation::Event::Append(nudge.clone()).into(),
-                ],
-                &arrivals,
-            )
-            .await?;
-        messages.append(reply.message.clone());
+        rows.push(Event::Append(nudge.clone()).into());
+        agent.save_carrying(session_id, rows, &arrivals).await?;
+        super::turn::apply_cut_reply(messages, reply.message.clone(), view);
         messages.append(nudge);
         agent
             .cells
@@ -1270,6 +1311,7 @@ mod tests {
             checklist_nudges: 0,
             checklist_nudges_this_turn: 0,
             outage_reprieve_used: false,
+            stream_continuations: 0,
         };
 
         recovery
@@ -1345,6 +1387,7 @@ mod tests {
             checklist_nudges: 0,
             checklist_nudges_this_turn: 0,
             outage_reprieve_used: false,
+            stream_continuations: 0,
         };
 
         let error = recovery
@@ -1413,6 +1456,7 @@ mod tests {
             thinking_only_nudged: false,
             checklist_nudges: 0,
             checklist_nudges_this_turn: 0,
+            stream_continuations: 0,
             outage_reprieve_used: false,
         };
         let carries_signed = |messages: &Conversation| {
@@ -1513,6 +1557,7 @@ mod tests {
             checklist_nudges: 0,
             checklist_nudges_this_turn: 0,
             outage_reprieve_used: false,
+            stream_continuations: 0,
         };
         let outage = |retry_after| MekaError::RetryableProvider {
             message: "503 unavailable".to_string(),
@@ -1580,6 +1625,7 @@ mod tests {
             checklist_nudges: 0,
             checklist_nudges_this_turn: 0,
             outage_reprieve_used: false,
+            stream_continuations: 0,
         };
         let outage = MekaError::RetryableProvider {
             message: "529 overloaded".to_string(),
@@ -1605,6 +1651,7 @@ mod tests {
         // change a verdict the provider has already reached on what it read.
         let mut fresh = TurnRecovery {
             outage_reprieve_used: false,
+            stream_continuations: 0,
             ..recovery
         };
         assert!(
@@ -2140,6 +2187,7 @@ mod tests {
             checklist_nudges: 0,
             checklist_nudges_this_turn: 0,
             outage_reprieve_used: true,
+            stream_continuations: 0,
         };
 
         // No pending repair, which is exactly the shape a successful reprieve leaves behind.

@@ -340,6 +340,10 @@ fn late_fires(
 /// context-window overflow before giving up. One pass shrinks the request dramatically; if it still
 /// overflows, looping won't help.
 pub(super) const MAX_OVERFLOW_RETRIES: u32 = 1;
+
+/// How many times a turn may recover a cut after output reached the frontend. Retrying a round
+/// that produced only reasoning or unrun calls spends the same budget as continuing partial text.
+pub(super) const MAX_STREAM_CONTINUATIONS: u32 = 3;
 /// How often a provider call in flight asks the inbox whether an interrupt is waiting. A second is
 /// below what a person notices of a chat reply and costs one indexed count per streaming session.
 pub(super) const INTERRUPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -497,7 +501,7 @@ pub(super) fn should_nudge_thinking_only(
 /// `None` when a cut came before anything arrived; a reply that ended is recorded even when it
 /// holds nothing, as every reply that ends is. The second half is the messages a repair puts in its
 /// place, `None` when the context keeps it whole.
-fn cut_reply_rows(
+pub(super) fn cut_reply_rows(
     reply: &Message,
     record: crate::conversation::ReplyRecord,
     kept: bool,
@@ -527,7 +531,11 @@ fn cut_reply_rows(
 }
 
 /// Mirror in memory what [`cut_reply_rows`] wrote: the reply, then the repair over it.
-fn apply_cut_reply(messages: &mut Conversation, reply: Message, view: Option<Vec<Message>>) {
+pub(super) fn apply_cut_reply(
+    messages: &mut Conversation,
+    reply: Message,
+    view: Option<Vec<Message>>,
+) {
     messages.append(reply);
     if let Some(view) = view {
         messages.replace_tail(1, view);
@@ -1012,11 +1020,15 @@ pub(super) struct StreamProgress {
     /// which the record keeps whatever the stream did afterwards.
     pub(crate) partial: Option<crate::provider::PartialReply>,
     /// The stream was stopped after the provider had answered, so the message returned is what
-    /// had arrived by then and not the whole reply. Which token stopped it is the caller's to ask.
+    /// had arrived by then and not the whole reply. Which token stopped it is the caller's to ask;
+    /// a stream that failed carries the failure in [`Self::cut_failure`] instead of a token.
     pub(crate) cut: bool,
     /// The calls the stream announced, in order, from the `ToolCallComposing` that opens each,
     /// and whether a `ToolCallStarted` followed.
     pub(crate) announced: Vec<(String, bool)>,
+    /// The stream failure that cut the answer, when one did rather than an inbox interrupt. Its
+    /// absence is what says the cut was an interrupt; a turn that stops continuing reports it.
+    pub(crate) cut_failure: Option<MekaError>,
 }
 
 impl StreamProgress {
@@ -1435,6 +1447,7 @@ impl Agent {
                 checklist_nudges: 0,
                 checklist_nudges_this_turn: 0,
                 outage_reprieve_used: false,
+                stream_continuations: 0,
             },
             // Accumulated across every provider call within this turn so the per-turn display
             // reflects the whole turn (including tool-execution loops), not just the final
@@ -2103,23 +2116,84 @@ impl Agent {
                 return Err(MekaError::Interrupted);
             }
             if progress.cut {
-                // An inbox interrupt cut the stream after the provider had answered. What arrived
-                // is kept as the answer so far, the message follows it, and the turn goes on:
-                // same turn, no terminal, the way a person is cut off and told the next thing.
-                let record = crate::conversation::ReplyRecord {
-                    stop: None,
-                    cut: Some(crate::conversation::ReplyCut::Interrupted),
-                    ..record
-                };
-                self.absorb_interrupt(
-                    session_id,
-                    messages,
-                    &mut run.recovery,
-                    &run.user_message,
-                    Some((assistant_message, record)),
-                )
-                .await?;
-                continue;
+                match progress.cut_failure.take() {
+                    Some(failure) => {
+                        let record = crate::conversation::ReplyRecord {
+                            stop: None,
+                            cut: Some(crate::conversation::ReplyCut::Failed),
+                            ..record
+                        };
+                        let has_text = assistant_message.has_visible_text();
+                        let attempt = run.recovery.next_stream_recovery();
+                        self.drop_unrun(std::mem::take(&mut unrun)).await;
+                        if attempt.is_some() && has_text {
+                            let reply = crate::conversation::RecordedMessage {
+                                message: assistant_message,
+                                reply: Some(record),
+                            };
+                            run.recovery
+                                .nudge_continuation(self, session_id, messages, &reply)
+                                .await?;
+                        } else {
+                            // With no answer text to continue, the retry must see the original
+                            // round, including completed tool results, not the failed attempt.
+                            self.record_cut_reply(
+                                session_id,
+                                messages,
+                                &mut run.recovery,
+                                &run.user_message,
+                                assistant_message,
+                                record,
+                                true,
+                            )
+                            .await;
+                        }
+                        let Some(attempt) = attempt else {
+                            return Err(failure);
+                        };
+                        let delay = crate::provider::retry::backoff_delay(attempt, None);
+                        tracing::warn!(
+                            "provider stream cut ({attempt}/{MAX_STREAM_CONTINUATIONS}); \
+                             resuming the turn in {delay:?}: {failure}"
+                        );
+                        let notice = if has_text {
+                            crate::frontend::CONTINUATION_NOTICE
+                        } else {
+                            "The reply was cut off before any answer text arrived; retrying the round."
+                        };
+                        self.cells
+                            .frontend
+                            .emit(FrontendEvent::Notice(crate::frontend::Notice::info(notice)))
+                            .await;
+                        tokio::select! {
+                            biased;
+                            _ = run.cancellation.token().cancelled() => return Err(MekaError::Interrupted),
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                        continue;
+                    }
+                    // An inbox interrupt cut the stream after the provider had answered. What
+                    // arrived is kept as the answer so far, the message follows it, and the turn
+                    // goes on: same turn, no terminal, the way a person is cut off and told the
+                    // next thing.
+                    None => {
+                        // The record says the cut, as it did before the continuation existed.
+                        let record = crate::conversation::ReplyRecord {
+                            stop: None,
+                            cut: Some(crate::conversation::ReplyCut::Interrupted),
+                            ..record
+                        };
+                        self.absorb_interrupt(
+                            session_id,
+                            messages,
+                            &mut run.recovery,
+                            &run.user_message,
+                            Some((assistant_message, record)),
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
             }
 
             // Run tools based on the *presence* of tool-call blocks, not the reported stop reason:
@@ -3561,8 +3635,17 @@ impl Agent {
                 progress.cut = true;
             }
             Ok(Err(error)) => {
-                progress.partial = accumulator.partial();
-                return Err(error);
+                // A stream failure after output began is a cut, not a failed round: the provider
+                // had accepted the request, and re-sending what the user already watched arrive
+                // would duplicate it. The turn's cut arm keeps it and asks for the rest. Before
+                // any output this stays a failure, which `run_streaming` may still retry.
+                if matches!(error, MekaError::StreamError(_)) && progress.content_started {
+                    progress.cut = true;
+                    progress.cut_failure = Some(error);
+                } else {
+                    progress.partial = accumulator.partial();
+                    return Err(error);
+                }
             }
             Err(join_error) => {
                 return Err(MekaError::Provider(format!(
@@ -7351,16 +7434,24 @@ mod tests {
 
     /// The text that streamed before the connection died is kept: it was on screen, and losing it
     /// from the conversation and the store makes the user re-ask for what they had already read.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_mid_stream_failure_keeps_the_text_that_had_arrived() {
-        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
-            MockEvent::Text {
-                text: "the first half".to_string(),
-            },
-            MockEvent::FailStream {
-                message: "connection reset".to_string(),
-            },
-        ]]));
+        // A single failing stream is continued, not reported; the error surfaces only past the
+        // continuation bound, so the script fails on every attempt the turn makes.
+        let provider = Arc::new(MockProvider::from_rounds(
+            (0..=MAX_STREAM_CONTINUATIONS)
+                .map(|_| {
+                    vec![
+                        MockEvent::Text {
+                            text: "the first half".to_string(),
+                        },
+                        MockEvent::FailStream {
+                            message: "connection reset".to_string(),
+                        },
+                    ]
+                })
+                .collect(),
+        ));
         let (agent, store) = agent_for_test(provider as Arc<dyn Provider>).await;
         let mut messages = Conversation::new();
         let outcome = agent
@@ -7389,6 +7480,308 @@ mod tests {
             )),
             "and it is in the store, so a resume shows it: {stored:?}"
         );
+    }
+
+    /// A transport failure after content is a cut and not a failed round: what arrived is the
+    /// answer so far, and the same turn asks for the rest. Reporting the error instead would make
+    /// the user re-ask for an answer the turn can finish.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_error_after_content_continues_the_turn_instead_of_failing_it() {
+        let mut cut = a_reply_with_a_call_then(MockEvent::FailStream {
+            message: "connection reset".to_string(),
+        });
+        cut.insert(2, MockEvent::Text {
+            text: "the first half".to_string(),
+        });
+        let (agent, provider, store, session_id, frontend) =
+            agent_with_session(vec![cut, text_round("the rest")]).await;
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await;
+        assert!(
+            matches!(&outcome, Ok(outcome) if outcome.stop_reason == StopReason::EndTurn),
+            "the continuation completes the reply and the turn ends well: {outcome:?}"
+        );
+        assert_eq!(
+            provider.streams().len(),
+            2,
+            "the continuation is a provider call of its own"
+        );
+        let shape = messages.as_slice();
+        assert_eq!(
+            shape.len(),
+            4,
+            "prompt, kept partial, nudge, completed reply: {shape:?}"
+        );
+        assert_eq!(shape[1].role, Role::Assistant);
+        assert_eq!(shape[1].text_content(), "the first half");
+        assert_eq!(
+            shape[2].nudge(),
+            Some((
+                crate::conversation::NudgeKind::Continuation,
+                crate::conversation::CONTINUATION_NUDGE,
+            )),
+            "the nudge asking for the rest follows the partial: {shape:?}"
+        );
+        assert_eq!(shape[3].role, Role::Assistant);
+        assert_eq!(shape[3].text_content(), "the rest");
+
+        assert!(provider.streams()[1].messages[1].tool_uses().is_empty());
+        assert_eq!(
+            recorded_replies(&store, session_id).await[0]
+                .0
+                .tool_uses()
+                .len(),
+            1
+        );
+        assert!(frontend.events().iter().any(|event| matches!(
+            event, FrontendEvent::ToolCallDropped { id, started: true } if id == "call-1"
+        )));
+        assert!(
+            !frontend
+                .events()
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::ToolCallCompleted { .. }))
+        );
+        let reloaded =
+            Conversation::from_events(store.load_view_events(session_id).await.expect("view"));
+        assert_eq!(reloaded.as_slice(), shape);
+    }
+
+    #[derive(Default)]
+    struct ReasoningFrontend(crate::frontend::testing::RecordingFrontend);
+
+    #[async_trait::async_trait]
+    impl crate::frontend::Frontend for ReasoningFrontend {
+        fn retains_reasoning(&self) -> bool {
+            true
+        }
+
+        async fn emit(&self, event: FrontendEvent) {
+            self.0.emit(event).await;
+        }
+
+        async fn request_permission(
+            &self,
+            request: crate::frontend::PermissionRequest,
+        ) -> crate::frontend::PermissionOutcome {
+            self.0.request_permission(request).await
+        }
+    }
+
+    /// A reset during reasoning must not restart the turn: the completed tool result is already
+    /// in the conversation, and the next attempt only needs to answer it.
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_during_reasoning_retries_only_the_unfinished_round() {
+        use crate::provider::mock::MockStopReason;
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "finished".to_string(),
+                    name: "no_such_tool".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            vec![
+                MockEvent::ThinkingDelta {
+                    text: "considering the tool result".to_string(),
+                },
+                MockEvent::FailStreamHolding {
+                    message: "Transport error: connection reset (x-trace-id: test)".to_string(),
+                    held: vec![MockEvent::ThinkingComplete {
+                        opaque: Some(crate::conversation::OpaqueReasoning::Verbatim),
+                    }],
+                },
+            ],
+            text_round("the turn completes"),
+        ]));
+        let (mut agent, store) = agent_for_test(provider.clone()).await;
+        let frontend = Arc::new(ReasoningFrontend::default());
+        agent.cells.frontend = frontend.clone();
+        let mut messages = Conversation::new();
+
+        ask(&agent, &mut messages, "go", Vec::new())
+            .await
+            .expect("a cut in reasoning does not end the turn");
+
+        let requests = provider.streams();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1].messages, requests[2].messages);
+        assert!(
+            matches!(requests[2].messages.last().map(|message| message.content.as_slice()),
+            Some([ContentBlock::ToolResult { tool_use_id, .. }]) if tool_use_id == "finished")
+        );
+        assert_eq!(
+            frontend
+                .0
+                .events()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    FrontendEvent::ToolCallCompleted { id, .. } if id == "finished"
+                ))
+                .count(),
+            1,
+        );
+        let session_id = agent.session_id().expect("the session");
+        let replies = recorded_replies(&store, session_id).await;
+        let (partial, record) = &replies[1];
+        assert!(matches!(partial.content.as_slice(), [
+            ContentBlock::Thinking { .. }
+        ]));
+        assert_eq!(
+            record.as_ref().and_then(|record| record.cut),
+            Some(crate::conversation::ReplyCut::Failed),
+        );
+        let reloaded =
+            Conversation::from_events(store.load_view_events(session_id).await.expect("view"));
+        assert_eq!(reloaded.as_slice(), messages.as_slice());
+    }
+
+    struct StopOnRecovery {
+        cancellation: crate::agent::TurnCancellation,
+        stopped_at: std::sync::OnceLock<tokio::time::Instant>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::frontend::Frontend for StopOnRecovery {
+        async fn emit(&self, event: FrontendEvent) {
+            if matches!(event, FrontendEvent::Notice(ref notice) if notice.text.contains("cut off"))
+            {
+                self.stopped_at.get_or_init(tokio::time::Instant::now);
+                self.cancellation.cancel(CancelReason::Client);
+            }
+        }
+
+        async fn request_permission(
+            &self,
+            _request: crate::frontend::PermissionRequest,
+        ) -> crate::frontend::PermissionOutcome {
+            crate::frontend::PermissionOutcome::Allow
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopping_stream_recovery_does_not_wait_for_backoff_or_send_again() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            MockEvent::Text {
+                text: "partial".to_string(),
+            },
+            MockEvent::FailStream {
+                message: "connection reset".to_string(),
+            },
+        ]]));
+        let (mut agent, _store) = agent_for_test(provider.clone()).await;
+        let cancellation = crate::agent::TurnCancellation::new();
+        let frontend = Arc::new(StopOnRecovery {
+            cancellation: cancellation.clone(),
+            stopped_at: std::sync::OnceLock::new(),
+        });
+        agent.cells.frontend = frontend.clone();
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new()).expect("prompt"),
+                cancellation,
+            )
+            .await;
+        assert!(
+            frontend
+                .stopped_at
+                .get()
+                .expect("the recovery was announced")
+                .elapsed()
+                < crate::provider::retry::backoff_delay(1, None),
+            "cancellation bypasses the recovery backoff"
+        );
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "{outcome:?}"
+        );
+        assert_eq!(provider.streams().len(), 1);
+        assert_eq!(messages.as_slice()[1].text_content(), "partial");
+    }
+
+    /// Text continuations and reasoning-only retries share a budget, since each costs a request.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_fails_after_content_every_time_gives_up_at_the_continuation_bound() {
+        let provider = Arc::new(MockProvider::from_rounds(
+            (1..=4)
+                .map(|attempt| {
+                    let mut output = if attempt == 2 {
+                        vec![
+                            MockEvent::ThinkingDelta {
+                                text: "reasoning only".to_string(),
+                            },
+                            MockEvent::ThinkingComplete { opaque: None },
+                        ]
+                    } else {
+                        vec![MockEvent::Text {
+                            text: format!("part {attempt}"),
+                        }]
+                    };
+                    output.push(MockEvent::FailStream {
+                        message: format!("connection reset (x-trace-id: trace-{attempt})"),
+                    });
+                    output
+                })
+                .collect(),
+        ));
+        let (agent, _store) = agent_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await;
+        assert!(
+            matches!(
+                &outcome,
+                Err(MekaError::StreamError(message)) if message == "connection reset (x-trace-id: trace-4)"
+            ),
+            "past the bound the last stream's failure is reported: {outcome:?}"
+        );
+        assert_eq!(
+            provider.streams().len(),
+            4,
+            "three continuations, four attempts, then the turn gives up"
+        );
+        let continuations = messages
+            .as_slice()
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message.nudge(),
+                    Some((crate::conversation::NudgeKind::Continuation, _))
+                )
+            })
+            .count();
+        assert_eq!(continuations, 2, "reasoning needs no continuation nudge");
+        for attempt in [1, 3, 4] {
+            assert!(
+                messages
+                    .as_slice()
+                    .iter()
+                    .any(|message| message.role == Role::Assistant
+                        && message.text_content() == format!("part {attempt}")),
+                "every partial is kept, including the one the give-up arm saves: {attempt}"
+            );
+        }
     }
 
     use std::sync::Arc;
@@ -7586,19 +7979,27 @@ mod tests {
     /// stream then died with text on screen: the prompt first, then the partial answer. A partial
     /// persisted ahead of the lazy prompt save would replay as an answer before its question, and
     /// a `Withdraw` turn's `pop_unsaved` would take it out of memory in the prompt's place.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_partial_answer_never_lands_on_disk_ahead_of_its_prompt() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("meka.db");
-        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
-            MockEvent::Sleep { ms: 300 },
-            MockEvent::Text {
-                text: "the first half".to_string(),
-            },
-            MockEvent::FailStream {
-                message: "connection reset".to_string(),
-            },
-        ]]));
+        // A single failing stream is continued, not reported; the error surfaces only past the
+        // continuation bound, so the script fails on every attempt the turn makes.
+        let provider = Arc::new(MockProvider::from_rounds(
+            (0..=MAX_STREAM_CONTINUATIONS)
+                .map(|_| {
+                    vec![
+                        MockEvent::Sleep { ms: 300 },
+                        MockEvent::Text {
+                            text: "the first half".to_string(),
+                        },
+                        MockEvent::FailStream {
+                            message: "connection reset".to_string(),
+                        },
+                    ]
+                })
+                .collect(),
+        ));
         let (agent, store) =
             agent_at_for_test(Arc::clone(&provider) as Arc<dyn Provider>, &path).await;
         let session_id = store
