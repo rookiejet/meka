@@ -117,7 +117,10 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
    and whether the host can deliver later turns. `admit_tool_call` lives in `tools`, where
    `tool_search` and `tool_load` consult it to say what a call would do before the model makes it.
 4. **Recovery.** A failed request goes through `TurnRecovery`, which decides between a retry, a
-   degraded resend and a reported failure. Once a profile's retries are spent on an error that says
+   degraded resend and a reported failure. A stream that fails after output began is continued
+   rather than reported: what arrived is kept as the answer so far, a continuation nudge asks for
+   the rest, and `stream_continuations` bounds the continuations before the failure is reported
+   with the partials kept. Once a profile's retries are spent on an error that says
    the profile cannot serve (`MekaError::is_profile_unavailable`), `agent::fallback` opens that
    profile's breaker in the `ProviderRegistry`, binds the next profile in its chain the turn has not
    tried, breaker or not, and re-sends under the retry's own no-output guard; the turn's end restores the named

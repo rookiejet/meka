@@ -278,6 +278,11 @@ fn inbox_block(item: &crate::store::inbox::InboxItem, mid_turn: bool) -> Content
 /// context-window overflow before giving up. One pass shrinks the request dramatically; if it still
 /// overflows, looping won't help.
 pub(super) const MAX_OVERFLOW_RETRIES: u32 = 1;
+
+/// How many times a turn continues a reply the stream cut mid-answer before it gives up and
+/// reports the failure with what arrived kept. Each continuation is a full request, so a stream
+/// that dies every time costs no more than this many per turn; the next turn may continue again.
+pub(super) const MAX_STREAM_CONTINUATIONS: u32 = 3;
 /// How often a provider call in flight asks the inbox whether an interrupt is waiting. A second is
 /// below what a person notices of a chat reply and costs one indexed count per streaming session.
 pub(super) const INTERRUPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -843,8 +848,12 @@ pub(super) struct StreamProgress {
     /// arrive, so it is theirs to keep whatever the stream did afterwards.
     pub(crate) partial: Option<Message>,
     /// The stream was stopped after the provider had answered, so the message returned is what
-    /// had arrived by then and not the whole reply. Which token stopped it is the caller's to ask.
+    /// had arrived by then and not the whole reply. Which token stopped it is the caller's to ask;
+    /// a stream that failed carries the failure in [`Self::cut_failure`] instead of a token.
     pub(crate) cut: bool,
+    /// The stream failure that cut the answer, when one did rather than an inbox interrupt. Its
+    /// absence is what says the cut was an interrupt; a turn that stops continuing reports it.
+    pub(crate) cut_failure: Option<MekaError>,
 }
 
 impl Agent {
@@ -1179,6 +1188,7 @@ impl Agent {
                 checklist_nudges: 0,
                 checklist_nudges_this_turn: 0,
                 outage_reprieve_used: false,
+                stream_continuations: 0,
             },
             // Accumulated across every provider call within this turn so the per-turn display
             // reflects the whole turn (including tool-execution loops), not just the final
@@ -1761,18 +1771,50 @@ impl Agent {
                 return Err(MekaError::Interrupted);
             }
             if progress.cut {
-                // An inbox interrupt cut the stream after the provider had answered. What arrived
-                // is kept as the answer so far, the message follows it, and the turn goes on:
-                // same turn, no terminal, the way a person is cut off and told the next thing.
-                self.absorb_interrupt(
-                    session_id,
-                    messages,
-                    &mut run.recovery,
-                    &run.user_message,
-                    Some(assistant_message),
-                )
-                .await?;
-                continue;
+                match progress.cut_failure.take() {
+                    // A stream failure cut the answer. What arrived is kept as the answer so far
+                    // and the model is asked for the rest, so the turn goes on: same turn, no
+                    // terminal. Bounded, because every continuation is a full request and a
+                    // stream that dies every time would otherwise cost without end.
+                    Some(failure) => {
+                        let partial = assistant_message.without_tool_use();
+                        let has_text = partial
+                            .content
+                            .iter()
+                            .any(|block| matches!(block, ContentBlock::Text { .. }));
+                        if has_text && run.recovery.stream_continuations < MAX_STREAM_CONTINUATIONS
+                        {
+                            run.recovery
+                                .nudge_continuation(self, session_id, messages, &partial)
+                                .await?;
+                            self.cells
+                                .frontend
+                                .emit(FrontendEvent::Notice(crate::frontend::Notice::info(
+                                    "The reply was cut off mid-answer; continuing where it left off.",
+                                )))
+                                .await;
+                            continue;
+                        }
+                        self.keep_partial_answer(session_id, messages, partial)
+                            .await;
+                        return Err(failure);
+                    }
+                    // An inbox interrupt cut the stream after the provider had answered. What
+                    // arrived is kept as the answer so far, the message follows it, and the turn
+                    // goes on: same turn, no terminal, the way a person is cut off and told the
+                    // next thing.
+                    None => {
+                        self.absorb_interrupt(
+                            session_id,
+                            messages,
+                            &mut run.recovery,
+                            &run.user_message,
+                            Some(assistant_message),
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
             }
 
             // Run tools based on the *presence* of tool-call blocks, not the reported stop reason:
@@ -3139,8 +3181,20 @@ impl Agent {
                 progress.cut = true;
             }
             Ok(Err(error)) => {
-                progress.partial = accumulator.partial();
-                return Err(error);
+                // A stream failure after output began is a cut, not a failed round: the provider
+                // had accepted the request, and re-sending what the user already watched arrive
+                // would duplicate it. The turn's cut arm keeps it and asks for the rest. Before
+                // any output this stays a failure, which `run_streaming` may still retry.
+                if matches!(error, MekaError::StreamError(_)) && progress.content_started {
+                    tracing::warn!(
+                        "provider stream failed mid-answer; continuing from what arrived: {error}"
+                    );
+                    progress.cut = true;
+                    progress.cut_failure = Some(error);
+                } else {
+                    progress.partial = accumulator.partial();
+                    return Err(error);
+                }
             }
             Err(join_error) => {
                 return Err(MekaError::Provider(format!(
@@ -4812,14 +4866,22 @@ mod tests {
     /// from the conversation and the store makes the user re-ask for what they had already read.
     #[tokio::test]
     async fn a_mid_stream_failure_keeps_the_text_that_had_arrived() {
-        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
-            MockEvent::Text {
-                text: "the first half".to_string(),
-            },
-            MockEvent::FailStream {
-                message: "connection reset".to_string(),
-            },
-        ]]));
+        // A single failing stream is continued, not reported; the error surfaces only past the
+        // continuation bound, so the script fails on every attempt the turn makes.
+        let provider = Arc::new(MockProvider::from_rounds(
+            (0..=MAX_STREAM_CONTINUATIONS)
+                .map(|_| {
+                    vec![
+                        MockEvent::Text {
+                            text: "the first half".to_string(),
+                        },
+                        MockEvent::FailStream {
+                            message: "connection reset".to_string(),
+                        },
+                    ]
+                })
+                .collect(),
+        ));
         let (agent, store) = agent_for_test(provider as Arc<dyn Provider>).await;
         let mut messages = Conversation::new();
         let outcome = agent
@@ -4848,6 +4910,129 @@ mod tests {
             )),
             "and it is in the store, so a resume shows it: {stored:?}"
         );
+    }
+
+    /// A transport failure after content is a cut and not a failed round: what arrived is the
+    /// answer so far, and the same turn asks for the rest. Reporting the error instead would make
+    /// the user re-ask for an answer the turn can finish.
+    #[tokio::test]
+    async fn a_stream_error_after_content_continues_the_turn_instead_of_failing_it() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::Text {
+                    text: "the first half".to_string(),
+                },
+                MockEvent::FailStream {
+                    message: "connection reset".to_string(),
+                },
+            ],
+            text_round("the rest"),
+        ]));
+        let (agent, _store) = agent_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await;
+        assert!(
+            matches!(outcome, Ok(TurnOutcome::EndTurn)),
+            "the continuation completes the reply and the turn ends well: {outcome:?}"
+        );
+        assert_eq!(
+            provider.streams().len(),
+            2,
+            "the continuation is a provider call of its own"
+        );
+        let shape = messages.as_slice();
+        assert_eq!(
+            shape.len(),
+            4,
+            "prompt, kept partial, nudge, completed reply: {shape:?}"
+        );
+        assert_eq!(shape[1].role, Role::Assistant);
+        assert_eq!(shape[1].text_content(), "the first half");
+        assert_eq!(
+            shape[2].nudge(),
+            Some((
+                crate::conversation::NudgeKind::Continuation,
+                crate::conversation::CONTINUATION_NUDGE,
+            )),
+            "the nudge asking for the rest follows the partial: {shape:?}"
+        );
+        assert_eq!(shape[3].role, Role::Assistant);
+        assert_eq!(shape[3].text_content(), "the rest");
+    }
+
+    /// The bound on continuing a cut reply, pinned exactly: a stream that dies after content on
+    /// every attempt earns three continuations, each a full request, and the fourth failure is
+    /// reported with everything that arrived kept. Unbounded, one bad connection would bill a
+    /// request per failure until the provider recovered.
+    #[tokio::test]
+    async fn a_stream_that_fails_after_content_every_time_gives_up_at_the_continuation_bound() {
+        let provider = Arc::new(MockProvider::from_rounds(
+            (1..=4)
+                .map(|attempt| {
+                    vec![
+                        MockEvent::Text {
+                            text: format!("part {attempt}"),
+                        },
+                        MockEvent::FailStream {
+                            message: "connection reset".to_string(),
+                        },
+                    ]
+                })
+                .collect(),
+        ));
+        let (agent, _store) = agent_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await;
+        assert!(
+            matches!(
+                &outcome,
+                Err(MekaError::StreamError(message)) if message == "connection reset"
+            ),
+            "past the bound the stream's own failure is reported: {outcome:?}"
+        );
+        assert_eq!(
+            provider.streams().len(),
+            4,
+            "three continuations, four attempts, then the turn gives up"
+        );
+        let continuations = messages
+            .as_slice()
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message.nudge(),
+                    Some((crate::conversation::NudgeKind::Continuation, _))
+                )
+            })
+            .count();
+        assert_eq!(
+            continuations, 3,
+            "the cap is per turn: three continuations, and the fourth cut is reported"
+        );
+        for attempt in 1..=4 {
+            assert!(
+                messages
+                    .as_slice()
+                    .iter()
+                    .any(|message| message.role == Role::Assistant
+                        && message.text_content() == format!("part {attempt}")),
+                "every partial is kept, including the one the give-up arm saves: {attempt}"
+            );
+        }
     }
 
     use std::sync::Arc;
@@ -5049,15 +5234,23 @@ mod tests {
     async fn a_partial_answer_never_lands_on_disk_ahead_of_its_prompt() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("meka.db");
-        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
-            MockEvent::Sleep { ms: 300 },
-            MockEvent::Text {
-                text: "the first half".to_string(),
-            },
-            MockEvent::FailStream {
-                message: "connection reset".to_string(),
-            },
-        ]]));
+        // A single failing stream is continued, not reported; the error surfaces only past the
+        // continuation bound, so the script fails on every attempt the turn makes.
+        let provider = Arc::new(MockProvider::from_rounds(
+            (0..=MAX_STREAM_CONTINUATIONS)
+                .map(|_| {
+                    vec![
+                        MockEvent::Sleep { ms: 300 },
+                        MockEvent::Text {
+                            text: "the first half".to_string(),
+                        },
+                        MockEvent::FailStream {
+                            message: "connection reset".to_string(),
+                        },
+                    ]
+                })
+                .collect(),
+        ));
         let (agent, store) =
             agent_at_for_test(Arc::clone(&provider) as Arc<dyn Provider>, &path).await;
         let session_id = store
