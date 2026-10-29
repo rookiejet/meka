@@ -102,6 +102,10 @@ The first word says how the turn ended (`Finished`, `Interrupted`, `Failed`), an
 facts after it: the time, the duration, the tokens used. A resumed session closes every recorded
 turn the same way, so the scrollback says when each one ended.
 
+A reply that a connection failure cuts off mid-answer does not end the turn: what arrived is kept
+and the agent is asked to continue where it stopped, up to three times in one turn. Past that the
+turn ends `Failed` with the partial answers kept.
+
 ## Expanding and collapsing
 
 Reasoning shows as one dimmed `• Thinking · …` row: the first words of the block once it has

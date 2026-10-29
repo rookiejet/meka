@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepts `block_binding` on those models only with adaptive thinking.
 - Compaction requests send no reasoning blocks, so the summarizer no longer fails when it sends
   no tools.
+- A reply cut off mid-answer by a stream failure no longer fails the turn: it is continued from
+  what arrived, up to three times, and reported only past that.
+- A stream failure says what cut the connection (dropped, timed out, truncated) instead of only
+  'error decoding response body'.
 
 ## [0.85.0] - 2026-10-28
 
@@ -167,7 +171,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - RUSTSEC-2026-0382 and 0383: `rustls-webpki` moves to 0.103.16 and `webpki-root-certs` to 1.0.10.
-||||||| parent of 1607976 (feat: support OpenCode Go, its session header and usage endpoint)
 
 ## [0.82.0] - 2026-10-19
 

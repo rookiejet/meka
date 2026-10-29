@@ -76,6 +76,45 @@ pub(crate) fn frame_json(what: &str, data: &str) -> Option<serde_json::Value> {
     }
 }
 
+/// `error` and the causes behind it, outermost first, joined so a transport failure names its real
+/// cause: reqwest reports every body failure as "error decoding response body", and only the
+/// source chain says what happened to the connection. Consecutive repeats are dropped, since a
+/// layer that displays its source would otherwise say it twice.
+fn causes(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if parts.last().map(String::as_str) != Some(text.as_str()) {
+            parts.push(text);
+        }
+        source = cause.source();
+    }
+    parts.join(": ")
+}
+
+/// The response-head headers that name a request across the proxies in front of a provider, for a
+/// failure message support can trace. Which headers do that is each endpoint's own, so the common
+/// ones (cf-ray and friends, seen on the captured Cloudflare edge) are read and only those present
+/// are reported: a message carries what the wire carried and invents nothing.
+fn trace_suffix(headers: &reqwest::header::HeaderMap) -> String {
+    const TRACE_HEADERS: [&str; 3] = ["cf-ray", "x-request-id", "x-trace-id"];
+    let carried: Vec<String> = TRACE_HEADERS
+        .iter()
+        .filter_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| format!("{name}: {value}"))
+        })
+        .collect();
+    if carried.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", carried.join("; "))
+    }
+}
+
 /// Read `response` as SSE to its end, handing each frame to `protocol`. `what` names the protocol
 /// in messages.
 pub(crate) async fn drive<P: Protocol>(
@@ -112,6 +151,7 @@ async fn drive_within<P: Protocol>(
         cancellation,
     )
     .await?;
+    let trace = trace_suffix(response.headers());
     let mut event_stream = bounded_events(response.bytes_stream(), max_event_bytes).eventsource();
     loop {
         tokio::select! {
@@ -124,7 +164,7 @@ async fn drive_within<P: Protocol>(
                 // a socket that will never speak again, for as long as the process runs.
                 let Ok(event) = event else {
                     let message = format!(
-                        "idle timeout waiting for a {what} SSE event after {}s",
+                        "idle timeout waiting for a {what} SSE event after {}s{trace}",
                         STREAM_IDLE_TIMEOUT.as_secs()
                     );
                     return Err(stream_error(event_sender, message).await);
@@ -151,7 +191,17 @@ async fn drive_within<P: Protocol>(
                         }
                         return Err(MekaError::Provider(message));
                     }
-                    Err(error) => return Err(stream_error(event_sender, error.to_string()).await),
+                    Err(error) => {
+                        // The real cause lives in the source chain: reqwest says the same three
+                        // words for a body failure whatever killed the connection.
+                        let message = match &error {
+                            eventsource_stream::EventStreamError::Transport(
+                                BodyError::Transport(failure),
+                            ) => format!("Transport error: {}{trace}", causes(failure)),
+                            _ => error.to_string(),
+                        };
+                        return Err(stream_error(event_sender, message).await);
+                    }
                 };
                 match protocol.frame(event, event_sender).await {
                     Ok(Step::Continue) => {}
@@ -346,6 +396,98 @@ mod tests {
 
         assert!(matches!(error, MekaError::Provider(_)), "{error}");
         assert!(error.to_string().contains("1.0 KiB"), "{error}");
+        assert!(
+            matches!(events.try_recv(), Ok(StreamEvent::Error(_))),
+            "the failure is announced on the channel first"
+        );
+    }
+
+    /// The chain behind a body failure is what a message must carry: reqwest says the same three
+    /// words for every one of them, and only the causes say what happened to the connection.
+    #[test]
+    fn causes_names_the_reason_behind_a_body_failure() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("innermost")]
+        struct Inner;
+        #[derive(Debug, thiserror::Error)]
+        #[error("the connection closed before the message completed")]
+        struct Middle(#[source] Inner);
+        #[derive(Debug, thiserror::Error)]
+        #[error("error decoding response body")]
+        struct Outer(#[source] Middle);
+        #[derive(Debug, thiserror::Error)]
+        #[error("innermost")]
+        struct Echo(#[source] Inner);
+
+        assert_eq!(
+            causes(&Outer(Middle(Inner))),
+            "error decoding response body: the connection closed before the message completed: \
+             innermost"
+        );
+        assert_eq!(causes(&Inner), "innermost");
+        assert_eq!(
+            causes(&Echo(Inner)),
+            "innermost",
+            "a layer that repeats its source is said once"
+        );
+    }
+
+    /// A body that stops mid-message is a transport failure whose message names the cause behind
+    /// reqwest's three words, announced on the channel like every failure after the head.
+    #[tokio::test]
+    async fn a_truncated_body_names_the_cause_behind_the_three_words() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.ends_with(b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.expect("the request arrives");
+                assert!(read > 0, "the client closed the connection");
+                head.extend_from_slice(&chunk[..read]);
+            }
+            // One whole event, then the connection hangs up before the chunked body ends.
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                      transfer-encoding: chunked\r\n\r\nd\r\ndata: hello\n\n\r\n",
+                )
+                .await
+                .expect("answer");
+            socket.shutdown().await.expect("hang up");
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .expect("the head arrives");
+        let (event_sender, mut events) = mpsc::channel(8);
+        let Err(error) = drive_within(
+            response,
+            "test",
+            &event_sender,
+            &CancellationToken::new(),
+            &mut Discard,
+            1024,
+        )
+        .await
+        else {
+            panic!("a truncated body is a failure");
+        };
+        peer.await.expect("the peer finished");
+
+        let message = error.to_string();
+        assert!(matches!(error, MekaError::StreamError(_)), "{message}");
+        assert!(
+            message.contains("error decoding response body: "),
+            "the message names the cause behind reqwest's three words: {message}"
+        );
         assert!(
             matches!(events.try_recv(), Ok(StreamEvent::Error(_))),
             "the failure is announced on the channel first"
