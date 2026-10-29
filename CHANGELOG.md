@@ -57,6 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepts `block_binding` on those models only with adaptive thinking.
 - Compaction requests send no reasoning blocks, so the summarizer no longer fails when it sends
   no tools.
+- A reply cut off mid-answer by a stream failure no longer fails the turn: it is continued from
+  what arrived, up to three times, and reported only past that.
+- A stream failure says what cut the connection (dropped, timed out, truncated) instead of only
+  'error decoding response body'.
 
 ## [0.91.0] - 2026-11-08
 

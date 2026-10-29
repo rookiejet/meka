@@ -134,6 +134,11 @@ pub(super) struct TurnRecovery {
     /// provider that cannot handle this body. Once per turn, on the first refusal that could
     /// be either, because a second would only re-measure what the first already answered.
     pub(super) outage_reprieve_used: bool,
+    /// Bounds continuing replies the stream cut mid-answer, so a stream that dies every time
+    /// costs a full request per continuation and the turn then gives up and reports the failure
+    /// with what arrived kept. Counted per turn for the reason [`Self::requested_compactions`]
+    /// gives: continuing again on the next turn is a fresh decision.
+    pub(super) stream_continuations: u32,
 }
 impl TurnRecovery {
     /// Compact and retry after the provider reported an overflow the local pre-send estimate missed
@@ -611,6 +616,35 @@ impl TurnRecovery {
         tracing::info!(
             "the reply left checklist items open; nudging ({in_a_row} of {limit}, {this_turn} this \
              turn)"
+        );
+        Ok(())
+    }
+
+    /// Answer a reply the stream cut mid-answer by appending the continuation nudge after the
+    /// kept partial, as one unit with it for the reason [`Self::nudge_thinking_only`] gives.
+    /// Counted here, against the cap, so a caller cannot continue without counting.
+    pub(super) async fn nudge_continuation(
+        &mut self,
+        agent: &Agent,
+        session_id: Uuid,
+        messages: &mut Conversation,
+        assistant_message: &Message,
+    ) -> Result<()> {
+        self.append_nudge(
+            agent,
+            session_id,
+            messages,
+            assistant_message,
+            crate::conversation::NudgeKind::Continuation,
+            crate::conversation::CONTINUATION_NUDGE.to_string(),
+            None,
+        )
+        .await?;
+        self.stream_continuations = self.stream_continuations.saturating_add(1);
+        let continuations = self.stream_continuations;
+        tracing::info!(
+            "a stream failure cut the reply mid-answer; continuing from what arrived \
+             ({continuations} this turn)"
         );
         Ok(())
     }
@@ -1203,6 +1237,7 @@ mod tests {
             checklist_nudges: 0,
             checklist_nudges_this_turn: 0,
             outage_reprieve_used: false,
+            stream_continuations: 0,
         };
 
         recovery
@@ -1278,6 +1313,7 @@ mod tests {
             checklist_nudges: 0,
             checklist_nudges_this_turn: 0,
             outage_reprieve_used: false,
+            stream_continuations: 0,
         };
 
         let error = recovery
@@ -1342,6 +1378,7 @@ mod tests {
             thinking_only_nudged: false,
             checklist_nudges: 0,
             checklist_nudges_this_turn: 0,
+            stream_continuations: 0,
             outage_reprieve_used: false,
         };
         let carries_signed = |messages: &Conversation| {
@@ -1439,6 +1476,7 @@ mod tests {
             checklist_nudges: 0,
             checklist_nudges_this_turn: 0,
             outage_reprieve_used: false,
+            stream_continuations: 0,
         };
         let outage = |retry_after| MekaError::RetryableProvider {
             message: "503 unavailable".to_string(),
@@ -1506,6 +1544,7 @@ mod tests {
             checklist_nudges: 0,
             checklist_nudges_this_turn: 0,
             outage_reprieve_used: false,
+            stream_continuations: 0,
         };
         let outage = MekaError::RetryableProvider {
             message: "529 overloaded".to_string(),
@@ -1531,6 +1570,7 @@ mod tests {
         // change a verdict the provider has already reached on what it read.
         let mut fresh = TurnRecovery {
             outage_reprieve_used: false,
+            stream_continuations: 0,
             ..recovery
         };
         assert!(
@@ -2011,6 +2051,7 @@ mod tests {
             checklist_nudges: 0,
             checklist_nudges_this_turn: 0,
             outage_reprieve_used: true,
+            stream_continuations: 0,
         };
 
         // No pending repair, which is exactly the shape a successful reprieve leaves behind.
