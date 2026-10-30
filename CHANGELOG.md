@@ -46,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepts `block_binding` on those models only with adaptive thinking.
 - Compaction requests send no reasoning blocks, so the summarizer no longer fails when it sends
   no tools.
+- A compaction that keeps recent rounds no longer replays their signed thinking blocks, whose
+  signatures the rewrite has invalidated: the request that followed the summary failed with
+  "Invalid `signature` in `thinking` block", and the `block_binding` remedy above does not survive
+  every gateway. The dead reasoning is left behind at the boundary; reasoning other wires can
+  still use (Chat Completions' `reasoning_content`, the Responses API's sealed state) stays.
 - A reply cut off mid-answer by a stream failure no longer fails the turn: it is continued from
   what arrived, up to three times, and reported only past that.
 - A stream failure says what cut the connection (dropped, timed out, truncated) instead of only
