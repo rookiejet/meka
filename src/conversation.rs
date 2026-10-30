@@ -3585,7 +3585,8 @@ pub(crate) fn write_message_markdown(
 pub(crate) const REDACTED_THINKING: &str = "[redacted thinking]";
 
 /// The text block that stands in for an assistant message left with no content, which every wire
-/// refuses: the converter's placeholder for an empty message.
+/// refuses: the converter's placeholder for an empty message, and what a kept tail's
+/// reasoning-only message becomes once its dead reasoning is dropped.
 pub(crate) const NO_MESSAGE_CONTENT: &str = "[No message content]";
 
 #[cfg(test)]
