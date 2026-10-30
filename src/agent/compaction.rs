@@ -400,6 +400,46 @@ pub(super) fn strip_reasoning(content: &mut Vec<ContentBlock>) {
     });
 }
 
+/// Drop the reasoning a kept tail carries across a compaction boundary **that no wire can use
+/// again**, and nothing else.
+///
+/// Anthropic binds each replayed thinking block to the prefix it was produced under: the system
+/// prompt, the tools array and the messages before it. A compaction replaces that prefix with a
+/// summary, so the tail's signed blocks can never validate again — the failure is "Invalid
+/// `signature` in `thinking` block... bound to a different conversation", and the API's own remedy
+/// for it is "Remove the block". Asking the API to drop them instead (`thinking.block_binding`) is
+/// not enough: a gateway that strips the setting before it reaches Anthropic leaves the request
+/// exactly as broken as one that never sent it (measured against api.commandcode.ai, 2026-10-29),
+/// and an endpoint that honors it drops the block server-side anyway. Either way that reasoning is
+/// lost the moment the head is replaced, so `Signed` blocks and Claude's `RedactedThinking` —
+/// whose sealed chain is bound the same way, and which no other wire replays — are left behind.
+///
+/// The other two `OpaqueReasoning` shapes stay, because they are not dead on their wires: `Sealed`
+/// is the Responses API's resume state, and `Verbatim` is the Chat Completions `reasoning_content`
+/// that DeepSeek's thinking mode *rejects* a tool request without (`OpaqueReasoning`'s own doc).
+/// The Claude wire is unaffected either way: its converter sends only signed blocks to begin with.
+/// Rounds keep their `tool_use`/`tool_result` pairs and an assistant turn whose reasoning is
+/// absent is accepted even mid tool loop (same measurement as above). An assistant message left
+/// with no content goes out under the same placeholder the converter uses for an empty message.
+fn strip_kept_reasoning(message: &mut Message) {
+    if message.role != Role::Assistant {
+        return;
+    }
+    message.content.retain(|block| match block {
+        ContentBlock::RedactedThinking { .. } => false,
+        ContentBlock::Thinking {
+            opaque: Some(crate::conversation::OpaqueReasoning::Signed { .. }),
+            ..
+        } => false,
+        _ => true,
+    });
+    if message.content.is_empty() {
+        message.content.push(ContentBlock::Text {
+            text: "[No message content]".to_string(),
+        });
+    }
+}
+
 /// Cap a checkpoint tool result at the size a normal turn would allow inline.
 ///
 /// A normal turn spills anything larger to the scratchpad
@@ -583,13 +623,21 @@ impl Agent {
         // budget (~10% of the window, capped), snapped back to a clean user boundary so
         // tool_use/tool_result pairs are never orphaned. Taken here, before the summarizer
         // consumes the head.
-        let (to_summarize, to_keep, retained) = split_and_retain(
+        let (to_summarize, mut to_keep, retained) = split_and_retain(
             messages.as_slice(),
             keep_recent,
             request.trigger != CompactionTrigger::Retention,
             request.request_in_flight.as_deref(),
             self.context_window(),
         );
+        // The kept tail is about to be re-appended under a summary that replaces its prefix, which
+        // is exactly the move that strands its signed reasoning; see `strip_kept_reasoning`. Done
+        // here rather than at the converter because the store is the one place that knows when the
+        // prefix moved, so every later request — the running turn's continuation included —
+        // replays rounds without dead blocks instead of gambling on the endpoint dropping them.
+        for message in &mut to_keep {
+            strip_kept_reasoning(message);
+        }
         // The list the boundary carries: as it stood before the kept tail. The replay that
         // recovers the list starts from the boundary and applies the tail's calls after it, so a
         // boundary holding the live list, which those calls already built, would have them
@@ -3293,6 +3341,100 @@ mod tests {
         assert_eq!(content, vec![ContentBlock::Text {
             text: "answer".to_string()
         }]);
+    }
+
+    /// A kept tail crosses a compaction carrying reasoning signed over the prefix the summary
+    /// replaces, so the blocks can never validate again and must not reach the wire: the API
+    /// rejects the request ("Invalid `signature` in `thinking` block... bound to a different
+    /// conversation"), and its suggested `block_binding` remedy does not survive every gateway.
+    /// Rounds keep their tool calls; a message that was only reasoning gets the converter's
+    /// placeholder; user messages pass through untouched.
+    #[test]
+    fn a_kept_tail_message_loses_its_dead_reasoning() {
+        let mut assistant = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "private".to_string(),
+                    opaque: Some(crate::conversation::OpaqueReasoning::Signed {
+                        signature: "sig".to_string(),
+                    }),
+                },
+                ContentBlock::RedactedThinking {
+                    data: "opaque".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_1".to_string(),
+                    name: "shell_execute".to_string(),
+                    input: serde_json::json!({"command": "true"}),
+                },
+            ],
+        };
+        strip_kept_reasoning(&mut assistant);
+        assert_eq!(assistant.content, vec![ContentBlock::ToolUse {
+            id: "toolu_1".to_string(),
+            name: "shell_execute".to_string(),
+            input: serde_json::json!({"command": "true"}),
+        }]);
+
+        let mut reasoning_only = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Thinking {
+                thinking: "private".to_string(),
+                opaque: Some(crate::conversation::OpaqueReasoning::Signed {
+                    signature: "sig".to_string(),
+                }),
+            }],
+        };
+        strip_kept_reasoning(&mut reasoning_only);
+        assert_eq!(reasoning_only.content, vec![ContentBlock::Text {
+            text: "[No message content]".to_string()
+        }]);
+
+        let mut user = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: vec![crate::conversation::ToolResultContent::Text {
+                    text: "done".to_string(),
+                }],
+                is_error: false,
+            }],
+        };
+        let before = user.content.clone();
+        strip_kept_reasoning(&mut user);
+        assert_eq!(user.content, before);
+    }
+
+    /// Reasoning that still has a job on its wire crosses the boundary untouched: `Sealed` is the
+    /// Responses API's resume state, and `Verbatim` is the `reasoning_content` DeepSeek's thinking
+    /// mode rejects a tool request without. Only Anthropic's invalidated signatures are dropped.
+    #[test]
+    fn a_kept_tail_message_keeps_its_replayable_reasoning() {
+        let mut message = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "resumable".to_string(),
+                    opaque: Some(crate::conversation::OpaqueReasoning::Sealed {
+                        encrypted_content: "blob".to_string(),
+                        id: Some("rs_1".to_string()),
+                    }),
+                },
+                ContentBlock::Thinking {
+                    thinking: "wants replay".to_string(),
+                    opaque: Some(crate::conversation::OpaqueReasoning::Verbatim),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_1".to_string(),
+                    name: "shell_execute".to_string(),
+                    input: serde_json::json!({"command": "true"}),
+                },
+            ],
+        };
+        let before = message.content.clone();
+        strip_kept_reasoning(&mut message);
+        assert_eq!(message.content, before);
     }
 
     /// The seed that stands in for a measurement after a compaction has to count what the
