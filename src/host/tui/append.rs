@@ -24,7 +24,8 @@ use std::{
 };
 
 use async_trait::async_trait;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+#[cfg(unix)]
 use futures::StreamExt;
 use ratatui::{
     style::Style,
@@ -3064,7 +3065,10 @@ pub(crate) async fn run_append(launch: AppendLaunch) -> anyhow::Result<()> {
     let mut state = AppendState::new(launch);
     state.open().await;
     state.refresh();
-    let mut events = EventStream::new();
+    #[cfg(windows)]
+    let mut events = super::vt_input::RawVtSource::new();
+    #[cfg(unix)]
+    let mut events = crossterm::event::EventStream::new();
     let mut tick = tokio::time::interval(TICK);
     while !state.leaving {
         tokio::select! {

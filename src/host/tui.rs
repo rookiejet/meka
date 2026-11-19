@@ -18,6 +18,18 @@ pub(crate) mod view;
 /// prints rows once to the normal buffer.
 pub(crate) mod append;
 
+/// crossterm's VT parser, vendored so a raw byte stream can be turned back into events on Windows,
+/// where crossterm's own input never reports bracketed paste. Only the Windows reader needs it at
+/// runtime; everywhere else it is compiled for the tests that hold its key and paste behaviour
+/// still.
+#[cfg(any(windows, test))]
+pub(crate) mod vt_parse;
+
+/// The Windows reader that turns a raw VT byte stream into those events, replacing `EventStream`
+/// there because that reports no bracketed paste.
+#[cfg(windows)]
+pub(crate) mod vt_input;
+
 use self::frontend::{HostEvent, Ui, UiEvent};
 use super::{terminal::*, *};
 
