@@ -69,6 +69,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Streaming replies are asked for uncompressed, so a stream error can never be the decompressor's.
 - A provider connection is dropped from the pool before a gateway's idle close can leave it
   half-closed, and a pooled one is probed so a dead peer is found before the next request.
+- A multi-line paste into the append renderer sends one prompt on Windows as everywhere else:
+  crossterm reports no bracketed paste there, so the terminal is read as a raw VT stream, where
+  the paste markers that make one prompt of a run are visible.
 
 ## [0.96.2] - 2026-11-22
 
