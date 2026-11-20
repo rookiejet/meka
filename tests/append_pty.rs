@@ -502,6 +502,14 @@ const SLOW_TURN: &str = r#"[
   {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
 
+/// A turn that would run for twenty seconds, for the tests that act on it from the keyboard.
+const LONG_TURN: &str = r#"[
+ [{"type":"text","text":"Starting."},
+  {"type":"sleep","ms":20000},
+  {"type":"text","text":" Never shown."},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+
 /// The append renderer never takes the screen: no alternate buffer, no mouse capture, no
 /// clipboard writes. The terminal a shell handed over is the terminal the run prints on.
 #[test]
@@ -711,6 +719,28 @@ fn a_running_turn_shows_a_working_row_that_clears_when_it_ends() {
         "the working row is gone when the run leaves: {:#?}",
         run.final_screen()
     );
+}
+
+/// Esc while the agent works stops the turn, the way the first Ctrl+C does.
+#[test]
+fn esc_stops_the_turn() {
+    let install = append_install();
+    install.write_script(LONG_TURN);
+    let run = drive(&install, &["-c"], &[
+        Beat::Type("hi"),
+        Beat::Keys("\x1b"),
+        Beat::Type("/exit"),
+    ]);
+    let text = run.text();
+    assert!(
+        text.lines().any(|row| row.trim_end() == "! Interrupted"),
+        "the turn was stopped: {text:?}"
+    );
+    assert!(
+        !text.contains("Never shown"),
+        "nothing past the stop reached the scrollback: {text:?}"
+    );
+    assert_eq!(run.exit, 0, "the run left on its own");
 }
 
 /// The permission prompt is rows of the transcript with an answer line under them: the call and
