@@ -72,6 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A multi-line paste into the append renderer sends one prompt on Windows as everywhere else:
   crossterm reports no bracketed paste there, so the terminal is read as a raw VT stream, where
   the paste markers that make one prompt of a run are visible.
+- Esc stops a running turn in the append renderer, as its working row promises and the screen's
+  Esc does: until now the row named the key but only Ctrl+C stopped the turn.
 
 ## [0.96.0] - 2026-11-18
 

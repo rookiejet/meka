@@ -1940,7 +1940,7 @@ impl AppendState {
                      \x20   Enter     Send\n\
                      \x20   (paste) A path to an image file attaches it to the next prompt\n\
                      \x20   Alt+Enter A line break (Ctrl+J; Shift+Enter on a kitty-protocol terminal)\n\
-                     \x20   Ctrl+C    Stop the turn, then background work, then leave\n\
+                     \x20   Esc, Ctrl+C Stop the turn, then background work, then leave\n\
                      \x20   Ctrl+D    Leave, on the empty composer of an idle run"
                 ));
             }
@@ -2845,6 +2845,10 @@ impl AppendState {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Char('c') if control => self.interrupt().await,
+            // Esc stops the turn while one runs, as the working row promises and the screen's Esc
+            // does. Idle it falls through: the screen's Esc navigates a viewport this renderer
+            // does not have.
+            KeyCode::Esc if self.busy => self.interrupt().await,
             KeyCode::Char('d') if control && self.editor.is_empty() && !self.busy => self.leave(),
             // Shift+Tab walks the permission level, as it does on the screen. A terminal on the
             // keyboard protocol reports it as Tab with Shift.
