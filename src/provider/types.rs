@@ -95,6 +95,56 @@ pub(crate) fn assert_writes_its_reserved_fields(
         assert_eq!(fields.get(field), Some(value), "{backend} sends `{field}`");
     }
 }
+/// The headers each builder test sends beside Meka's own. `accept` is among them on purpose: the
+/// transport sends `accept: */*` when a request carries none and steps aside when it does, so a
+/// builder that writes its own `accept` and a caller's entry both are seen to go out.
+#[cfg(test)]
+pub(crate) fn headers_for_test() -> reqwest::header::HeaderMap {
+    [
+        (
+            reqwest::header::HeaderName::from_static("x-test-ride"),
+            reqwest::header::HeaderValue::from_static("1"),
+        ),
+        (
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/x-probe"),
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+/// Assert that the request head a mock endpoint captured, built with every switch on, the
+/// gateway where the backend names one, and [`headers_for_test`], carries exactly the header
+/// lines `backend` reserves plus the test's own, and nothing else. Counted as lines rather than
+/// as names, because a name both a caller and the builder write goes out twice: `header` adds its
+/// value beside one already there, which is why a name Meka writes is refused at the door.
+#[cfg(test)]
+pub(crate) fn assert_writes_its_reserved_headers(backend: crate::config::Backend, head: &str) {
+    // `host` and `content-length` are the transport's own, written as the request goes out; no
+    // builder holds them, so the list under test carries them as what may appear and this takes
+    // them off both sides.
+    const TRANSPORT: [&str; 2] = ["content-length", "host"];
+    let mut written: Vec<&str> = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, _)| name.trim())
+        .filter(|name| !TRANSPORT.contains(name))
+        .collect();
+    let mut expected: Vec<&str> = backend
+        .reserved_request_headers()
+        .iter()
+        .copied()
+        .filter(|name| !TRANSPORT.contains(name))
+        .collect();
+    let custom = headers_for_test();
+    expected.extend(custom.keys().map(|name| name.as_str()));
+    written.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(
+        written, expected,
+        "{backend} reserves the headers its builder writes; head:\n{head}"
+    );
+}
 /// Pay-as-you-go / extra-usage (overage credits) state. Normalized from Anthropic's `extra_usage` +
 /// `spend` blocks and Codex's `credits` + `spend_control` blocks; every numeric field is optional
 /// because the two providers report different subsets.

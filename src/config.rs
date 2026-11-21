@@ -27,9 +27,10 @@ pub(crate) use profile::PROFILE_KEY_ORDER;
 pub(crate) use profile::{
     ANTHROPIC_MAX_REQUEST_BYTES, AccountConfig, Backend, DEFAULT_CONTEXT_WINDOW, ProfileCatalog,
     ProfileConfig, ProfileRefusal, ProfileRequest, ProfileSettings, account_for,
-    default_profile_on_disk, refuse_an_unrunnable_profile, refuse_unrunnable_profiles,
-    request_parameters, require_model, require_profile, resolve_device_id, resolve_profile,
-    select_profile, sort_account_keys, sort_profile_keys, stated_text, validate_max_output_tokens,
+    default_profile_on_disk, expand_request_headers, refuse_an_unrunnable_profile,
+    refuse_unrunnable_profiles, request_headers, request_parameters, require_model,
+    require_profile, resolve_device_id, resolve_profile, select_profile, sort_account_keys,
+    sort_profile_keys, stated_text, validate_max_output_tokens,
 };
 
 pub(crate) use self::{mcp::*, serve::*};
@@ -1054,6 +1055,65 @@ impl WebClientConfig {
     }
 }
 
+/// One entry of a header table as a request carries it: the name a header's, the value a header
+/// value's, or why it is neither. The one predicate behind every header table's parse and the
+/// write doors' own checks, so a name refused at a door is refused in the same words at load.
+pub(crate) fn check_header_entry(
+    name: &str,
+    value: &str,
+) -> std::result::Result<(reqwest::header::HeaderName, reqwest::header::HeaderValue), String> {
+    let header = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| format!("'{name}' is not a header name"))?;
+    let value = reqwest::header::HeaderValue::from_str(value)
+        .map_err(|_| format!("the value of `{name}` is not a header value"))?;
+    Ok((header, value))
+}
+
+/// Read header names to values into a map, in the order they come: every name a header's, every
+/// value a header value's, and no name twice. The one parse loop behind [`WebHeaders`],
+/// [`RequestHeaders`] and the write doors' own checks, so a name refused at a door is refused in
+/// the same words at load; `refused` names the entries a caller's table cannot carry, with the
+/// message owed for them, and a caller that takes them all passes a closure that never refuses.
+pub(crate) fn read_header_pairs<I, F>(
+    pairs: I,
+    mut refused: F,
+) -> std::result::Result<reqwest::header::HeaderMap, String>
+where
+    I: IntoIterator<Item = (String, String)>,
+    F: FnMut(&reqwest::header::HeaderName, &str) -> Option<String>,
+{
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in pairs {
+        let (header, value) = check_header_entry(&name, &value)?;
+        if let Some(message) = refused(&header, &name) {
+            return Err(message);
+        }
+        if headers.contains_key(&header) {
+            return Err(format!("`{name}` is given twice"));
+        }
+        headers.insert(header, value);
+    }
+    Ok(headers)
+}
+
+/// [`read_header_pairs`] over a serde map, keeping the visitor's own errors for the entries that
+/// are not strings.
+fn read_header_entries<'de, A, F>(
+    mut entries: A,
+    refused: F,
+) -> std::result::Result<reqwest::header::HeaderMap, A::Error>
+where
+    A: serde::de::MapAccess<'de>,
+    F: FnMut(&reqwest::header::HeaderName, &str) -> Option<String>,
+{
+    use serde::de::Error;
+    let mut pairs = Vec::new();
+    while let Some(pair) = entries.next_entry::<String, String>()? {
+        pairs.push(pair);
+    }
+    read_header_pairs(pairs, refused).map_err(A::Error::custom)
+}
+
 /// `[web].headers`: header names to values, in the order the file writes them, every name a
 /// header's and once only, and neither of the two [`is_reserved_web_header`] names.
 #[derive(Debug, Clone)]
@@ -1073,31 +1133,71 @@ impl<'de> Deserialize<'de> for WebHeaders {
 
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
-                mut entries: A,
+                entries: A,
             ) -> std::result::Result<WebHeaders, A::Error> {
-                use serde::de::Error;
-                let mut headers = reqwest::header::HeaderMap::new();
-                while let Some((name, value)) = entries.next_entry::<String, String>()? {
-                    let Ok(header) = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                    else {
-                        return Err(A::Error::custom(format!("'{name}' is not a header name")));
-                    };
-                    if is_reserved_web_header(&header) {
-                        return Err(A::Error::custom(format!(
-                            "`{name}` is set by Meka on every request; remove it"
-                        )));
-                    }
-                    if headers.contains_key(&header) {
-                        return Err(A::Error::custom(format!("`{name}` is given twice")));
-                    }
-                    let Ok(value) = reqwest::header::HeaderValue::from_str(&value) else {
-                        return Err(A::Error::custom(format!(
-                            "the value of `{name}` is not a header value"
-                        )));
-                    };
-                    headers.insert(header, value);
-                }
-                Ok(WebHeaders(headers))
+                read_header_entries(entries, |header, name| {
+                    is_reserved_web_header(header)
+                        .then(|| format!("`{name}` is set by Meka on every request; remove it"))
+                })
+                .map(WebHeaders)
+            }
+        }
+        deserializer.deserialize_map(Headers)
+    }
+}
+
+/// `headers` on an account or a profile: header names to values, in the order the table writes
+/// them, every name a header's and once only. The values are held as written: whether a name is
+/// one the backend writes itself is [`request_headers`]'s to say, since that depends on where the
+/// request goes, and a `${VAR}` reference is [`expand_request_headers`]'s, since whether an
+/// environment supplies a name is a fact about a run rather than about the file.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RequestHeaders(reqwest::header::HeaderMap);
+
+impl RequestHeaders {
+    /// The entries as the file's own parse takes them, for the write doors' own checks: a name
+    /// refused here is refused in the same words at load.
+    pub(crate) fn from_pairs<I>(pairs: I) -> std::result::Result<Self, String>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        read_header_pairs(pairs, |_, _| None).map(RequestHeaders)
+    }
+
+    /// The entries in the order the table writes them.
+    pub(crate) fn entries(
+        &self,
+    ) -> impl Iterator<Item = (&reqwest::header::HeaderName, &reqwest::header::HeaderValue)> {
+        self.0.iter()
+    }
+
+    /// The names alone, in the order the table writes them: the shape every surface that shows a
+    /// header table takes, since a value may hold a secret.
+    pub(crate) fn names(&self) -> Vec<String> {
+        self.0
+            .keys()
+            .map(|name| name.as_str().to_string())
+            .collect()
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestHeaders {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Headers;
+        impl<'de> serde::de::Visitor<'de> for Headers {
+            type Value = RequestHeaders;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a table of header names and their values")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                entries: A,
+            ) -> std::result::Result<RequestHeaders, A::Error> {
+                read_header_entries(entries, |_, _| None).map(RequestHeaders)
             }
         }
         deserializer.deserialize_map(Headers)
@@ -1581,7 +1681,9 @@ impl Backend {
             "deferred_tools" => !matches!(self, Self::OpenAiChatCompletions | Self::OpenCodeGo),
             // Not the subscriptions: their request copies an official client's, against an
             // endpoint that cannot vary.
-            "parameters" => !matches!(self, Self::ClaudeSubscription | Self::ChatGptSubscription),
+            "parameters" | "headers" => {
+                !matches!(self, Self::ClaudeSubscription | Self::ChatGptSubscription)
+            }
             _ => true,
         }
     }
@@ -1646,6 +1748,78 @@ impl Backend {
         }
     }
 
+    /// The header names Meka writes on this backend's requests, and those the transport writes
+    /// (`host`, `content-length`). A profile's or account's `headers` may name none of them, so
+    /// every header has one owner. Every name the backend may write on any request whatever a
+    /// profile's settings, so whether a header is allowed never turns on another key. Empty on the
+    /// subscriptions, which read no `headers`. No name comes with the setting that decides it,
+    /// unlike [`Self::reserved_request_fields`]: a header is refused with "remove it" alone,
+    /// since no one setting reproduces one. A test beside each builder holds its list equal to
+    /// what the builder writes.
+    pub(crate) const fn reserved_request_headers(self) -> &'static [&'static str] {
+        match self {
+            // An `opencode-go-*` backend reserves the headers of the wire it speaks plus the two
+            // the gateway adds on the way past it: `User-Agent` and its session header.
+            Self::AnthropicMessages => &[
+                "accept",
+                "accept-encoding",
+                "anthropic-beta",
+                "anthropic-version",
+                "content-length",
+                "content-type",
+                "host",
+                "x-api-key",
+            ],
+            Self::OpenCodeGoMessages => &[
+                "accept",
+                "accept-encoding",
+                "anthropic-beta",
+                "anthropic-version",
+                "content-length",
+                "content-type",
+                "host",
+                "user-agent",
+                "x-api-key",
+                "x-opencode-session",
+            ],
+            Self::OpenAiChatCompletions => &[
+                "accept-encoding",
+                "authorization",
+                "content-length",
+                "content-type",
+                "host",
+            ],
+            Self::OpenCodeGo => &[
+                "accept-encoding",
+                "authorization",
+                "content-length",
+                "content-type",
+                "host",
+                "user-agent",
+                "x-opencode-session",
+            ],
+            Self::OpenAiResponses => &[
+                "accept",
+                "accept-encoding",
+                "authorization",
+                "content-length",
+                "content-type",
+                "host",
+            ],
+            Self::OpenCodeGoResponses => &[
+                "accept",
+                "accept-encoding",
+                "authorization",
+                "content-length",
+                "content-type",
+                "host",
+                "user-agent",
+                "x-opencode-session",
+            ],
+            Self::ClaudeSubscription | Self::ChatGptSubscription => &[],
+        }
+    }
+
     /// Whether this backend actually reads the account key `key`: `client_id` and `oauth_token_url`
     /// are read only by the two OAuth backends. The sibling of [`Self::reads_profile_key`], asked
     /// by `account add` and the load-time check.
@@ -1664,6 +1838,9 @@ impl Backend {
             "prompt_cache_key" => {
                 matches!(self, Self::OpenAiResponses | Self::OpenCodeGoResponses)
             }
+            // As for `parameters`: an account's `headers` ride the API-key wires alone, where the
+            // account is what sends them.
+            "headers" => !matches!(self, Self::ClaudeSubscription | Self::ChatGptSubscription),
             "stream_usage" => matches!(self, Self::OpenAiChatCompletions | Self::OpenCodeGo),
             "max_tool_name_bytes" => matches!(
                 self,
@@ -1926,6 +2103,7 @@ fn warn_about_inert_profile_keys(
             ("prompt_cache_key", account.prompt_cache_key.is_some()),
             ("stream_usage", account.stream_usage.is_some()),
             ("max_tool_name_bytes", account.max_tool_name_bytes.is_some()),
+            ("headers", account.headers.is_some()),
         ];
         for (key, is_set) in set {
             if is_set && !backend.reads_account_key(key) {

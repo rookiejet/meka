@@ -348,6 +348,9 @@ pub(crate) struct CreateAccountRequest {
     pub(crate) stream_usage: Option<bool>,
     /// The longest tool name the endpoint takes, in bytes, read by the three API-key backends.
     pub(crate) max_tool_name_bytes: Option<usize>,
+    /// Request headers sent as written, each a string value.
+    #[schema(value_type = Option<Object>)]
+    pub(crate) headers: Option<serde_json::Map<String, serde_json::Value>>,
     /// The key an API-key backend presents, stored in the database and never in `config.toml`.
     /// Required on such a backend, refused on one that logs in through the browser.
     #[serde(default, deserialize_with = "crate::text::deserialize_blank_as_none")]
@@ -401,6 +404,12 @@ pub(crate) async fn create_account(
                     prompt_cache_key: body.prompt_cache_key,
                     stream_usage: body.stream_usage,
                     max_tool_name_bytes: body.max_tool_name_bytes,
+                },
+                headers: match &body.headers {
+                    Some(headers) => profile::headers_from_json(headers).map_err(|error| {
+                        door_problem(&state, "failed to read the headers", error)
+                    })?,
+                    None => Vec::new(),
                 },
             },
             credential.as_ref(),
@@ -1544,6 +1553,9 @@ pub(crate) struct CreateProfileRequest {
     pub(crate) reasoning_summary: Option<bool>,
     #[serde(default, deserialize_with = "crate::text::deserialize_blank_as_none")]
     pub(crate) cyber_access_program: Option<String>,
+    /// Request headers sent as written, each a string value.
+    #[schema(value_type = Option<Object>)]
+    pub(crate) headers: Option<serde_json::Map<String, serde_json::Value>>,
     /// Request fields sent as written, each a top-level field of the request body.
     #[schema(value_type = Option<Object>)]
     pub(crate) parameters: Option<serde_json::Map<String, serde_json::Value>>,
@@ -1591,6 +1603,11 @@ pub(crate) async fn create_profile(
         encrypted_reasoning: body.encrypted_reasoning,
         reasoning_summary: body.reasoning_summary,
         cyber_access_program: body.cyber_access_program,
+        headers: match &body.headers {
+            Some(headers) => profile::headers_from_json(headers)
+                .map_err(|error| door_problem(&state, "failed to read the headers", error))?,
+            None => Vec::new(),
+        },
         parameters: match &body.parameters {
             Some(parameters) => profile::parameters_from_json(parameters)
                 .map_err(|error| door_problem(&state, "failed to read the parameters", error))?,
@@ -1670,6 +1687,10 @@ pub(crate) struct PatchProfileRequest {
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub(crate) cyber_access_program: Patch<String>,
+    /// The request headers sent as written, replaced whole; `null` removes them all.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub(crate) headers: Patch<serde_json::Map<String, serde_json::Value>>,
     /// The request fields sent as written, replaced whole; `null` removes them all.
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
@@ -1678,14 +1699,25 @@ pub(crate) struct PatchProfileRequest {
 
 impl PatchProfileRequest {
     /// The changes the body asks for, as the edit door takes them. The door reads each value and
-    /// refuses one no profile may carry, in the words `meka profile set` would; a `parameters`
-    /// value TOML cannot hold is refused here, on its way into the file's terms.
+    /// refuses one no profile may carry, in the words `meka profile set` would; a `headers` entry
+    /// that is not a string and a `parameters` value TOML cannot hold are refused here, on their
+    /// way into the file's terms.
     fn into_changes(self) -> crate::error::Result<profile::ProfileChanges> {
+        let headers = match &self.headers {
+            Patch::Keep => profile::SubtableChange::Keep,
+            Patch::Remove => profile::SubtableChange::Remove,
+            Patch::Set(headers) => profile::SubtableChange::Replace(
+                profile::headers_from_json(headers)?
+                    .into_iter()
+                    .map(|(name, value)| (name, toml_edit::Value::from(value)))
+                    .collect(),
+            ),
+        };
         let parameters = match &self.parameters {
-            Patch::Keep => profile::ParametersChange::Keep,
-            Patch::Remove => profile::ParametersChange::Remove,
+            Patch::Keep => profile::SubtableChange::Keep,
+            Patch::Remove => profile::SubtableChange::Remove,
             Patch::Set(parameters) => {
-                profile::ParametersChange::Replace(profile::parameters_from_json(parameters)?)
+                profile::SubtableChange::Replace(profile::parameters_from_json(parameters)?)
             }
         };
         Ok(profile::ProfileChanges {
@@ -1704,6 +1736,7 @@ impl PatchProfileRequest {
             encrypted_reasoning: self.encrypted_reasoning,
             reasoning_summary: self.reasoning_summary,
             cyber_access_program: self.cyber_access_program,
+            headers,
             parameters,
         })
     }

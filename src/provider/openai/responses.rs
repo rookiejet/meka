@@ -53,6 +53,8 @@ pub(crate) struct OpenAiResponsesProvider {
     prompt_cache_key: bool,
     /// See [`crate::config::ProfileConfig::parameters`].
     parameters: serde_json::Map<String, serde_json::Value>,
+    /// See [`crate::config::ProfileConfig::headers`], as the request carries them.
+    headers: reqwest::header::HeaderMap,
     /// The OpenCode Go gateway facts, when this provider is one of the `opencode-*` backends;
     /// `None` (the generic case) adds nothing to the wire.
     opencode: Option<crate::provider::opencode::Gateway>,
@@ -75,6 +77,7 @@ impl OpenAiResponsesProvider {
             reasoning_summary,
             prompt_cache_key,
             parameters,
+            headers,
             opencode,
             ..
         } = settings;
@@ -100,6 +103,7 @@ impl OpenAiResponsesProvider {
             reasoning_summary,
             prompt_cache_key,
             parameters,
+            headers,
             opencode,
         })
     }
@@ -200,6 +204,9 @@ impl ResponsesBackend for OpenAiResponsesProvider {
     ) -> Result<reqwest::RequestBuilder> {
         Ok(crate::provider::opencode::apply_request_headers(
             request
+                // The account's and the profile's headers first: the names Meka writes itself are
+                // refused in config, so the two never contend for one.
+                .headers(self.headers.clone())
                 .header("Authorization", crate::text::bearer(&self.api_key))
                 .header("Accept", "text/event-stream")
                 // Identity: an SSE body that fails in the decompressor looks exactly like one
@@ -394,6 +401,53 @@ mod tests {
             crate::config::Backend::OpenAiResponses,
             &body,
         );
+    }
+
+    /// The headers this builder writes are exactly the names a profile's or account's `headers`
+    /// may not take, minus the two the transport writes, on the direct wire and on the gateway;
+    /// the account's and the profile's ride beside them.
+    #[tokio::test]
+    async fn the_reserved_headers_are_what_the_builder_writes() {
+        for (backend, gateway) in [
+            (crate::config::Backend::OpenAiResponses, false),
+            (crate::config::Backend::OpenCodeGoResponses, true),
+        ] {
+            let (local, head_receiver) =
+                crate::provider::opencode::mock_endpoint_capturing_the_head().await;
+            let mut builder = crate::provider::ProviderBuilder::new(
+                backend,
+                crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                "gpt-6-astra".to_string(),
+            )
+            .base_url(Some(format!("http://{local}")))
+            .effort(Some("high".to_string()))
+            .max_output_tokens(Some(4096))
+            .headers(crate::provider::headers_for_test());
+            if gateway {
+                builder = builder.opencode();
+            }
+            let provider = OpenAiResponsesProvider::from_settings("test-key".to_string(), builder)
+                .expect("build test provider");
+            let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+            if provider
+                .stream(
+                    CompletionRequest::new("", &[Message::user("hi")], &[]).attributed(
+                        crate::provider::Attribution {
+                            session_id: Some(uuid::Uuid::new_v4()),
+                            ..Default::default()
+                        },
+                    ),
+                    sender,
+                    CancellationToken::new(),
+                )
+                .await
+                .is_ok()
+            {
+                panic!("a 400 from the endpoint must not read as a completed stream");
+            }
+            let head = head_receiver.await.expect("the mock saw the request");
+            crate::provider::assert_writes_its_reserved_headers(backend, &head);
+        }
     }
 
     /// Each field has its own switch, for the endpoint or the model that refuses it, and a switch

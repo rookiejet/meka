@@ -43,6 +43,8 @@ pub(crate) struct ProfileTuning {
     pub(crate) encrypted_reasoning: Option<bool>,
     pub(crate) reasoning_summary: Option<bool>,
     pub(crate) cyber_access_program: Option<String>,
+    /// The `headers` entries, in the order given; written as `[profiles.<name>.headers]`.
+    pub(crate) headers: Vec<(String, String)>,
     /// The `parameters` fields, in the order given; written as `[profiles.<name>.parameters]`.
     pub(crate) parameters: Vec<(String, toml_edit::Value)>,
 }
@@ -71,6 +73,7 @@ impl ProfileTuning {
                 "cyber_access_program",
                 config::stated_text(self.cyber_access_program.as_deref()).is_some(),
             ),
+            ("headers", !self.headers.is_empty()),
             ("parameters", !self.parameters.is_empty()),
         ]
         .into_iter()
@@ -317,14 +320,16 @@ fn set_profile_field(
     true
 }
 
-/// Apply `change` to `[profiles.<name>.parameters]`, a field-level edit like [`set_profile_field`]
-/// so every other field keeps its place and its comments. A new table is the header table after
-/// the profile's own, or an inline one inside an inline profile; one left empty is removed, since
-/// it says nothing.
-fn set_profile_parameters(
+/// Apply `change` to `[profiles.<name>.<table>]`, a field-level edit like [`set_profile_field`] so
+/// every other entry keeps its place and its comments. A new table is the header table after the
+/// profile's own, or an inline one inside an inline profile; one left empty is removed, since it
+/// says nothing. `table` is `parameters` or `headers`, the profile's two sub-tables, which edit
+/// alike and so share this one editor.
+fn set_profile_subtable(
     document: &mut toml_edit::DocumentMut,
     name: &str,
-    change: &ParametersChange,
+    table: &str,
+    change: &SubtableChange,
 ) {
     let Some(item) = document
         .get_mut("profiles")
@@ -337,64 +342,65 @@ fn set_profile_parameters(
     let Some(profile) = item.as_table_like_mut() else {
         return;
     };
-    fn fields(
-        profile: &mut dyn toml_edit::TableLike,
+    fn fields<'a>(
+        profile: &'a mut dyn toml_edit::TableLike,
+        table: &str,
         inline: bool,
-    ) -> Option<&mut dyn toml_edit::TableLike> {
-        if profile.get("parameters").is_none() {
-            let table = if inline {
+    ) -> Option<&'a mut dyn toml_edit::TableLike> {
+        if profile.get(table).is_none() {
+            let new = if inline {
                 toml_edit::Item::Value(toml_edit::Value::InlineTable(toml_edit::InlineTable::new()))
             } else {
                 toml_edit::Item::Table(toml_edit::Table::new())
             };
-            profile.insert("parameters", table);
+            profile.insert(table, new);
         }
         profile
-            .get_mut("parameters")
+            .get_mut(table)
             .and_then(|item| item.as_table_like_mut())
     }
     match change {
-        ParametersChange::Keep => return,
-        ParametersChange::Remove => {
-            profile.remove("parameters");
+        SubtableChange::Keep => return,
+        SubtableChange::Remove => {
+            profile.remove(table);
         }
-        ParametersChange::Replace(replacement) => {
-            if let Some(table) = fields(profile, inline) {
-                table.clear();
-                for (field, value) in replacement {
-                    table.insert(field, toml_edit::Item::Value(value.clone()));
+        SubtableChange::Replace(replacement) => {
+            if let Some(entries) = fields(profile, table, inline) {
+                entries.clear();
+                for (entry, value) in replacement {
+                    entries.insert(entry, toml_edit::Item::Value(value.clone()));
                 }
             }
         }
-        ParametersChange::Field(field, Some(value)) => {
-            if let Some(table) = fields(profile, inline) {
+        SubtableChange::Field(entry, Some(value)) => {
+            if let Some(entries) = fields(profile, table, inline) {
                 let mut value = value.clone();
                 // Kept for the reason `set_profile_field` keeps them: `insert` clears both.
-                if let Some(existing) = table.get(field).and_then(|item| item.as_value()) {
+                if let Some(existing) = entries.get(entry).and_then(|item| item.as_value()) {
                     *value.decor_mut() = existing.decor().clone();
                 }
-                let key_decor = table.key(field).map(|key| key.leaf_decor().clone());
-                table.insert(field, toml_edit::Item::Value(value));
-                if let (Some(decor), Some(mut written)) = (key_decor, table.key_mut(field)) {
+                let key_decor = entries.key(entry).map(|key| key.leaf_decor().clone());
+                entries.insert(entry, toml_edit::Item::Value(value));
+                if let (Some(decor), Some(mut written)) = (key_decor, entries.key_mut(entry)) {
                     *written.leaf_decor_mut() = decor;
                 }
             }
         }
-        ParametersChange::Field(field, None) => {
-            if let Some(table) = profile
-                .get_mut("parameters")
+        SubtableChange::Field(entry, None) => {
+            if let Some(entries) = profile
+                .get_mut(table)
                 .and_then(|item| item.as_table_like_mut())
             {
-                table.remove(field);
+                entries.remove(entry);
             }
         }
     }
     if profile
-        .get("parameters")
+        .get(table)
         .and_then(|item| item.as_table_like())
-        .is_some_and(|table| table.is_empty())
+        .is_some_and(|entries| entries.is_empty())
     {
-        profile.remove("parameters");
+        profile.remove(table);
     }
 }
 
@@ -468,30 +474,32 @@ pub(crate) struct ProfileChanges {
     pub(crate) encrypted_reasoning: Patch<bool>,
     pub(crate) reasoning_summary: Patch<bool>,
     pub(crate) cyber_access_program: Patch<String>,
-    pub(crate) parameters: ParametersChange,
+    pub(crate) headers: SubtableChange,
+    pub(crate) parameters: SubtableChange,
 }
 
-/// What an edit does to `[profiles.<name>.parameters]`: the table replaced or removed whole, as a
-/// request's JSON says it, or one field set or removed, as `profile set parameters.<field>` does.
+/// What an edit does to one sub-table of `[profiles.<name>]`, `parameters` or `headers`: the table
+/// replaced or removed whole, as a request's JSON says it, or one entry set or removed, as
+/// `profile set parameters.<field>` and `profile set headers.<name>` do.
 #[derive(Debug, Default)]
-pub(crate) enum ParametersChange {
+pub(crate) enum SubtableChange {
     #[default]
     Keep,
     Remove,
     Replace(Vec<(String, toml_edit::Value)>),
-    /// One field, set to the value or removed with `None`; the table goes with its last field.
+    /// One entry, set to the value or removed with `None`; the table goes with its last entry.
     Field(String, Option<toml_edit::Value>),
 }
 
-impl ParametersChange {
+impl SubtableChange {
     /// Which of the three [`Patch`] states this is, for a caller that names keys. An empty
     /// replacement writes nothing and leaves no table, so it is a removal, which a backend that
-    /// never sends `parameters` takes as the remedy rather than the offense.
+    /// never sends the key takes as the remedy rather than the offense.
     fn state(&self) -> PatchState {
         match self {
             Self::Keep => PatchState::Keep,
             Self::Remove | Self::Field(_, None) => PatchState::Remove,
-            Self::Replace(fields) if fields.is_empty() => PatchState::Remove,
+            Self::Replace(entries) if entries.is_empty() => PatchState::Remove,
             Self::Replace(_) | Self::Field(_, Some(_)) => PatchState::Set,
         }
     }
@@ -499,7 +507,7 @@ impl ParametersChange {
 
 impl ProfileChanges {
     /// Every key with what happens to it, in the order the file carries the keys.
-    fn states(&self) -> [(&'static str, PatchState); 16] {
+    fn states(&self) -> [(&'static str, PatchState); 17] {
         [
             ("model", self.model.state()),
             ("fallbacks", self.fallbacks.state()),
@@ -516,6 +524,7 @@ impl ProfileChanges {
             ("encrypted_reasoning", self.encrypted_reasoning.state()),
             ("reasoning_summary", self.reasoning_summary.state()),
             ("cyber_access_program", self.cyber_access_program.state()),
+            ("headers", self.headers.state()),
             ("parameters", self.parameters.state()),
         ]
     }
@@ -641,6 +650,7 @@ pub(crate) fn edit_profile(
     changes: &ProfileChanges,
     make_default: bool,
 ) -> crate::error::Result<()> {
+    let headers = &changes.headers;
     let parameters = &changes.parameters;
     let changes = changes.to_document(name)?;
     // `_lock` is held to the end of the function, so the read, the validation and the write are one
@@ -667,7 +677,11 @@ pub(crate) fn edit_profile(
             refuse_an_inert_key(&document, name, key)?;
         }
     }
-    set_profile_parameters(&mut document, name, parameters);
+    set_profile_subtable(&mut document, name, "headers", headers);
+    if headers.state() == PatchState::Set {
+        refuse_an_inert_key(&document, name, "headers")?;
+    }
+    set_profile_subtable(&mut document, name, "parameters", parameters);
     if parameters.state() == PatchState::Set {
         refuse_an_inert_key(&document, name, "parameters")?;
     }
@@ -753,6 +767,22 @@ pub(crate) fn refuse_unsendable_parameters(
         .map_err(super::refusal)
 }
 
+/// Refuse `headers` as load would refuse them on a `backend` profile, for a door that asks before
+/// it prompts: read back in the file's own terms, so the answer is the check's and nothing else's.
+pub(crate) fn refuse_unsendable_headers(
+    backend: config::Backend,
+    headers: &[(String, String)],
+) -> crate::error::Result<()> {
+    if headers.is_empty() {
+        return Ok(());
+    }
+    let table =
+        config::RequestHeaders::from_pairs(headers.iter().cloned()).map_err(super::refusal)?;
+    config::request_headers(backend, Some(&table), None)
+        .map(|_| ())
+        .map_err(super::refusal)
+}
+
 /// A request's `parameters` object as the fields the table holds, or the first value TOML cannot:
 /// a `null`, which TOML has no word for, and an integer past the signed 64 bits TOML has.
 pub(crate) fn parameters_from_json(
@@ -800,6 +830,22 @@ pub(crate) fn parameters_from_json(
                 field.clone(),
                 convert(&format!("parameters.{field}"), value)?,
             ))
+        })
+        .collect()
+}
+
+/// A request's `headers` object as the entries the table holds, or the first value a header cannot
+/// carry: anything but a string, since a header value is a string.
+pub(crate) fn headers_from_json(
+    headers: &serde_json::Map<String, serde_json::Value>,
+) -> crate::error::Result<Vec<(String, String)>> {
+    headers
+        .iter()
+        .map(|(name, value)| match value {
+            serde_json::Value::String(text) => Ok((name.clone(), text.clone())),
+            _ => Err(super::refusal(format!(
+                "`headers.{name}` must be a string, got {value}"
+            ))),
         })
         .collect()
 }
@@ -877,6 +923,13 @@ fn upsert_profile_document(
     }
     if let Some(program) = config::stated_text(tuning.cyber_access_program.as_deref()) {
         profile.insert("cyber_access_program", toml_edit::value(program));
+    }
+    if !tuning.headers.is_empty() {
+        let mut headers = toml_edit::Table::new();
+        for (name, value) in &tuning.headers {
+            headers.insert(name, toml_edit::value(value));
+        }
+        profile.insert("headers", toml_edit::Item::Table(headers));
     }
     if !tuning.parameters.is_empty() {
         let mut parameters = toml_edit::Table::new();
@@ -2054,16 +2107,18 @@ model = "o"
         .parse::<toml_edit::DocumentMut>()
         .expect("parse");
         let field = |name: &str, value: Option<toml_edit::Value>| {
-            ParametersChange::Field(name.to_string(), value)
+            SubtableChange::Field(name.to_string(), value)
         };
-        set_profile_parameters(
+        set_profile_subtable(
             &mut document,
             "work",
+            "parameters",
             &field("temperature", Some(toml_edit::Value::from(0.6))),
         );
-        set_profile_parameters(
+        set_profile_subtable(
             &mut document,
             "work",
+            "parameters",
             &field("top_p", Some(toml_edit::Value::from(0.9))),
         );
         assert_eq!(
@@ -2077,9 +2132,10 @@ model = "o"
             .replace("temperature = 0.6", "# warm\ntemperature = 0.6 # for now")
             .parse::<toml_edit::DocumentMut>()
             .expect("parse");
-        set_profile_parameters(
+        set_profile_subtable(
             &mut annotated,
             "work",
+            "parameters",
             &field("temperature", Some(toml_edit::Value::from(0.2))),
         );
         let rendered = annotated.to_string();
@@ -2088,22 +2144,29 @@ model = "o"
             "{rendered}"
         );
 
-        set_profile_parameters(&mut document, "work", &field("temperature", None));
-        set_profile_parameters(&mut document, "work", &field("top_p", None));
+        set_profile_subtable(
+            &mut document,
+            "work",
+            "parameters",
+            &field("temperature", None),
+        );
+        set_profile_subtable(&mut document, "work", "parameters", &field("top_p", None));
         assert!(
             !document.to_string().contains("parameters"),
             "the table goes with its last field: {document}"
         );
 
-        set_profile_parameters(
+        set_profile_subtable(
             &mut document,
             "work",
-            &ParametersChange::Replace(vec![("seed".to_string(), toml_edit::Value::from(7))]),
+            "parameters",
+            &SubtableChange::Replace(vec![("seed".to_string(), toml_edit::Value::from(7))]),
         );
-        set_profile_parameters(
+        set_profile_subtable(
             &mut document,
             "work",
-            &ParametersChange::Replace(vec![("top_k".to_string(), toml_edit::Value::from(20))]),
+            "parameters",
+            &SubtableChange::Replace(vec![("top_k".to_string(), toml_edit::Value::from(20))]),
         );
         let rendered = document.to_string();
         assert!(
@@ -2111,15 +2174,16 @@ model = "o"
                 && !rendered.contains("seed"),
             "a replacement leaves only what it names: {rendered}"
         );
-        set_profile_parameters(&mut document, "work", &ParametersChange::Remove);
+        set_profile_subtable(&mut document, "work", "parameters", &SubtableChange::Remove);
         assert!(!document.to_string().contains("parameters"), "{document}");
 
         let mut inline = "profiles.work = { account = \"work\", model = \"m\" }\n"
             .parse::<toml_edit::DocumentMut>()
             .expect("parse");
-        set_profile_parameters(
+        set_profile_subtable(
             &mut inline,
             "work",
+            "parameters",
             &field("temperature", Some(toml_edit::Value::from(0.6))),
         );
         let parsed: config::ConfigFile = toml::from_str(&inline.to_string()).expect("parses");
@@ -2201,6 +2265,22 @@ model = "o"
             message.contains("`parameters.stream` is written by Meka on 'openai-chat-completions'"),
             "{message}"
         );
+        let header_message = refuse_unsendable_headers(config::Backend::AnthropicMessages, &[(
+            "content-type".to_string(),
+            "1".to_string(),
+        )])
+        .expect_err("a name Meka writes")
+        .to_string();
+        assert!(
+            header_message
+                .contains("`headers.content-type` is written by Meka on 'anthropic-messages'"),
+            "{header_message}"
+        );
+        refuse_unsendable_headers(config::Backend::AnthropicMessages, &[(
+            "x-trace".to_string(),
+            "1".to_string(),
+        )])
+        .expect("a name Meka leaves alone");
         let date = "1979-05-27"
             .parse::<toml_edit::Value>()
             .expect("a date literal");
@@ -2212,7 +2292,7 @@ model = "o"
             .is_err()
         );
         assert_eq!(
-            ParametersChange::Replace(Vec::new()).state(),
+            SubtableChange::Replace(Vec::new()).state(),
             PatchState::Remove
         );
     }
@@ -2400,6 +2480,59 @@ model = "o"
         );
         let config: config::ConfigFile = toml::from_str(&rendered).expect("re-parse config");
         assert_eq!(config.profiles["main"].fallbacks, vec!["backup", "last"]);
+    }
+
+    /// The headers table is written in the canonical place, right after `cyber_access_program` and
+    /// before `parameters`, an empty value as a value, and reads back as the names it was given.
+    #[test]
+    fn upsert_profile_document_writes_the_headers_table_in_order() {
+        let mut document = toml_edit::DocumentMut::new();
+        upsert_profile_document(&mut document, "main", "a", "m", &ProfileTuning {
+            headers: vec![
+                ("x-trace".to_string(), "1".to_string()),
+                ("x-empty".to_string(), String::new()),
+            ],
+            parameters: vec![("top_p".to_string(), toml_edit::Value::from(0.9))],
+            ..Default::default()
+        })
+        .expect("upsert");
+        let rendered = document.to_string();
+        let headers_at = rendered.find("headers").expect("headers");
+        let parameters_at = rendered.find("parameters").expect("parameters");
+        assert!(headers_at < parameters_at, "{rendered}");
+        assert!(rendered.contains("x-trace = \"1\""), "{rendered}");
+        assert!(rendered.contains("x-empty = \"\""), "{rendered}");
+        let config: config::ConfigFile = toml::from_str(&rendered).expect("re-parse config");
+        assert_eq!(
+            config.profiles["main"]
+                .headers
+                .as_ref()
+                .expect("headers")
+                .names(),
+            ["x-trace", "x-empty"]
+        );
+    }
+
+    /// A header's value is a string wherever a door collects it, and one that is not is refused
+    /// naming the entry.
+    #[test]
+    fn a_header_must_be_a_string_where_a_door_collects_it() {
+        let from_json =
+            |json: serde_json::Value| headers_from_json(json.as_object().expect("an object"));
+        assert_eq!(
+            from_json(serde_json::json!({"x-trace": "1", "x-empty": ""})).expect("pairs"),
+            vec![
+                ("x-trace".to_string(), "1".to_string()),
+                ("x-empty".to_string(), String::new()),
+            ]
+        );
+        let message = from_json(serde_json::json!({"x-count": 2}))
+            .expect_err("not a string")
+            .to_string();
+        assert!(
+            message.contains("`headers.x-count` must be a string, got 2"),
+            "{message}"
+        );
     }
 
     /// The write doors apply the startup rule to the file they are about to write: a list may not

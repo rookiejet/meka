@@ -360,6 +360,10 @@ pub(crate) struct AccountView {
     /// The longest tool name the endpoint takes, when the account states it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tool_name_bytes: Option<usize>,
+    /// The request headers the account states, as their names alone: a value there may be a
+    /// secret, and knowing which names are set is the diagnostic.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) header_keys: Vec<String>,
     /// `yes`, `no`, or `unreadable`: the same three answers as the plain column, because a row
     /// Meka cannot deserialize is neither logged in nor logged out.
     pub(crate) authenticated: &'static str,
@@ -379,6 +383,11 @@ impl AccountView {
             prompt_cache_key: account.prompt_cache_key,
             stream_usage: account.stream_usage,
             max_tool_name_bytes: account.max_tool_name_bytes,
+            header_keys: account
+                .headers
+                .as_ref()
+                .map(|headers| headers.names())
+                .unwrap_or_default(),
             authenticated,
         }
     }
@@ -427,6 +436,10 @@ pub(crate) struct ProfileDetailView {
     pub(crate) reasoning_summary: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cyber_access_program: Option<String>,
+    /// The request headers the profile states, as their names alone: a value there may be a
+    /// secret, and knowing which names are set is the diagnostic.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) header_keys: Vec<String>,
     /// The request fields sent as written, as the file states them. Load holds every profile's to
     /// values JSON can carry, on a backend that sends them or not.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -469,6 +482,11 @@ impl ProfileDetailView {
             encrypted_reasoning: profile.encrypted_reasoning,
             reasoning_summary: profile.reasoning_summary,
             cyber_access_program: profile.cyber_access_program.clone(),
+            header_keys: profile
+                .headers
+                .as_ref()
+                .map(|headers| headers.names())
+                .unwrap_or_default(),
             parameters: profile
                 .parameters
                 .clone()
@@ -1191,6 +1209,46 @@ mod tests {
         for document in [&from_config, &detail] {
             assert!(document.get("backend").is_none(), "{document}");
             assert_eq!(document["account"], "gone");
+        }
+    }
+
+    /// A header value may be a secret, so the views carry the names alone: which are set is the
+    /// diagnostic, what they say is the leak.
+    #[test]
+    fn a_view_carries_the_header_names_and_never_their_values() {
+        let headers = crate::config::RequestHeaders::from_pairs([
+            ("x-trace".to_string(), "1".to_string()),
+            ("x-token".to_string(), "hunter2".to_string()),
+        ])
+        .expect("headers");
+        let account = AccountConfig {
+            backend: "anthropic-messages".to_string(),
+            headers: Some(headers.clone()),
+            ..Default::default()
+        };
+        let profile = ProfileConfig {
+            account: "work".to_string(),
+            headers: Some(headers),
+            ..Default::default()
+        };
+        let accounts: BTreeMap<String, AccountConfig> =
+            [("work".to_string(), account)].into_iter().collect();
+        let listing =
+            serde_json::to_value(AccountView::new("work", &accounts["work"], "yes")).expect("json");
+        let detail = serde_json::to_value(ProfileDetailView::from_config(
+            "work", &profile, &accounts, false,
+        ))
+        .expect("json");
+        for document in [&listing, &detail] {
+            assert_eq!(
+                document["header_keys"],
+                serde_json::json!(["x-trace", "x-token"]),
+                "{document}"
+            );
+            assert!(
+                !document.to_string().contains("hunter2"),
+                "a value may be a secret and must not reach the document: {document}"
+            );
         }
     }
 

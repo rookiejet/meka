@@ -9,8 +9,9 @@ use crate::{
         Patch,
         account::validate_backend,
         profile::{
-            ParametersChange, ProfileChanges, ProfileTuning, edit_profile, parameter_from_literal,
-            refuse_unsendable_parameters, remove_profile, rename_profile, write_profile,
+            ProfileChanges, ProfileTuning, SubtableChange, edit_profile, parameter_from_literal,
+            refuse_unsendable_headers, refuse_unsendable_parameters, remove_profile,
+            rename_profile, write_profile,
         },
     },
 };
@@ -41,6 +42,7 @@ pub(crate) async fn run(
             encrypted_reasoning,
             reasoning_summary,
             cyber_access_program,
+            header,
             parameter,
         } => run_add(name, account.as_deref(), model.clone(), ProfileTuning {
             fallbacks: fallback.clone(),
@@ -57,6 +59,7 @@ pub(crate) async fn run(
             encrypted_reasoning: *encrypted_reasoning,
             reasoning_summary: *reasoning_summary,
             cyber_access_program: cyber_access_program.clone(),
+            headers: header_flags(header)?,
             parameters: parameter_flags(parameter)?,
         }),
         ProfileAction::List { format } => run_list(*format),
@@ -218,16 +221,18 @@ pub(super) const SETTABLE_PROFILE_KEYS: &[&str] = &[
     "encrypted_reasoning",
     "reasoning_summary",
     "cyber_access_program",
+    "headers",
     "parameters",
 ];
 
 /// [`SETTABLE_PROFILE_KEYS`] as a listing shows them: `parameters` by the spelling that sets a
-/// field of it.
+/// field of it, `headers` by the spelling that sets one entry.
 pub(super) fn settable_profile_keys_listing() -> String {
     SETTABLE_PROFILE_KEYS
         .iter()
         .map(|key| match *key {
             "parameters" => "parameters.<field>",
+            "headers" => "headers.<name>",
             key => key,
         })
         .collect::<Vec<_>>()
@@ -265,8 +270,16 @@ fn parse_profile_change(key: &str, value: Option<&str>) -> anyhow::Result<Profil
         })
     };
     let mut changes = ProfileChanges::default();
+    if let Some(name) = key.strip_prefix("headers.") {
+        if name.is_empty() {
+            anyhow::bail!("`headers.` needs a header name");
+        }
+        changes.headers =
+            SubtableChange::Field(name.to_string(), value.map(toml_edit::Value::from));
+        return Ok(changes);
+    }
     if let Some(field) = key.strip_prefix("parameters.") {
-        changes.parameters = ParametersChange::Field(
+        changes.parameters = SubtableChange::Field(
             parameter_field(field)?.to_string(),
             value
                 .map(|value| parameter_from_literal(field, value))
@@ -276,13 +289,19 @@ fn parse_profile_change(key: &str, value: Option<&str>) -> anyhow::Result<Profil
     }
     match key {
         "model" => changes.model = patch(value, |value| Ok(value.to_string()))?,
+        "headers" => {
+            if value.is_some() {
+                anyhow::bail!("`headers` is set one name at a time, as `headers.<name> <value>`");
+            }
+            changes.headers = SubtableChange::Remove;
+        }
         "parameters" => {
             if value.is_some() {
                 anyhow::bail!(
                     "`parameters` is set one field at a time, as `parameters.<field> <value>`"
                 );
             }
-            changes.parameters = ParametersChange::Remove;
+            changes.parameters = SubtableChange::Remove;
         }
         "fallbacks" => {
             changes.fallbacks = patch(value, |value| {
@@ -350,6 +369,21 @@ fn parameter_field(field: &str) -> anyhow::Result<&str> {
     Ok(field)
 }
 
+/// The `--header NAME=VALUE` flags of `profile add` and `account add`, each value a header value
+/// as typed, an empty one included: `--header trace=` is sent empty rather than dropped.
+pub(super) fn header_flags(flags: &[String]) -> anyhow::Result<Vec<(String, String)>> {
+    flags
+        .iter()
+        .map(|flag| {
+            let Some((name, value)) = flag.split_once('=').filter(|(name, _)| !name.is_empty())
+            else {
+                anyhow::bail!("`--header` takes NAME=VALUE, got '{flag}'");
+            };
+            Ok((name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 /// The `--parameter FIELD=VALUE` flags of `profile add`, each value a TOML literal.
 fn parameter_flags(flags: &[String]) -> anyhow::Result<Vec<(String, toml_edit::Value)>> {
     flags
@@ -403,7 +437,10 @@ fn unsettable_key_refusal(key: &str) -> anyhow::Error {
 /// the same words as `set modle x`. Checking it inside the value branch instead left `--unset` to
 /// accept any spelling and report success, having changed nothing.
 fn ensure_settable_key(key: &str) -> anyhow::Result<()> {
-    if SETTABLE_PROFILE_KEYS.contains(&key) || key.starts_with("parameters.") {
+    if SETTABLE_PROFILE_KEYS.contains(&key)
+        || key.starts_with("headers.")
+        || key.starts_with("parameters.")
+    {
         return Ok(());
     }
     Err(unsettable_key_refusal(key))
@@ -584,10 +621,11 @@ fn budget_is_worth_asking_about(thinking: Option<crate::config::ThinkingMode>) -
     thinking == Some(crate::config::ThinkingMode::Budgeted)
 }
 
-/// The `profile add` flag that states `key`: its own name, singular for the two that repeat.
+/// The `profile add` flag that states `key`: its own name, singular for the three that repeat.
 fn add_flag(key: &str) -> String {
     match key {
         "fallbacks" => "--fallback".to_string(),
+        "headers" => "--header".to_string(),
         "parameters" => "--parameter".to_string(),
         key => format!("--{}", key.replace('_', "-")),
     }
@@ -631,9 +669,11 @@ fn resolve_tuning(
             inert.join(", ")
         );
     }
-    // A field the backend writes itself, or a value no request can carry, refused before the
-    // prompts too, in the words the write would use.
+    // A name Meka writes itself, a field the backend writes itself, or a value no request can
+    // carry, refused before the prompts too, in the words the write would use.
     refuse_unsendable_parameters(backend, &flags.parameters)
+        .map_err(|error| anyhow::anyhow!("profile '{profile_name}': {error}"))?;
+    refuse_unsendable_headers(backend, &flags.headers)
         .map_err(|error| anyhow::anyhow!("profile '{profile_name}': {error}"))?;
     let complete = flags.context_window.is_some()
         && flags.effort.is_some()
@@ -727,6 +767,7 @@ fn resolve_tuning(
         encrypted_reasoning: flags.encrypted_reasoning,
         reasoning_summary: flags.reasoning_summary,
         cyber_access_program: flags.cyber_access_program,
+        headers: flags.headers,
         parameters: flags.parameters,
     })
 }
@@ -917,6 +958,7 @@ mod tests {
             encrypted_reasoning: Some(true),
             reasoning_summary: Some(true),
             cyber_access_program: Some("standard".to_string()),
+            headers: vec![("x-trace".to_string(), "1".to_string())],
             parameters: vec![("seed".to_string(), toml_edit::Value::from(1))],
         };
         let keys = every.stated_keys();
@@ -1145,7 +1187,12 @@ mod tests {
                 "thinking" => "adaptive",
                 "deferred_tools" => "native",
                 "fallbacks" => "backup",
-                // Set a field at a time, and removed whole.
+                // Set one name or field at a time, and removed whole.
+                "headers" => {
+                    assert!(parse_profile_change("headers.x-trace", Some("1")).is_ok());
+                    assert!(parse_profile_change(key, None).is_ok());
+                    continue;
+                }
                 "parameters" => {
                     assert!(parse_profile_change("parameters.seed", Some("1")).is_ok());
                     assert!(parse_profile_change(key, None).is_ok());
@@ -1172,16 +1219,16 @@ mod tests {
         };
         assert!(matches!(
             change("parameters.temperature", Some("0.6")),
-            Ok(ParametersChange::Field(field, Some(value)))
+            Ok(SubtableChange::Field(field, Some(value)))
                 if field == "temperature" && value.as_float() == Some(0.6)
         ));
         assert!(matches!(
             change("parameters.temperature", None),
-            Ok(ParametersChange::Field(field, None)) if field == "temperature"
+            Ok(SubtableChange::Field(field, None)) if field == "temperature"
         ));
         assert!(matches!(
             change("parameters", None),
-            Ok(ParametersChange::Remove)
+            Ok(SubtableChange::Remove)
         ));
         ensure_settable_key("parameters.temperature").expect("settable");
         ensure_settable_key("parameters").expect("removable");
@@ -1212,6 +1259,54 @@ mod tests {
                 message.contains("`--parameter` takes FIELD=VALUE"),
                 "{message}"
             );
+        }
+    }
+
+    /// `headers.<name>` sets or removes one entry, its value a header value as typed, an empty one
+    /// included; the table goes whole with `--unset headers`, and a name left out, a value for the
+    /// whole table and a malformed `--header` are refused with the spelling that works.
+    #[test]
+    fn a_header_is_set_one_name_at_a_time() {
+        let change = |key: &str, value: Option<&str>| {
+            parse_profile_change(key, value)
+                .map(|changes| changes.headers)
+                .map_err(|error| error.to_string())
+        };
+        assert!(matches!(
+            change("headers.x-trace", Some("1")),
+            Ok(SubtableChange::Field(name, Some(value)))
+                if name == "x-trace" && value.as_str() == Some("1")
+        ));
+        assert!(matches!(
+            change("headers.x-trace", None),
+            Ok(SubtableChange::Field(name, None)) if name == "x-trace"
+        ));
+        assert!(matches!(
+            change("headers", None),
+            Ok(SubtableChange::Remove)
+        ));
+        ensure_settable_key("headers.x-trace").expect("settable");
+        ensure_settable_key("headers").expect("removable");
+
+        let refused = |key: &str, value: Option<&str>| change(key, value).expect_err("refused");
+        assert!(refused("headers.", Some("1")).contains("needs a header name"));
+        assert!(refused("headers", Some("1")).contains("set one name at a time"));
+
+        let flags =
+            header_flags(&["x-trace=1".to_string(), "x-empty=".to_string()]).expect("flags");
+        assert_eq!(
+            flags,
+            [
+                ("x-trace".to_string(), "1".to_string()),
+                ("x-empty".to_string(), String::new()),
+            ],
+            "an empty value is sent empty rather than dropped"
+        );
+        for flag in ["x-trace", "=1"] {
+            let message = header_flags(&[flag.to_string()])
+                .expect_err("no name and value")
+                .to_string();
+            assert!(message.contains("`--header` takes NAME=VALUE"), "{message}");
         }
     }
 

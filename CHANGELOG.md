@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `meka account usage` reports an OpenCode Go subscription's dollar-budget windows.
 - FreeBSD: `shell_execute` at `read` and `workspace` runs in a jail `jailbrokerd` builds.
 - `[shell].jailbroker_socket` names the socket that daemon listens on.
+- Custom request headers on accounts and profiles, as `headers`: sent as written on every request
+  to the model, a profile's entry overriding the account's under one name, and a `${VAR}` in a
+  value resolved at send. Listings show the names alone, since a value may hold a secret.
 
 ### Changed
 
