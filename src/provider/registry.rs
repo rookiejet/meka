@@ -39,6 +39,8 @@ pub(crate) struct ProviderBuilder {
     pub(super) cyber_access_program: Option<String>,
     /// See `ProfileConfig::parameters`, as the body carries them; read by the API-key backends.
     pub(super) parameters: serde_json::Map<String, serde_json::Value>,
+    /// See `ProfileConfig::headers`, as the request carries them; read by the API-key backends.
+    pub(super) headers: reqwest::header::HeaderMap,
     /// See `AccountConfig::prompt_cache_key`; read by `openai-responses` alone.
     pub(super) prompt_cache_key: bool,
     /// See `AccountConfig::stream_usage`; read by `openai-chat-completions` alone.
@@ -78,6 +80,7 @@ impl ProviderBuilder {
             reasoning_summary: true,
             cyber_access_program: None,
             parameters: serde_json::Map::new(),
+            headers: reqwest::header::HeaderMap::new(),
             prompt_cache_key: true,
             stream_usage: true,
             max_tool_name_bytes: None,
@@ -144,6 +147,12 @@ impl ProviderBuilder {
     /// The fields a request carries as written; the API-key backends alone.
     pub(crate) fn parameters(mut self, value: serde_json::Map<String, serde_json::Value>) -> Self {
         self.parameters = value;
+        self
+    }
+
+    /// The headers a request carries as written; the API-key backends alone.
+    pub(crate) fn headers(mut self, value: reqwest::header::HeaderMap) -> Self {
+        self.headers = value;
         self
     }
 
@@ -770,6 +779,12 @@ impl ProviderRegistry {
 
         let credential = self.credential_for(&settings.account).await?;
         let model = crate::config::require_model(profile, settings.model.as_deref())?.to_string();
+        // The headers' `${VAR}` references are resolved here, where the request goes out, rather
+        // than where the file is read: whether the environment supplies a name is a fact about
+        // this run, and one left unresolved must never reach the wire as the placeholder it is.
+        // Fails closed, before a request can be built.
+        let headers =
+            crate::config::expand_request_headers(&settings.headers).map_err(MekaError::Config)?;
         let needs_token_store = matches!(credential, AuthCredential::OAuthToken { .. });
         let provider = ProviderBuilder::new(settings.backend, credential, model)
             .base_url(settings.base_url.clone())
@@ -791,6 +806,7 @@ impl ProviderRegistry {
             .reasoning_summary(settings.reasoning_summary)
             .cyber_access_program(settings.cyber_access_program.clone())
             .parameters(settings.parameters.clone())
+            .headers(headers)
             .prompt_cache_key(settings.prompt_cache_key)
             .stream_usage(settings.stream_usage)
             .max_tool_name_bytes(settings.max_tool_name_bytes)

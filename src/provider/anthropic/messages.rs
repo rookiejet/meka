@@ -48,6 +48,8 @@ pub(crate) struct AnthropicMessagesProvider {
     max_request_bytes: Option<usize>,
     /// See [`crate::config::ProfileConfig::parameters`].
     parameters: serde_json::Map<String, serde_json::Value>,
+    /// See [`crate::config::ProfileConfig::headers`], as the request carries them.
+    headers: reqwest::header::HeaderMap,
     /// The OpenCode Go gateway facts, when this provider is one of the `opencode-*` backends;
     /// `None` (the generic case) adds nothing to the wire.
     opencode: Option<crate::provider::opencode::Gateway>,
@@ -71,6 +73,7 @@ impl AnthropicMessagesProvider {
             max_output_tokens,
             max_request_bytes,
             parameters,
+            headers,
             opencode,
             ..
         } = settings;
@@ -93,6 +96,7 @@ impl AnthropicMessagesProvider {
             max_output_tokens,
             max_request_bytes,
             parameters,
+            headers,
             opencode,
         })
     }
@@ -201,7 +205,10 @@ impl AnthropicMessagesProvider {
         request: reqwest::RequestBuilder,
         declares_deferred: bool,
     ) -> reqwest::RequestBuilder {
+        // The account's and the profile's headers go first: the names Meka writes itself are
+        // refused in config, so the two never contend for one.
         let mut request = request
+            .headers(self.headers.clone())
             .header("accept", "application/json")
             .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01")
@@ -709,6 +716,55 @@ mod tests {
             crate::config::Backend::AnthropicMessages,
             &body,
         );
+    }
+
+    /// The headers this builder writes are exactly the names a profile's or account's `headers`
+    /// may not take, minus the two the transport writes, on the direct wire and on the gateway;
+    /// the account's and the profile's ride beside them.
+    #[tokio::test]
+    async fn the_reserved_headers_are_what_the_builder_writes() {
+        for (backend, gateway) in [
+            (crate::config::Backend::AnthropicMessages, false),
+            (crate::config::Backend::OpenCodeGoMessages, true),
+        ] {
+            let (local, head_receiver) =
+                crate::provider::opencode::mock_endpoint_capturing_the_head().await;
+            let mut builder = crate::provider::ProviderBuilder::new(
+                backend,
+                crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                "claude-opus-5-5".to_string(),
+            )
+            .base_url(Some(format!("http://{local}")))
+            .thinking(ThinkingMode::Budgeted, 10_000)
+            .effort(Some("high".to_string()))
+            .max_output_tokens(Some(64_000))
+            .headers(crate::provider::headers_for_test());
+            if gateway {
+                builder = builder.opencode();
+            }
+            let provider =
+                AnthropicMessagesProvider::from_settings("test-key".to_string(), builder)
+                    .expect("build test provider");
+            let (sender, _receiver) = mpsc::channel(8);
+            if provider
+                .stream(
+                    CompletionRequest::new("", &[Message::user("hi")], &[]).attributed(
+                        crate::provider::Attribution {
+                            session_id: Some(uuid::Uuid::new_v4()),
+                            ..Default::default()
+                        },
+                    ),
+                    sender,
+                    CancellationToken::new(),
+                )
+                .await
+                .is_ok()
+            {
+                panic!("a 400 from the endpoint must not read as a completed stream");
+            }
+            let head = head_receiver.await.expect("the mock saw the request");
+            crate::provider::assert_writes_its_reserved_headers(backend, &head);
+        }
     }
 
     #[test]

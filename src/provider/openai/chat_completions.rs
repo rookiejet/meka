@@ -44,6 +44,8 @@ pub(crate) struct OpenAiChatCompletionsProvider {
     stream_usage: bool,
     /// See [`crate::config::ProfileConfig::parameters`].
     parameters: serde_json::Map<String, serde_json::Value>,
+    /// See [`crate::config::ProfileConfig::headers`], as the request carries them.
+    headers: reqwest::header::HeaderMap,
     /// The OpenCode Go gateway facts, when this provider is one of the `opencode-*` backends;
     /// `None` (the generic case) adds nothing to the wire.
     opencode: Option<crate::provider::opencode::Gateway>,
@@ -63,6 +65,7 @@ impl OpenAiChatCompletionsProvider {
             max_request_bytes,
             stream_usage,
             parameters,
+            headers,
             opencode,
             ..
         } = settings;
@@ -83,6 +86,7 @@ impl OpenAiChatCompletionsProvider {
             max_request_bytes,
             stream_usage,
             parameters,
+            headers,
             opencode,
         })
     }
@@ -549,6 +553,7 @@ impl Provider for OpenAiChatCompletionsProvider {
                 Ok(crate::provider::opencode::apply_request_headers(
                     self.client
                         .post(format!("{}/chat/completions", self.base_url))
+                        .headers(self.headers.clone())
                         .header("Authorization", crate::text::bearer(&self.api_key))
                         .header(reqwest::header::CONTENT_TYPE, "application/json"),
                     &attribution,
@@ -623,6 +628,7 @@ impl Provider for OpenAiChatCompletionsProvider {
                 Ok(crate::provider::opencode::apply_request_headers(
                     self.client
                         .post(format!("{}/chat/completions", self.base_url))
+                        .headers(self.headers.clone())
                         .header("Authorization", crate::text::bearer(&self.api_key))
                         .header(reqwest::header::CONTENT_TYPE, "application/json")
                         // Identity: an SSE body that fails in the decompressor looks exactly
@@ -2512,6 +2518,54 @@ mod tests {
             );
         }
         assert_eq!(whole["temperature"], 0.3);
+    }
+
+    /// The headers this builder writes are exactly the names a profile's or account's `headers`
+    /// may not take, minus the two the transport writes, on the generic wire and on the gateway;
+    /// the account's and the profile's ride beside them.
+    #[tokio::test]
+    async fn the_reserved_headers_are_what_the_builder_writes() {
+        for (backend, gateway) in [
+            (crate::config::Backend::OpenAiChatCompletions, false),
+            (crate::config::Backend::OpenCodeGo, true),
+        ] {
+            let (local, head_receiver) =
+                crate::provider::opencode::mock_endpoint_capturing_the_head().await;
+            let mut builder = crate::provider::ProviderBuilder::new(
+                backend,
+                crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                "gpt-5.6-sol".to_string(),
+            )
+            .base_url(Some(format!("http://{local}")))
+            .effort(Some("high".to_string()))
+            .max_output_tokens(Some(4096))
+            .headers(crate::provider::headers_for_test());
+            if gateway {
+                builder = builder.opencode();
+            }
+            let provider =
+                OpenAiChatCompletionsProvider::from_settings("test-key".to_string(), builder)
+                    .expect("provider");
+            let (sender, _receiver) = mpsc::channel(8);
+            if provider
+                .stream(
+                    CompletionRequest::new("", &[Message::user("hello")], &[]).attributed(
+                        crate::provider::Attribution {
+                            session_id: Some(uuid::Uuid::new_v4()),
+                            ..Default::default()
+                        },
+                    ),
+                    sender,
+                    CancellationToken::new(),
+                )
+                .await
+                .is_ok()
+            {
+                panic!("a 400 from the endpoint must not read as a completed stream");
+            }
+            let head = head_receiver.await.expect("the mock saw the request");
+            crate::provider::assert_writes_its_reserved_headers(backend, &head);
+        }
     }
 
     /// `"error": null` rides on every chunk from some servers and is not a failure.

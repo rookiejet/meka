@@ -36,6 +36,7 @@ pub(crate) async fn run(
             prompt_cache_key,
             stream_usage,
             max_tool_name_bytes,
+            header,
             api_key_stdin,
         } => {
             run_add(
@@ -52,6 +53,7 @@ pub(crate) async fn run(
                     stream_usage: *stream_usage,
                     max_tool_name_bytes: *max_tool_name_bytes,
                 },
+                super::profile::header_flags(header)?,
                 *api_key_stdin,
                 token_store,
             )
@@ -72,12 +74,17 @@ pub(crate) async fn run(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the inputs are the independent `account add` flags beside the store; a bundle would only move the destructuring one step upstream"
+)]
 async fn run_add(
     name: &str,
     backend_flag: Option<&str>,
     base_url_flag: Option<String>,
     settings_flags: OAuthSettings,
     endpoint: EndpointSettings,
+    headers: Vec<(String, String)>,
     api_key_stdin: bool,
     token_store: &TokenStore,
 ) -> anyhow::Result<()> {
@@ -126,6 +133,7 @@ async fn run_add(
         base_url: None,
         settings: &settings_flags,
         endpoint,
+        headers: headers.clone(),
     })?;
 
     let base_url = match base_url_flag {
@@ -178,6 +186,7 @@ async fn run_add(
             base_url: base_url.as_deref(),
             settings: &settings,
             endpoint,
+            headers,
         },
         Some(&credential),
         token_store,
@@ -1043,6 +1052,7 @@ mod tests {
                 interleaved_thinking: Some(false),
                 ..EndpointSettings::default()
             },
+            Vec::new(),
             true,
             &store,
         )
@@ -1056,6 +1066,7 @@ mod tests {
                 client_id: Some("mine".to_string()),
             },
             EndpointSettings::default(),
+            Vec::new(),
             true,
             &store,
         )
@@ -1091,6 +1102,7 @@ mod tests {
             None,
             OAuthSettings::default(),
             EndpointSettings::default(),
+            Vec::new(),
             true,
             &store,
         )
@@ -1125,6 +1137,7 @@ mod tests {
             Some("https://chatgpt.com/backend-api".to_string()),
             OAuthSettings::default(),
             EndpointSettings::default(),
+            Vec::new(),
             false,
             &store,
         )

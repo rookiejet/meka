@@ -68,7 +68,8 @@ pub(crate) const ANTHROPIC_MAX_REQUEST_BYTES: usize = 30 * crate::text::MIB;
 /// **Field order is canonical and load-bearing**, and every surface that lists these keys repeats
 /// it: [`ACCOUNT_KEY_ORDER`], `upsert_account_document`, the `account add` flags, and the
 /// `config.toml` reference. Widest reach first, ending with the narrowest: `backend` leads and
-/// `device_id` closes as the one key Meka writes rather than the user.
+/// `device_id` closes the settings the user states, as the one key Meka writes rather than the
+/// user, with `headers` after it as a table of its own that can only follow the account's keys.
 ///
 /// The division from [`ProfileConfig`] is the one "Whose fact is it" draws, which is why a new
 /// field has an obvious home: would two models on one account state it differently? Then it
@@ -103,6 +104,11 @@ pub(crate) struct AccountConfig {
     #[serde(default, deserialize_with = "deserialize_tool_name_bytes")]
     pub(crate) max_tool_name_bytes: Option<usize>,
     pub(crate) device_id: Option<String>,
+    /// Request headers every profile on this account sends, as `[accounts.<name>.headers]`. A
+    /// profile's own `headers` replace these per name; see [`request_headers`]. Read by the
+    /// API-key backends alone, since a subscription's request copies an official client's. The
+    /// values may hold a secret, kept out of the file with `${VAR}` expansion.
+    pub(crate) headers: Option<RequestHeaders>,
 }
 
 /// An account's `max_tool_name_bytes`, refused below what a cut name needs.
@@ -124,8 +130,9 @@ where
 /// leads, then `model`, then `fallbacks` as the one key that names another profile, then every
 /// model-tied knob by how many backends read it: the keys every backend reads first, down to the
 /// keys of one backend, Anthropic's ahead of OpenAI's and each API-key backend's ahead of its
-/// subscription's. `parameters` is last whatever its count, because its usual spelling, a table of
-/// its own, can only follow the profile's own keys.
+/// subscription's. `headers` and `parameters` are last whatever their count, because their usual
+/// spelling, a table of their own, can only follow the profile's own keys, and `parameters` is
+/// last of all since it is the wire's rather than the profile's.
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfileConfig {
@@ -202,6 +209,13 @@ pub(crate) struct ProfileConfig {
     /// programs a model offers an account is the server's to say, and it rejects one the model
     /// does not. Unset sends nothing, which leaves the program to the server.
     pub(crate) cyber_access_program: Option<String>,
+    /// Request headers this profile sends over the account's, replacing them per name, as
+    /// `[profiles.<name>.headers]`. The account's headers are not a base to keep whole: one name
+    /// carries one value, so a profile states the names it changes and the account keeps the rest;
+    /// see [`request_headers`]. Read by the API-key backends alone, since a subscription's request
+    /// copies an official client's. The values may hold a secret, kept out of the file with
+    /// `${VAR}` expansion.
+    pub(crate) headers: Option<RequestHeaders>,
     /// Request body fields Meka sends as written and never reads, spelled as the provider
     /// documents them: `temperature`, `top_p`, a server's own extensions. Each is one top-level
     /// field, and one Meka writes itself is refused, so nothing overrides anything; see
@@ -238,6 +252,12 @@ impl ProfileConfig {
                 stated_text(self.cyber_access_program.as_deref()).is_some(),
             ),
             (
+                "headers",
+                self.headers
+                    .as_ref()
+                    .is_some_and(|headers| headers.entries().next().is_some()),
+            ),
+            (
                 "parameters",
                 self.parameters
                     .as_ref()
@@ -260,6 +280,7 @@ pub(crate) const ACCOUNT_KEY_ORDER: &[&str] = &[
     "stream_usage",
     "max_tool_name_bytes",
     "device_id",
+    "headers",
 ];
 /// [`ProfileConfig`]'s field order, as the key names a `config.toml` profile table carries.
 ///
@@ -283,6 +304,7 @@ pub(crate) const PROFILE_KEY_ORDER: &[&str] = &[
     "encrypted_reasoning",
     "reasoning_summary",
     "cyber_access_program",
+    "headers",
     "parameters",
 ];
 /// Put one table's keys into `order`.
@@ -317,35 +339,54 @@ fn sort_keys(item: &mut toml_edit::Item, order: &[&str]) {
     }
 }
 /// Put one account table's keys into [`ACCOUNT_KEY_ORDER`].
+///
+/// `headers` is lifted out first and put back last, where the order puts it: its entries are the
+/// user's, in the order they wrote them, and a sort that reached inside would move an entry named
+/// like an account key ahead of the rest.
 pub(crate) fn sort_account_keys(account: &mut toml_edit::Item) {
+    let headers = lift_entry(account, "headers");
     sort_keys(account, ACCOUNT_KEY_ORDER);
+    if let Some(entry) = headers {
+        drop_entry(account, entry);
+    }
 }
 /// Put one profile table's keys into [`PROFILE_KEY_ORDER`].
 ///
-/// `parameters` is lifted out first and put back last, where the order puts it: its fields are the
-/// provider's, in the order the user wrote them, and `toml_edit` sorts inside a dotted table with
-/// the same ranking, which would move a field named like a profile key ahead of the rest.
+/// `headers` and `parameters` are lifted out first and put back last, where the order puts them:
+/// their entries are the provider's and the user's, in the order they were written, and
+/// `toml_edit` sorts inside a dotted table with the same ranking, which would move an entry named
+/// like a profile key ahead of the rest.
 pub(crate) fn sort_profile_keys(profile: &mut toml_edit::Item) {
-    let parameters = match profile {
-        toml_edit::Item::Table(table) => table.remove_entry("parameters"),
+    let headers = lift_entry(profile, "headers");
+    let parameters = lift_entry(profile, "parameters");
+    sort_keys(profile, PROFILE_KEY_ORDER);
+    for entry in [headers, parameters].into_iter().flatten() {
+        drop_entry(profile, entry);
+    }
+}
+/// Lift one named entry out of a table, whatever shape it is written in: a section table, or an
+/// inline one inside an inline table.
+fn lift_entry(item: &mut toml_edit::Item, name: &str) -> Option<(toml_edit::Key, toml_edit::Item)> {
+    match item {
+        toml_edit::Item::Table(table) => table.remove_entry(name),
         toml_edit::Item::Value(toml_edit::Value::InlineTable(table)) => table
-            .remove_entry("parameters")
+            .remove_entry(name)
             .map(|(key, value)| (key, toml_edit::Item::Value(value))),
         _ => None,
-    };
-    sort_keys(profile, PROFILE_KEY_ORDER);
-    let Some((key, parameters)) = parameters else {
-        return;
-    };
-    match (profile, parameters) {
-        (toml_edit::Item::Table(table), parameters) => {
-            table.insert_formatted(&key, parameters);
+    }
+}
+/// Put a lifted entry back at the end of a table, whatever shape it is written in.
+fn drop_entry(item: &mut toml_edit::Item, entry: (toml_edit::Key, toml_edit::Item)) {
+    let (key, entry) = entry;
+    match (item, entry) {
+        (toml_edit::Item::Table(table), entry) => {
+            table.insert_formatted(&key, entry);
         }
         (
             toml_edit::Item::Value(toml_edit::Value::InlineTable(table)),
-            toml_edit::Item::Value(parameters),
+            toml_edit::Item::Value(value),
         ) => {
-            table.insert_formatted(&key, parameters);
+            table.insert_formatted(&key, value);
         }
         _ => {}
     }
@@ -400,6 +441,10 @@ pub(crate) struct ProfileSettings {
     /// See [`ProfileConfig::parameters`]; as the body carries them, empty on a backend that reads
     /// none.
     pub(crate) parameters: serde_json::Map<String, serde_json::Value>,
+    /// See [`ProfileConfig::headers`] and [`AccountConfig::headers`]; the profile's entries over
+    /// the account's, values as written (a `${VAR}` reference is [`expand_request_headers`]'s to
+    /// resolve), empty on a backend that reads none.
+    pub(crate) headers: reqwest::header::HeaderMap,
     /// See [`AccountConfig::prompt_cache_key`]; resolved to the default here.
     pub(crate) prompt_cache_key: bool,
     /// See [`AccountConfig::stream_usage`]; resolved to the default here.
@@ -525,6 +570,7 @@ pub(crate) fn resolve_profile(
         cyber_access_program: stated_text(profile.cyber_access_program.as_deref())
             .map(|program| program.trim().to_string()),
         parameters: request_parameters(backend, profile.parameters.as_ref())?,
+        headers: request_headers(backend, account.headers.as_ref(), profile.headers.as_ref())?,
         prompt_cache_key: account.prompt_cache_key.unwrap_or(true),
         stream_usage: account.stream_usage.unwrap_or(true),
         // Only where the backend reads it: a hand-edited file can state it anywhere, and load warns
@@ -625,7 +671,93 @@ fn parameter_to_json(
         ),
     })
 }
-/// The `claude-subscription` device identifier for one account, seeding and persisting one when
+/// An account's and a profile's `headers` as the request carries them: the profile's entries over
+/// the account's, one value per name, or why the profile cannot run with them.
+///
+/// The one check, through [`resolve_profile`], which load, a session's resolution and every write
+/// door's reparse all reach. A name `backend` writes itself is refused whatever either table says
+/// of it, since either owner winning would make the other's setting a lie. The map is empty on a
+/// backend that reads no `headers`, where load warns and the write doors refuse.
+///
+/// Values are held as written, `${VAR}` references included: [`expand_request_headers`] resolves
+/// them where a request goes out, since whether an environment supplies a name is a fact about a
+/// run and a write door writes the entry regardless, the same way `meka mcp add` writes one its
+/// own shell cannot expand.
+pub(crate) fn request_headers(
+    backend: Backend,
+    account: Option<&RequestHeaders>,
+    profile: Option<&RequestHeaders>,
+) -> std::result::Result<reqwest::header::HeaderMap, String> {
+    let sent = backend.reads_profile_key("headers");
+    let mut headers = reqwest::header::HeaderMap::new();
+    // The account's entries first and the profile's after, so one name carries the profile's
+    // value wherever both state it: `insert` leaves the first position and takes the last value.
+    for table in [account, profile].into_iter().flatten() {
+        for (name, value) in table.entries() {
+            let checked = check_request_headers(backend, name);
+            // Errors surface however the backend reads the key, so a name Meka writes is refused
+            // on a backend that would send nothing, the way `parameters` refuses its fields.
+            if sent || checked.is_err() {
+                checked?;
+                headers.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    Ok(headers)
+}
+/// One name of `headers` as `backend` carries it, or why it cannot: a name Meka writes on the
+/// request itself is refused naming the backend that writes it, whatever table states it.
+fn check_request_headers(
+    backend: Backend,
+    name: &reqwest::header::HeaderName,
+) -> Result<(), String> {
+    if backend
+        .reserved_request_headers()
+        .iter()
+        .any(|reserved| *reserved == name.as_str())
+    {
+        return Err(format!(
+            "`headers.{name}` is written by Meka on '{backend}'; remove it"
+        ));
+    }
+    Ok(())
+}
+/// The request's `headers` with every `${VAR}` reference in a value resolved against the
+/// environment, or the first reference that stopped it.
+///
+/// Fails closed, as an MCP server's headers do: sent unresolved, a `${TOKEN}` reaches the provider
+/// as the placeholder where a credential was meant. Asked where a request goes out, by the
+/// provider assembly, so a config that cannot expand here has already been accepted as the file's
+/// terms by [`request_headers`].
+pub(crate) fn expand_request_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> std::result::Result<reqwest::header::HeaderMap, String> {
+    let mut expanded = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        // Every value reached this map as a config string, so it is visible ASCII; one that did
+        // not is Meka's own bug rather than the user's configuration.
+        let text = value.to_str().map_err(|error| {
+            format!("the value of `headers.{name}` is not a header value: {error}")
+        })?;
+        let expansion =
+            crate::config::expand_env_vars(text, |variable| std::env::var(variable).ok());
+        if let Some(reference) = expansion.malformed.first() {
+            return Err(format!(
+                "the value of `headers.{name}` holds `{reference}`, which is not a `${{VAR}}` or \
+                 `${{VAR:-default}}` reference"
+            ));
+        }
+        if let Some(variable) = expansion.missing.first() {
+            return Err(format!(
+                "env var `{variable}` referenced by `headers.{name}` is unset"
+            ));
+        }
+        let value = reqwest::header::HeaderValue::from_str(&expansion.text)
+            .map_err(|_| format!("the value of `headers.{name}` is not a header value"))?;
+        expanded.insert(name.clone(), value);
+    }
+    Ok(expanded)
+}
 /// the account states none.
 ///
 /// Empty for every other backend. Deliberately separate from [`resolve_profile`], which callers
@@ -1130,6 +1262,105 @@ mod tests {
         }
     }
 
+    fn headers(text: &str) -> RequestHeaders {
+        toml::from_str(text).expect("a headers table")
+    }
+
+    /// The two tables merge into one map, the profile's value under a name both state, and a name
+    /// Meka writes on the request itself is refused naming the backend that writes it. A
+    /// subscription carries none of them, its request being an official client's.
+    #[test]
+    fn headers_merge_over_the_account_s_and_a_name_meka_writes_is_refused() {
+        let account = headers("x-shared = \"account\"\nx-a = \"1\"\n");
+        let profile = headers("x-shared = \"profile\"\nx-b = \"2\"\nx-empty = \"\"\n");
+        let merged = request_headers(Backend::AnthropicMessages, Some(&account), Some(&profile))
+            .expect("headers");
+        assert_eq!(
+            merged
+                .iter()
+                .map(|(name, value)| (
+                    name.as_str(),
+                    value.to_str().expect("a visible value").to_string()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("x-shared", "profile".to_string()),
+                ("x-a", "1".to_string()),
+                ("x-b", "2".to_string()),
+                ("x-empty", String::new()),
+            ],
+            "the profile's value replaces the account's under one name, and the account's \
+             position is kept; an empty value is a value"
+        );
+
+        let refused = |backend: Backend, name: &str| {
+            request_headers(backend, None, Some(&headers(&format!("{name} = \"1\""))))
+                .expect_err("a name Meka writes")
+        };
+        for (backend, name) in [
+            (Backend::AnthropicMessages, "content-type"),
+            (Backend::OpenAiChatCompletions, "authorization"),
+            (Backend::OpenAiResponses, "accept"),
+            (Backend::OpenCodeGo, "user-agent"),
+            (Backend::OpenCodeGoMessages, "x-api-key"),
+            (Backend::OpenCodeGoResponses, "x-opencode-session"),
+        ] {
+            assert_eq!(
+                refused(backend, name),
+                format!("`headers.{name}` is written by Meka on '{backend}'; remove it"),
+                "{backend}"
+            );
+        }
+        for backend in [Backend::ClaudeSubscription, Backend::ChatGptSubscription] {
+            assert!(
+                request_headers(backend, Some(&account), Some(&profile))
+                    .expect("inert")
+                    .is_empty(),
+                "{backend} copies an official client's request"
+            );
+        }
+    }
+
+    /// A `${VAR}` in a value is resolved where a request goes out, defaults included, and a
+    /// reference that cannot resolve refuses the send rather than going out as its placeholder.
+    #[test]
+    fn a_header_reference_resolves_where_a_request_goes_out_and_fails_closed() {
+        // SAFETY: the name is this test's alone, and the tests that move `MEKA_CONFIG_DIR` take
+        // the lock this holds.
+        let _lock = crate::config::CONFIG_DIR_ENV_LOCK.blocking_lock();
+        unsafe {
+            std::env::set_var("MEKA_TEST_HEADERS_VAR", "resolved");
+            std::env::remove_var("MEKA_TEST_HEADERS_UNSET");
+        }
+        let expand = |text: &str| {
+            let map = [(reqwest::header::HeaderName::from_static("x-ride"), {
+                reqwest::header::HeaderValue::from_str(text).expect("a header value")
+            })]
+            .into_iter()
+            .collect();
+            expand_request_headers(&map)
+        };
+        assert_eq!(
+            expand("${MEKA_TEST_HEADERS_VAR} / ${MEKA_TEST_HEADERS_UNSET:-plain} / as-is")
+                .expect("resolves")
+                .get("x-ride")
+                .and_then(|value| value.to_str().ok()),
+            Some("resolved / plain / as-is")
+        );
+        assert_eq!(
+            expand("${MEKA_TEST_HEADERS_UNSET}").expect_err("unset"),
+            "env var `MEKA_TEST_HEADERS_UNSET` referenced by `headers.x-ride` is unset"
+        );
+        assert_eq!(
+            expand("a ${ b").expect_err("malformed"),
+            "the value of `headers.x-ride` holds `${ b`, which is not a `${VAR}` or \
+             `${VAR:-default}` reference"
+        );
+        unsafe {
+            std::env::remove_var("MEKA_TEST_HEADERS_VAR");
+        }
+    }
+
     fn profiles_from(
         backends: &[(&str, &str)],
     ) -> std::collections::BTreeMap<String, ProfileConfig> {
@@ -1530,6 +1761,7 @@ mod tests {
             "stream_usage = false\n",
             "max_tool_name_bytes = 64\n",
             "device_id = \"a-device\"\n",
+            "headers = { x-trace = \"1\" }\n",
             "\n",
             "[profiles.work]\n",
             "account = \"work\"\n",
@@ -1548,6 +1780,7 @@ mod tests {
             "encrypted_reasoning = false\n",
             "reasoning_summary = false\n",
             "cyber_access_program = \"daybreak_blue\"\n",
+            "headers = { x-trace = \"1\" }\n",
             "parameters = { temperature = 0.6 }\n",
         );
 

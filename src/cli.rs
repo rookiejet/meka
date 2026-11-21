@@ -381,6 +381,9 @@ pub(crate) enum AccountAction {
         /// The longest tool name the endpoint takes (default: the wire's)
         #[arg(long = "max-tool-name-bytes", value_name = "BYTES")]
         max_tool_name_bytes: Option<usize>,
+        /// Request header sent as written (repeatable)
+        #[arg(long = "header", value_name = "NAME=VALUE")]
+        header: Vec<String>,
         /// Read the API key from stdin
         #[arg(long = "api-key-stdin")]
         api_key_stdin: bool,
@@ -543,6 +546,9 @@ pub(crate) enum ProfileAction {
         /// Cyber access program to request
         #[arg(long = "cyber-access-program", value_name = "PROGRAM")]
         cyber_access_program: Option<String>,
+        /// Request header sent as written (repeatable)
+        #[arg(long = "header", value_name = "NAME=VALUE")]
+        header: Vec<String>,
         /// Request field sent as written, the value a TOML literal (repeatable)
         #[arg(long = "parameter", value_name = "FIELD=VALUE")]
         parameter: Vec<String>,

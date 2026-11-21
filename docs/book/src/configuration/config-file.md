@@ -263,6 +263,36 @@ backend   = "claude-subscription"
 device_id = "your-stable-id-here"
 ```
 
+### `headers`
+
+`anthropic-messages`, `openai-chat-completions`, `openai-responses`, `opencode-go`,
+`opencode-go-messages` and `opencode-go-responses` only. Header entries every request the
+account's profiles make carries, as written: a tracing id, a gateway's routing key, anything else
+the endpoint reads and Meka has no field for. Each key is a header name and its value a header
+value, an empty one sent empty rather than dropped. A name Meka writes on the request itself is
+refused when the config loads and by every command that writes an account or a profile, naming the
+name; each backend's page lists the ones it writes, so what is refused follows the wire the
+backend speaks.
+
+A profile's own `headers` table joins this one: a name both state goes out with the profile's
+value, in the account's position. Values may hold a secret, so listings and the HTTP API show the
+names alone. A `${VAR}` or `${VAR:-default}` in a value resolves against the environment where the
+request goes out; one that cannot resolve refuses the send rather than going out as its
+placeholder.
+
+The two subscription backends send the official client's request and read no `headers`; a table on
+such an account is reported at startup and refused by `meka account add`. Set entries with
+`meka account add <name> --header NAME=VALUE`, repeatable.
+
+```toml
+[accounts.work]
+backend = "anthropic-messages"
+
+[accounts.work.headers]
+x-trace-id = "${TRACE_ID}"
+x-route    = "eu"
+```
+
 ## Profile fields
 
 ### `account`
@@ -541,6 +571,35 @@ its own program with the key unset. The other backends never read it, and `meka 
 account              = "chatgpt"
 model                = "gpt-6-sol"
 cyber_access_program = "daybreak_blue"
+```
+
+### `headers`
+
+`anthropic-messages`, `openai-chat-completions`, `openai-responses`, `opencode-go`,
+`opencode-go-messages` and `opencode-go-responses` only. Header entries every request the profile
+makes carries, joining the [account's](#headers) table: a name both state goes out with the
+profile's value. They ride every request to the model, compaction summaries and sub-agents on the
+profile included. A name Meka writes on the request itself is refused when the config loads and by
+every command that writes a profile, naming the name; each backend's page lists the ones it
+writes. Values may hold a secret, so listings and the HTTP API show the names alone. A `${VAR}` or
+`${VAR:-default}` in a value resolves against the environment where the request goes out; one that
+cannot resolve refuses the send rather than going out as its placeholder.
+
+The two subscription backends read no `headers`, because their request is the official client's; a
+table on such a profile is reported at startup and refused by `meka profile add` and
+`meka profile set`.
+
+Set one entry with `meka profile set <name> headers.<name> <value>`, or on `meka profile add` with
+`--header NAME=VALUE`, repeatable. An empty value is sent empty rather than dropped.
+
+```toml
+[profiles.edge]
+account = "openrouter"
+model   = "qwen/qwen3-235b-a22b"
+
+[profiles.edge.headers]
+x-trace-id = "${TRACE_ID}"
+x-route    = "eu"
 ```
 
 ### `parameters`

@@ -523,6 +523,13 @@ fn upsert_account_document(
     for (key, value) in account.endpoint.stated() {
         table.insert(key, toml_edit::Item::Value(value));
     }
+    if !account.headers.is_empty() {
+        let mut headers = toml_edit::Table::new();
+        for (name, value) in &account.headers {
+            headers.insert(name, toml_edit::value(value));
+        }
+        table.insert("headers", toml_edit::Item::Table(headers));
+    }
     // The one line that makes "every writer leaves the canonical order" true of this writer
     // whatever order the inserts above run in.
     let mut table = toml_edit::Item::Table(table);
@@ -547,6 +554,8 @@ pub(crate) struct NewAccount<'a> {
     pub(crate) base_url: Option<&'a str>,
     pub(crate) settings: &'a OAuthSettings,
     pub(crate) endpoint: EndpointSettings,
+    /// The `headers` entries, in the order given; written as `[accounts.<name>.headers]`.
+    pub(crate) headers: Vec<(String, String)>,
 }
 
 /// What an account states its endpoint takes, beside the settings a login is made against: each
@@ -600,7 +609,9 @@ pub(crate) fn refuse_inert_account_keys(account: &NewAccount<'_>) -> crate::erro
             .stated()
             .into_iter()
             .map(|(key, _)| (key, true)),
-    ) {
+    )
+    .chain([("headers", !account.headers.is_empty())])
+    {
         if given && !account.backend.reads_account_key(key) {
             return Err(super::refusal(format!(
                 "an account on '{backend}' never reads `{key}`; drop it",
@@ -608,6 +619,9 @@ pub(crate) fn refuse_inert_account_keys(account: &NewAccount<'_>) -> crate::erro
             )));
         }
     }
+    // A name Meka writes on the request itself is refused the same way here as at load, ahead of
+    // the write rather than at the first run that would send it.
+    super::profile::refuse_unsendable_headers(account.backend, &account.headers)?;
     Ok(())
 }
 
@@ -1558,6 +1572,7 @@ mod tests {
                     max_tool_name_bytes: Some(bytes),
                     ..EndpointSettings::default()
                 },
+                headers: Vec::new(),
             })
             .err()
             .map(|error| error.to_string())
@@ -2056,6 +2071,7 @@ mod tests {
             base_url: None,
             settings: &OAuthSettings::default(),
             endpoint: EndpointSettings::default(),
+            headers: Vec::new(),
         })
         .expect("upsert");
         let rendered = bare.to_string();
@@ -2073,6 +2089,10 @@ mod tests {
                 client_id: Some("my-client".to_string()),
             },
             endpoint: EndpointSettings::default(),
+            headers: vec![
+                ("x-trace".to_string(), "1".to_string()),
+                ("x-empty".to_string(), String::new()),
+            ],
         })
         .expect("upsert");
         // Read back through the real parser, so a key written under the wrong name or type is
@@ -2089,6 +2109,15 @@ mod tests {
             Some("https://auth.invalid/token")
         );
         assert_eq!(account.client_id.as_deref(), Some("my-client"));
+        assert_eq!(
+            account.headers.as_ref().expect("the headers").names(),
+            ["x-trace", "x-empty"],
+            "an empty value is a value and the order given is the order kept"
+        );
+        assert!(
+            tuned.to_string().contains("[accounts.sub.headers]"),
+            "the headers table is written as a section: {tuned}"
+        );
     }
 
     /// `accounts = { work = { … } }` is valid TOML that serde reads. Treating "not a header table"
@@ -2104,6 +2133,7 @@ mod tests {
             base_url: None,
             settings: &OAuthSettings::default(),
             endpoint: EndpointSettings::default(),
+            headers: Vec::new(),
         })
         .expect_err("an inline `accounts` must be refused, not overwritten");
         assert!(
