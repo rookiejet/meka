@@ -2400,6 +2400,7 @@ mod tests {
                     stderr: Captured::default(),
                     stopped_early: false,
                 },
+                local_exit: Some(std::process::ExitStatus::from_raw(0)),
             };
             crate::scheduler::shell_probe_outcome(finished, Duration::from_secs(30))
                 .expect("a run that ended in time is judged")

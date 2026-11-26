@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     fs::*,
-    paths::{config_file_path, expand_user_path, meka_config_dir},
+    paths::{WslDirectory, config_file_path, expand_user_path, meka_config_dir},
     permission::{EnabledPermissions, Permission},
 };
 
@@ -1320,6 +1320,28 @@ pub(crate) struct ShellConfig {
     /// the socket is named, so this is Meka being told where that is;
     /// [`DEFAULT_JAILBROKER_SOCKET`] is used when it is unset.
     pub(crate) jailbroker_socket: Option<std::path::PathBuf>,
+    /// Windows: the trusted guest installation used for WSL directory grants.
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "a shared config parses on every platform")
+    )]
+    pub(crate) wsl: Option<WslTargetConfig>,
+}
+
+/// A managed WSL distro and its optional override for the installed runner path.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WslTargetConfig {
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "a shared config parses on every platform")
+    )]
+    pub(crate) distribution: String,
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "a shared config parses on every platform")
+    )]
+    pub(crate) runner: Option<String>,
 }
 
 /// Where `jailbrokerd` listens unless `[shell].jailbroker_socket` names another path.
@@ -2448,6 +2470,9 @@ pub(crate) struct RunRequest {
     /// inherits them and a shaped one does not. The per-run form of
     /// `[shell].additional_readable_directories`, and CLI-only for the reason above.
     pub(crate) additional_readable_directories: Vec<std::path::PathBuf>,
+    /// WSL directories are per-run grants, never native filesystem roots.
+    #[cfg(windows)]
+    pub(crate) wsl_directories: WslRunDirectories,
     /// CLI-flag override for `[serve].bind` (`meka serve --bind ...`). Wins over the config file
     /// when set.
     pub(crate) serve_bind_override: Option<String>,
@@ -2461,6 +2486,22 @@ pub(crate) struct RunRequest {
     /// it has a profile at all. A `--profile` on the command line is still held to naming one at
     /// startup, since a typo there is the operator's to fix and nothing over the API can.
     pub(crate) profile_named_per_session: bool,
+}
+
+/// Target-qualified directory grants from the Windows CLI, in their original access classes.
+#[cfg(windows)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WslRunDirectories {
+    pub(crate) workspace: Vec<WslDirectory>,
+    pub(crate) readable: Vec<WslDirectory>,
+}
+
+#[cfg(windows)]
+impl WslRunDirectories {
+    /// Whether this invocation named any directories that require a WSL execution target.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.workspace.is_empty() && self.readable.is_empty()
+    }
 }
 
 /// One configured profile as a listing shows it: its name, the account it bills, that account's
@@ -2569,6 +2610,8 @@ pub(crate) struct ResolvedConfig {
     /// the same reason it probes a backend, because whether anything is listening is a fact
     /// about the machine.
     pub(crate) jailbroker_socket: std::path::PathBuf,
+    #[cfg(windows)]
+    pub(crate) wsl_target: Option<WslTargetConfig>,
     /// Resolved `[session].retention`. `None`, the default, disables the session sweep.
     pub(crate) retention: Option<std::time::Duration>,
     /// Resolved `[session].turn_retention`. `None`, the default, keeps every turn for the life of
@@ -3413,6 +3456,41 @@ fn eager_load_overrides(
     overrides
 }
 
+/// Keep missing native directories for live resolution, but never use the native filesystem to
+/// resolve a guest grant. Even an invalid guest spelling must not fall back to a native root.
+fn resolve_run_directories(
+    flag: &str,
+    directories: Vec<PathBuf>,
+    config_error: &mut Option<String>,
+) -> (Vec<PathBuf>, Vec<WslDirectory>) {
+    let mut native = Vec::new();
+    let mut wsl = Vec::new();
+    for directory in directories {
+        match WslDirectory::from_run_directory(&directory) {
+            Ok(Some(guest)) => {
+                if !wsl.contains(&guest) {
+                    wsl.push(guest);
+                }
+            }
+            Ok(None) => {
+                if let Err(error) = std::fs::canonicalize(&directory) {
+                    tracing::warn!(
+                        "{flag} {directory} does not resolve ({error}); it grants nothing until \
+                         it exists",
+                        directory = directory.display()
+                    );
+                }
+                native.push(directory);
+            }
+            Err(reason) => {
+                config_error
+                    .get_or_insert_with(|| format!("{flag} '{}': {reason}", directory.display()));
+            }
+        }
+    }
+    (native, wsl)
+}
+
 impl ResolvedConfig {
     /// The MCP servers as they run: each entry with what it leaves unsaid filled in under the
     /// `[mcp]` defaults, for a listing. [`Self::mcp_servers`] stays the file's word.
@@ -3638,31 +3716,16 @@ impl ResolvedConfig {
             .jailbroker_socket
             .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_JAILBROKER_SOCKET));
 
-        // A directory that does not resolve contributes nothing to either boundary, because
-        // `usable_roots` drops what it cannot canonicalize. Silently, until an access is refused
-        // with a boundary the user believed included this path. The path is kept regardless of the
-        // warning: a build directory that does not exist yet is a legitimate directory, and the
-        // boundary is recomputed on every access rather than frozen here.
-        for (flag, directories) in [
-            (
-                "--additional-workspace-directory",
-                &overrides.additional_workspace_directories,
-            ),
-            (
-                "--additional-readable-directory",
-                &overrides.additional_readable_directories,
-            ),
-        ] {
-            for directory in directories {
-                if let Err(error) = std::fs::canonicalize(directory) {
-                    tracing::warn!(
-                        "{flag} {directory} does not resolve ({error}); it grants nothing until \
-                         it exists",
-                        directory = directory.display()
-                    );
-                }
-            }
-        }
+        let (additional_workspace_directories, _wsl_workspace) = resolve_run_directories(
+            "--additional-workspace-directory",
+            overrides.additional_workspace_directories,
+            &mut config_error,
+        );
+        let (additional_readable_directories, _wsl_readable) = resolve_run_directories(
+            "--additional-readable-directory",
+            overrides.additional_readable_directories,
+            &mut config_error,
+        );
 
         Self {
             default_profile,
@@ -3704,6 +3767,8 @@ impl ResolvedConfig {
                 .unwrap_or_default(),
             sandbox_backend,
             jailbroker_socket,
+            #[cfg(windows)]
+            wsl_target: file_shell.wsl,
             retention: file_session.retention,
             turn_retention: file_session.turn_retention,
             auto_compact: file_session.auto_compact.unwrap_or(true),
@@ -3750,8 +3815,13 @@ impl ResolvedConfig {
             acp,
             serve: config_file.serve,
             request: RunRequest {
-                additional_workspace_directories: overrides.additional_workspace_directories,
-                additional_readable_directories: overrides.additional_readable_directories,
+                additional_workspace_directories,
+                additional_readable_directories,
+                #[cfg(windows)]
+                wsl_directories: WslRunDirectories {
+                    workspace: _wsl_workspace,
+                    readable: _wsl_readable,
+                },
                 requested_permission,
                 requested_profile: overrides.profile,
                 requested_project: overrides.project,
@@ -3802,6 +3872,89 @@ impl ResolvedConfig {
         warn_about_inert_profile_keys(&self.accounts, &self.profiles);
     }
 
+    /// Whether every grant the managed WSL target admits is Windows-backed, so a session needs
+    /// `workspace` to open it at all.
+    ///
+    /// A Windows mount is proved by the host before the guest resolves it, and what a `read`
+    /// session can prove is a guest path alone (`Target::request` refuses the rest). When this
+    /// run's grants are all Linux flags, some directory is selectable at `read`. When they are
+    /// empty and the target exists, every grant is one derived from a native workspace
+    /// directory, so nothing is. Meaningful only alongside [`Self::managed_wsl`], which is what
+    /// decides whether a target exists.
+    #[cfg(windows)]
+    pub(crate) fn managed_wsl_needs_workspace(&self) -> bool {
+        self.request.wsl_directories.is_empty()
+    }
+
+    /// Resolve the optional managed target from this run's directory grants: the explicit Linux
+    /// ones, and any native workspace directory the runner can resolve as a Windows-backed guest
+    /// view.
+    #[cfg(windows)]
+    pub(crate) fn managed_wsl(&self) -> crate::error::Result<Option<crate::subshell::Target>> {
+        use crate::error::MekaError;
+
+        let grants = &self.request.wsl_directories;
+        // A native workspace directory the runner can resolve becomes a Windows-backed guest
+        // grant. What cannot name a drive-absolute path keeps its native meaning alone, so
+        // nothing that was only ever a Windows sandbox root is refused for being one.
+        let windows: Vec<String> = self
+            .request
+            .additional_workspace_directories
+            .iter()
+            .filter_map(|path| path.to_str())
+            .filter(|path| crate::subshell::windows_components(path).is_some())
+            .map(str::to_owned)
+            .collect();
+        if grants.is_empty() {
+            // A derived grant is convenience, never a reason to refuse a run: without the managed
+            // target, the sandbox, or outside a session `meka serve` names, it simply does not
+            // exist and the directory keeps its native meaning alone.
+            if windows.is_empty() || !self.sandbox || self.request.profile_named_per_session {
+                return Ok(None);
+            }
+            let Some(target) = self.wsl_target.as_ref() else {
+                return Ok(None);
+            };
+            return crate::subshell::Target::from_grants(
+                &target.distribution,
+                target
+                    .runner
+                    .as_deref()
+                    .unwrap_or(crate::subshell::DEFAULT_RUNNER),
+                &[],
+                &[],
+                &windows,
+            )
+            .map(Some)
+            .map_err(|error| MekaError::Config(error.to_string()));
+        }
+        if self.request.profile_named_per_session {
+            return Err(MekaError::Config(
+                "WSL directory flags are not available for `meka serve`".to_string(),
+            ));
+        }
+        if !self.sandbox {
+            return Err(MekaError::Config(
+                "WSL directory flags require `[shell].sandbox = true`".to_string(),
+            ));
+        }
+        let target = self.wsl_target.as_ref().ok_or_else(|| {
+            MekaError::Config("WSL directory flags require a managed WSL execution target in `[shell.wsl]`; they are not native Windows workspace roots".to_string())
+        })?;
+        crate::subshell::Target::from_grants(
+            &target.distribution,
+            target
+                .runner
+                .as_deref()
+                .unwrap_or(crate::subshell::DEFAULT_RUNNER),
+            &grants.workspace,
+            &grants.readable,
+            &windows,
+        )
+        .map(Some)
+        .map_err(|error| MekaError::Config(error.to_string()))
+    }
+
     pub(crate) fn validate(&self) -> crate::error::Result<()> {
         // Profile-selection failure (none / ambiguous / unknown name) is reported first with its
         // specific guidance. Ahead of the provider check: with an unparsed config there are no
@@ -3810,6 +3963,8 @@ impl ResolvedConfig {
         if let Some(error) = &self.config_error {
             return Err(crate::error::MekaError::Config(error.clone()));
         }
+        #[cfg(windows)]
+        self.managed_wsl()?;
         self.validate_default_profile()?;
         validate_fallback_chains(&self.accounts, &self.profiles, self.session_context_window)
             .map_err(crate::error::MekaError::Config)?;
@@ -4014,6 +4169,12 @@ impl BuiltinToolFilter {
     }
 
     pub(crate) fn admits(&self, name: &str) -> bool {
+        // Selecting a guest execution target must not bypass the shell tool policy.
+        (!crate::subshell::is_tool(name) || self.admits_tool("shell_execute"))
+            && self.admits_tool(name)
+    }
+
+    fn admits_tool(&self, name: &str) -> bool {
         if self.denies(name) {
             return false;
         }
@@ -5495,6 +5656,97 @@ retention = "90d"
         let resolved = ResolvedConfig::resolve(crate::cli::Cli::parse_from(["meka"]).overrides());
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
         resolved
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_run_keeps_wsl_grants_separate_from_native_roots_and_each_other() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let native_workspace = directory.path().join("work");
+        let native_readable = directory.path().join("reference");
+        std::fs::create_dir(&native_workspace).expect("native workspace");
+        std::fs::create_dir(&native_readable).expect("native reference");
+        let read = ConfigRead {
+            modified: None,
+            at: chrono::Utc::now(),
+            path: None,
+            text: Ok(None),
+        };
+        let resolved = ResolvedConfig::resolve_from(
+            CliOverrides {
+                additional_workspace_directories: vec![
+                    native_workspace.clone(),
+                    PathBuf::from(r"\\wsl.localhost\Test\home\Project"),
+                    PathBuf::from(r"\\wsl$\Test\home\Project"),
+                ],
+                additional_readable_directories: vec![
+                    PathBuf::from(r"\\wsl$\Test\home\reference"),
+                    native_readable.clone(),
+                ],
+                ..CliOverrides::default()
+            },
+            &read,
+        );
+        let request = resolved.request;
+        assert_eq!(request.additional_workspace_directories, [native_workspace]);
+        assert_eq!(request.additional_readable_directories, [native_readable]);
+        let render = |directories: &[WslDirectory]| {
+            directories
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(render(&request.wsl_directories.workspace), [
+            r"\\wsl.localhost\Test\home\Project"
+        ]);
+        assert_eq!(render(&request.wsl_directories.readable), [
+            r"\\wsl.localhost\Test\home\reference"
+        ]);
+    }
+
+    /// Whether the managed target's grants can be selected at `read` is read off the same
+    /// resolution that builds the target: a run with a Linux flag has a guest directory to select,
+    /// and a run whose only grants are native workspace directories has none.
+    #[cfg(windows)]
+    #[test]
+    fn a_managed_target_needs_workspace_exactly_when_it_holds_no_guest_grant() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let native_workspace = directory.path().join("work");
+        std::fs::create_dir(&native_workspace).expect("native workspace");
+        let read = ConfigRead {
+            modified: None,
+            at: chrono::Utc::now(),
+            path: None,
+            text: Ok(None),
+        };
+
+        let native_only = ResolvedConfig::resolve_from(
+            CliOverrides {
+                additional_workspace_directories: vec![native_workspace],
+                ..CliOverrides::default()
+            },
+            &read,
+        );
+        assert!(native_only.request.wsl_directories.is_empty());
+        assert!(
+            native_only.managed_wsl_needs_workspace(),
+            "a run whose grants are all native workspace directories needs `workspace`",
+        );
+
+        let with_guest = ResolvedConfig::resolve_from(
+            CliOverrides {
+                additional_workspace_directories: vec![PathBuf::from(
+                    r"\\wsl.localhost\Test\home\Project",
+                )],
+                ..CliOverrides::default()
+            },
+            &read,
+        );
+        assert!(!with_guest.request.wsl_directories.is_empty());
+        assert!(
+            !with_guest.managed_wsl_needs_workspace(),
+            "a guest grant is selectable at `read`",
+        );
     }
 
     /// A default the catalog refuses stops a run that needs it now, and is deferred for a resume,

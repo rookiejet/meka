@@ -481,6 +481,7 @@ pub(crate) async fn run_interactive(
     let schedule_watcher = {
         let store = store.clone();
         let shared_session_id = Arc::clone(&shared_session_id);
+        let on_screen = shared_agent.clone();
         let poll_interval = config.schedule.poll_interval;
         let background_enabled = config.background.enabled;
         let ui = ui.clone();
@@ -502,6 +503,18 @@ pub(crate) async fn run_interactive(
                     }
                 };
                 if background_enabled {
+                    // Deliver stops whose durable record stands but whose signal may never have
+                    // reached the owner: one another process recorded, or one a dropped request
+                    // left between its record and its signal. A timer is what lets those land
+                    // after all.
+                    if let Err(error) = on_screen
+                        .get()
+                        .background_tasks()
+                        .deliver_durable_stops(&store.background_store(), current)
+                        .await
+                    {
+                        tracing::warn!("failed to deliver recorded background stops: {error}");
+                    }
                     match store
                         .background_store()
                         .list_undelivered_background_tasks(current)
@@ -688,7 +701,25 @@ pub(crate) async fn run_interactive(
                             items: opened.cells().checklist.get().items,
                         },
                     ));
-                    crate::host::release_agent(&agent, &cancel, mcp_manager.as_ref()).await;
+                    let stopped =
+                        crate::host::release_agent(&agent, &cancel, mcp_manager.as_ref()).await;
+                    if stopped > 0
+                        && let Some(id) = session_id
+                        && tokio::time::timeout(
+                            BACKGROUND_EXIT_GRACE,
+                            agent.background_tasks().wait_for_session(id),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            "session {id} left {stopped} background task(s) running after \
+                             {seconds}s; the next open will report their teardown as unconfirmed",
+                            seconds = BACKGROUND_EXIT_GRACE.as_secs()
+                        );
+                    }
+                    // Only after the work above has settled: the lock is the lease that says a
+                    // still-running row belongs to a dead process.
                     hold_session_lock(&session_lock, None);
                     agent = Arc::clone(&opened.agent);
                     conversation = Arc::clone(&opened.conversation);
@@ -764,10 +795,9 @@ pub(crate) async fn run_interactive(
     {
         crate::render::render_session_id("Leaving session", &id.to_string());
     }
-    // Emptied after the "Leaving session" line so the lock is held until the very end; the OS
-    // releases the underlying flock when the FD closes.
-    hold_session_lock(&session_lock, None);
-
+    // Emptied only after the tasks below have settled: the lock is the lease that tells the next
+    // opener every still-running row belongs to a dead process. The "Leaving session" line is
+    // printed first; the OS releases the underlying flock when the FD finally closes.
     // Stop this process's background tasks on the way out: a detached `shell_execute` is
     // `setsid()`-ed, so nothing else reaches it, and the next session open would sweep its row to
     // `interrupted` while it may still be writing to the workspace.
@@ -791,6 +821,7 @@ pub(crate) async fn run_interactive(
             );
         }
     }
+    hold_session_lock(&session_lock, None);
 
     drop(agent);
 

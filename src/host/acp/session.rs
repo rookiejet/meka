@@ -252,7 +252,9 @@ pub(super) fn spawn_idle_session_sweep(state: Arc<ServerState>) -> tokio::task::
             {
                 // Same teardown `session/close` does: the background work the session left is
                 // stopped and recorded, and its registry leaves the manager's list.
-                entry.release(state.shared.mcp_manager.as_ref()).await;
+                entry
+                    .release_and_wait(state.shared.mcp_manager.as_ref())
+                    .await;
                 crate::sync::lock(&state.released).insert(id.clone());
                 tracing::info!(
                     "released idle ACP session {id} after {ACP_SESSION_IDLE_TIMEOUT:?}; the next request naming it reopens it"
@@ -277,12 +279,10 @@ async fn reopen_released(
     crate::host::refuse_a_spawned_session(&state.shared.store, Some(session_uuid))
         .await
         .map_err(|error| build_failure_error("failed to read session", &error, relay))?;
-    let (session_lock, summary) = state
-        .shared
-        .store
-        .open_session_row(session_uuid)
-        .await
-        .map_err(|error| acp_error_for(&error, false))?;
+    let (session_lock, summary) =
+        crate::host::open_session_row_or_adopt(&state.shared.store, session_uuid)
+            .await
+            .map_err(|error| acp_error_for(&error, false))?;
     let cwd = summary
         .cwd
         .clone()
@@ -413,10 +413,11 @@ pub(super) async fn handle_load_session(
 
     // Locked, then read, so the row this session reopens from is the one this process now owns,
     // and no concurrent process can write events while history is replayed.
-    let (session_lock, summary) = match state.shared.store.open_session_row(session_uuid).await {
-        Ok(opened) => opened,
-        Err(error) => return responder.respond_with_error(acp_error_for(&error, false)),
-    };
+    let (session_lock, summary) =
+        match crate::host::open_session_row_or_adopt(&state.shared.store, session_uuid).await {
+            Ok(opened) => opened,
+            Err(error) => return responder.respond_with_error(acp_error_for(&error, false)),
+        };
 
     let session_id: SessionId = session_id_str.clone().into();
 
@@ -482,7 +483,7 @@ pub(super) async fn handle_load_session(
     {
         runtime
             .resident
-            .release(state.shared.mcp_manager.as_ref())
+            .release_and_wait(state.shared.mcp_manager.as_ref())
             .await;
         return responder.respond_with_error(acp_error_for(&error, false));
     }
@@ -663,10 +664,11 @@ pub(super) async fn handle_resume_session(
     }
 
     // Locked, then read, as `session/load` does and for the same reason.
-    let (session_lock, summary) = match state.shared.store.open_session_row(session_uuid).await {
-        Ok(opened) => opened,
-        Err(error) => return responder.respond_with_error(acp_error_for(&error, false)),
-    };
+    let (session_lock, summary) =
+        match crate::host::open_session_row_or_adopt(&state.shared.store, session_uuid).await {
+            Ok(opened) => opened,
+            Err(error) => return responder.respond_with_error(acp_error_for(&error, false)),
+        };
 
     let session_id: SessionId = session_id_str.clone().into();
 
@@ -716,7 +718,7 @@ pub(super) async fn handle_resume_session(
     {
         runtime
             .resident
-            .release(state.shared.mcp_manager.as_ref())
+            .release_and_wait(state.shared.mcp_manager.as_ref())
             .await;
         return responder.respond_with_error(acp_error_for(&error, false));
     }
@@ -1105,7 +1107,9 @@ pub(super) async fn handle_close_session(
     // `file_read` and the `fs/*` delegates do not observe the token -- so this genuinely blocks
     // until the turn ends, off the loop, which is the correct place to do it.
     drop(entry.conversation.lock().await);
-    let stopped = entry.release(state.shared.mcp_manager.as_ref()).await;
+    let stopped = entry
+        .release_and_wait(state.shared.mcp_manager.as_ref())
+        .await;
     if stopped > 0 {
         tracing::info!("session/close signaled {stopped} running background task(s) to stop");
     }

@@ -2,7 +2,89 @@
 //! `~` expansion every path setting goes through. A leaf, so any layer may ask without reaching
 //! into `config`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// A directory in a WSL distribution. The guest path is POSIX text, not a Windows `PathBuf`, so
+/// comparison and resolution cannot accidentally follow Win32 path rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WslDirectory {
+    distribution: String,
+    guest_path: String,
+}
+
+impl WslDirectory {
+    #[cfg(windows)]
+    pub(crate) fn distribution(&self) -> &str {
+        &self.distribution
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn guest_path(&self) -> &str {
+        &self.guest_path
+    }
+
+    /// Recognize WSL aliases on Windows without consulting the UNC provider or starting a distro.
+    /// An invalid path in either alias is an error, never a native path.
+    pub(crate) fn from_run_directory(path: &Path) -> Result<Option<Self>, &'static str> {
+        if !cfg!(windows) {
+            return Ok(None);
+        }
+        Self::from_explorer_path(path)
+    }
+
+    fn from_explorer_path(path: &Path) -> Result<Option<Self>, &'static str> {
+        // Recognize the ASCII namespace even if a later path component is not Unicode. A lossy
+        // conversion is sufficient only for that test; it must never supply a guest path.
+        let displayed = path.to_string_lossy();
+        let separators = ['\\', '/'];
+        let rest = displayed.trim_start_matches(separators);
+        if displayed.len() - rest.len() < 2 {
+            return Ok(None);
+        }
+        let mut components = rest.split(separators);
+        let server = match components.next() {
+            Some("?" | ".") => match components.next() {
+                Some(namespace) if namespace.eq_ignore_ascii_case("unc") => components.next(),
+                _ => None,
+            },
+            server => server,
+        };
+        if !server.is_some_and(|server| {
+            server.eq_ignore_ascii_case("wsl.localhost") || server.eq_ignore_ascii_case("wsl$")
+        }) {
+            return Ok(None);
+        }
+        if path.to_str().is_none() || displayed.chars().any(char::is_control) {
+            return Err("WSL paths must be Unicode and contain no control characters");
+        }
+        let distribution = components
+            .next()
+            .filter(|name| !matches!(*name, "" | "." | ".."))
+            .ok_or("a WSL path must name a distribution")?;
+        let components: Vec<_> = components.filter(|part| !part.is_empty()).collect();
+        if components.is_empty() {
+            return Err("a WSL path must name a directory below the distribution root");
+        }
+        if components.iter().any(|part| matches!(*part, "." | "..")) {
+            return Err("WSL paths must not contain `.` or `..` components");
+        }
+        Ok(Some(Self {
+            distribution: distribution.to_owned(),
+            guest_path: format!("/{}", components.join("/")),
+        }))
+    }
+}
+
+impl std::fmt::Display for WslDirectory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            r"\\wsl.localhost\{}{}",
+            self.distribution,
+            self.guest_path.replace('/', "\\"),
+        )
+    }
+}
 
 /// Expand a leading `~` or `~/` in a user-supplied path to the home directory.
 ///
@@ -128,6 +210,70 @@ pub(crate) fn skill_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wsl_explorer_aliases_keep_guest_path_case_and_punctuation() {
+        let expected = WslDirectory {
+            distribution: "Ubuntu 24.04".to_string(),
+            guest_path: "/home/dev/Build Tools/Éxample".to_string(),
+        };
+        for path in [
+            r"\\wsl.localhost\Ubuntu 24.04\home\dev\Build Tools\Éxample",
+            r"\\WSL$\Ubuntu 24.04\home\dev\Build Tools\Éxample\",
+            r"\\?\UNC\wsl.localhost\Ubuntu 24.04\home\dev\Build Tools\Éxample",
+            "//wsl.localhost/Ubuntu 24.04/home/dev/Build Tools/Éxample",
+        ] {
+            assert_eq!(
+                WslDirectory::from_explorer_path(Path::new(path)),
+                Ok(Some(expected.clone())),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            expected.to_string(),
+            r"\\wsl.localhost\Ubuntu 24.04\home\dev\Build Tools\Éxample"
+        );
+    }
+
+    #[test]
+    fn invalid_wsl_roots_are_errors_not_native_paths() {
+        for path in [
+            r"\\wsl.localhost",
+            r"\\wsl$\",
+            r"\\wsl.localhost\Ubuntu",
+            r"\\wsl$\Ubuntu\",
+            r"\\wsl$\Ubuntu\home\..\etc",
+            r"\\wsl.localhost\Ubuntu\home\.\dev",
+            "\\\\wsl$\\Ubuntu\\embedded\0nul",
+        ] {
+            assert!(
+                WslDirectory::from_explorer_path(Path::new(path)).is_err(),
+                "{path}"
+            );
+        }
+        for path in [
+            r"C:\work",
+            r".\wsl.localhost\Ubuntu",
+            r"\\example.net\wsl$\Ubuntu\home",
+            r"\\wsl.localhost.example.net\Ubuntu\home",
+            r"\\?\C:\work",
+        ] {
+            assert_eq!(WslDirectory::from_explorer_path(Path::new(path)), Ok(None));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_non_unicode_guest_path_never_falls_back_to_native() {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+
+        let units: Vec<_> = r"\\wsl$\Ubuntu\home\"
+            .encode_utf16()
+            .chain([0xd800])
+            .collect();
+        let path = PathBuf::from(OsString::from_wide(&units));
+        assert!(WslDirectory::from_run_directory(&path).is_err());
+    }
 
     /// A relative override is refused, and no directory is resolved from it meanwhile, neither
     /// the platform's nor one under the working directory; an empty one is unset.

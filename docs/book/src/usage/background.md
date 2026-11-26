@@ -113,6 +113,13 @@ Every task ends in one of four states, and every one of them is reported: inside
 | `canceled` | Stopped on request, via `task_cancel`, `/task cancel`, or a second Ctrl+C |
 | `interrupted` | The session holding it went away: Meka exited or was signaled, or the client closed the session |
 
+While a stop request waits for the task's own result, the row says `stopping`. That is not an
+outcome: it is never delivered and never wakes a host. A stop is a request and not proof of an
+end: when no live handle here can be signaled the request is recorded for the row, and there it
+waits, until the work itself reports the stop back (`canceled`) or the session sweep retires a row
+whose owner is gone (`interrupted`). Either way the outcome says its teardown is unconfirmed,
+rather than carrying a result the work never produced.
+
 `interrupted` is the one that matters most. A task in flight when Meka lets go of its session cannot be resumed, so it is stopped and recorded as interrupted on the way out, and reported the next time something takes ownership of that session: a screen resume, a `meka serve` reattach, or an ACP `session/load`. A process that dies writes nothing; the *next* owner does the retiring then, because holding the session lock is what proves the previous owner is gone. Without this the agent would wait forever on a result it had usually already promised someone.
 
 Large output is written to a [scratchpad](../tools/scratchpad.md) entry and the delivered turn carries the beginning plus the entry name, so a long build log does not occupy the conversation permanently. A call that names a `scratchpad` entry has its whole output saved there instead, whatever its size, and the delivered turn says where it went rather than carrying it; a task stopped before its work came back writes nothing there. A report carries text alone, so an image the tool returned (an MCP screenshot, a fetched picture) is saved to a scratchpad entry of its own, which `image_render` shows, and the report names the entry where the image was.

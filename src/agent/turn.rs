@@ -1057,19 +1057,35 @@ impl Agent {
     ) -> prompt::WorldSnapshot {
         let catalog = self.tool_registry.tool_catalog();
         let skills = self.skills.current().await;
-        let (memories, memories_readable) = match prompt::memory_index_is_live(&catalog) {
-            false => (Vec::new(), true),
-            true => match self
-                .memories
-                .index(&crate::store::memory::MemoryView::for_session(
-                    self.project().as_deref(),
-                ))
-                .await
-            {
-                Ok(memories) => (memories, true),
+        let memory_view = crate::store::memory::MemoryView::for_session(self.project().as_deref());
+        let (memories, memory_state) = match prompt::memory_index_is_live(&catalog) {
+            false => (Vec::new(), prompt::MemoryIndexState::Read),
+            true => match self.memories.index(&memory_view).await {
+                Ok(memories) => {
+                    // The records, not the rendering: a body withheld for the live route set is
+                    // still the last text the store was known to hold, and a later turn whose
+                    // read fails has to be able to restore it if the target comes back.
+                    *self.last_known_memories.write().await = Some(prompt::KnownMemoryIndex {
+                        view: memory_view,
+                        memories: memories.clone(),
+                    });
+                    (memories, prompt::MemoryIndexState::Read)
+                }
                 Err(error) => {
                     tracing::warn!("failed to read the memory index: {error}");
-                    (Vec::new(), false)
+                    // A failed read is not evidence of deletion, and it is not evidence that a
+                    // different view's entries belong here either. The cache is used only for the
+                    // view it was read through, and rebuilt against the live route set, expiry
+                    // and budget below; with no such cache the snapshot says "unknown", never
+                    // "empty". Cached records are shown but marked last known, never fresh.
+                    let known = self.last_known_memories.read().await.clone();
+                    match known
+                        .as_ref()
+                        .and_then(|known| known.records_for(&memory_view))
+                    {
+                        Some(records) => (records.to_vec(), prompt::MemoryIndexState::LastKnown),
+                        None => (Vec::new(), prompt::MemoryIndexState::Unknown),
+                    }
                 }
             },
         };
@@ -1100,27 +1116,38 @@ impl Agent {
         } else {
             Vec::new()
         };
-        let mut current =
-            prompt::WorldSnapshot::new(&catalog, &skills, &memories, &mcp_instructions, &scheduled)
-                .with_inline_max_bytes(self.memories.inline_max_bytes())
-                .with_gate_authority(
-                    self.store.scheduler_memory(),
-                    &scheduled,
-                    permission,
-                    self.options.gate_tools.as_deref(),
-                )
-                .loading_by_search(
-                    self.tool_registry.deferred_tool_delivery()
-                        == crate::provider::DeferredToolDelivery::Searched,
-                )
-                .with_project(self.project());
-        // A failed read is not evidence of deletion. Preserve what was known, including across a
-        // compaction that removes the messages carrying it.
-        if !memories_readable && let Some(previous) = self.last_rendered_world.read().await.as_ref()
-        {
-            current.carry_memories_from(previous);
-        }
-        current
+        // The targets this session is actually on, so a memory scoped to another one is listed
+        // but not inlined as a standing instruction here. The real tool catalog answers whether
+        // the route's tool is with the model at all and at what level: it is the set the model is
+        // shown, so it already applied the `[tools]` filters, the sub-agent and serve/worker
+        // grants, what this wire carries per profile and provider, and the operator's
+        // `[tools.tool_permissions]`, and a tool absent from it cannot be called at any level.
+        let shell = catalog
+            .iter()
+            .find(|(name, ..)| name == "shell_execute")
+            .map(|(_, _, required, _)| *required);
+        let active_scopes = self.cells.active_memory_scopes(shell, permission);
+        prompt::WorldSnapshot::new_scoped(
+            &catalog,
+            &skills,
+            &memories,
+            &active_scopes,
+            &mcp_instructions,
+            &scheduled,
+        )
+        .with_inline_max_bytes(self.memories.inline_max_bytes())
+        .with_memory_index_state(memory_state)
+        .with_gate_authority(
+            self.store.scheduler_memory(),
+            &scheduled,
+            permission,
+            self.options.gate_tools.as_deref(),
+        )
+        .loading_by_search(
+            self.tool_registry.deferred_tool_delivery()
+                == crate::provider::DeferredToolDelivery::Searched,
+        )
+        .with_project(self.project())
     }
 
     /// Use the same live capability and session-state rendering after compaction as at a turn
@@ -1639,8 +1666,11 @@ impl Agent {
         let current = self.read_world_snapshot(session_id, permission).await;
         let (world_state, world_state_rollback) = {
             let mut last = self.last_rendered_world.write().await;
-            let rendered = prompt::render_world_state(&current, last.as_ref());
-            let previous = last.replace(current);
+            // The tracked variant records what was actually communicated: a changed body the
+            // delta's entry budget cut never reached the window, and the next render's retraction
+            // claims must not treat it as though it did.
+            let (rendered, told) = prompt::render_world_state_tracked(&current, last.as_ref());
+            let previous = last.replace(told);
             drop(last);
             (rendered, previous)
         };

@@ -668,6 +668,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "inbox_items_name_their_schedule",
         step: Step::Rust(inbox_items_name_their_schedule),
     },
+    Migration {
+        name: "memories_carry_scope",
+        step: Step::Rust(memories_carry_scope),
+    },
 ];
 
 /// `inbox_items.schedule_id`, `gate_output`, `occurrences`, `due_at` and `fired_at`, nullable, and
@@ -2782,7 +2786,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 7_471_482_584_958_421_530;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 8_007_475_826_351_669_054;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -5200,6 +5204,17 @@ fn memories_carry_load_references_source_verification_and_expiry(
     }
     if !table_has_column(transaction, "memories", "expires_at")? {
         transaction.execute_batch("ALTER TABLE memories ADD COLUMN expires_at TEXT")?;
+    }
+    Ok(())
+}
+
+/// Where a memory's fact applies: a Windows host, a particular WSL distro, or portable. The
+/// column is empty for portable, which is every memory written before this migration and the
+/// default for new ones.
+fn memories_carry_scope(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "memories", "scope")? {
+        transaction
+            .execute_batch("ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT ''")?;
     }
     Ok(())
 }

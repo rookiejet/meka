@@ -13,6 +13,10 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`file_search`](./search.md#file_search) | Read | Search file contents with regex |
 | [`web_fetch`](./web.md#web_fetch) | Read | Fetch a web page as markdown |
 | [`shell_execute`](./shell.md#shell_execute) | Read | Run a shell command (see the note below) |
+| [`subshell_open`](./shell.md#subshell_open--subshell_execute--subshell_export--subshell_close) | Read | Pin a confined WSL scope on Windows |
+| [`subshell_execute`](./shell.md#subshell_open--subshell_execute--subshell_export--subshell_close) | Read | Run a confined command in an open WSL scope |
+| [`subshell_export`](./shell.md#subshell_open--subshell_execute--subshell_export--subshell_close) | Workspace | Copy files out of an open WSL scope |
+| [`subshell_close`](./shell.md#subshell_open--subshell_execute--subshell_export--subshell_close) | Read | Close an open WSL scope |
 | [`checklist_add`](../usage/checklist.md) | Read | Add items the turn has to finish |
 | [`checklist_edit`](../usage/checklist.md) | Read | Change one item by id |
 | [`checklist_read`](../usage/checklist.md) | Read | Read the checklist |

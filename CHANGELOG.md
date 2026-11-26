@@ -31,23 +31,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Append mode folds MCP tool progress reports onto the call's own row, as the screen does.
 - Append mode completes slash commands and their arguments on Tab, as the screen does.
 - Append rows print flush left: the gutter is dropped so the terminal's own selection copies what
-  is on the screen, and what the gutter said is kept as status lines in the stream — an act `•`,
-  an error `■`, a warning its `!`, a prompt `>`, a boundary its `→←` — each in its kind's color
+  is on the screen, and what the gutter said is kept as status lines in the stream (an act `•`,
+  an error `■`, a warning its `!`, a prompt `>`, a boundary its `→←`) each in its kind's color
   over the dim that marks the screen's own words. A tool call's result prints flush under its
   call's status line, a folded code line prints whole again, and a sent prompt's status line
   states the level and class its bar carried in color.
 - Three `opencode-go` backends, one per protocol, for OpenCode Go's subscription. An account that
-  names no `base_url` — `meka account add`'s empty answer — goes to the gateway's own URL.
+  names no `base_url` (`meka account add`'s empty answer) goes to the gateway's own URL.
 - OpenCode Go requests carry the required `x-opencode-session` header per conversation.
 - `meka account usage` reports an OpenCode Go subscription's dollar-budget windows.
 - FreeBSD: `shell_execute` at `read` and `workspace` runs in a jail `jailbrokerd` builds.
 - `[shell].jailbroker_socket` names the socket that daemon listens on.
+- Windows: `subshell_open`, `subshell_execute`, `subshell_export` and `subshell_close` run
+  confined commands in explicitly granted WSL 2 directories, one supervised scope per named
+  handle. Every command runs in a fresh shell the handle's grants confine, and `subshell_export`
+  copies files out of that scope into the session's write boundary, refusing everything the
+  scope would not have exposed to the shell itself.
+- Windows: `subshell_open` can pin a handle over a scratch workspace instead of a live
+  directory: a snapshot of an admitted source staged into a private Linux-native directory
+  under a quota, running at Linux speed. An export back over the staged source is refused
+  wherever the source changed since the snapshot, and it must name a fresh destination so an
+  existing staged file is never replaced; the workspace is deleted at close, so anything worth
+  keeping is exported first.
+- Windows: a workspace directory the runner can resolve is also a Windows-backed guest view of
+  the managed WSL target. The guest reads the kernel's own mount table to find the drive mount,
+  opens beneath it without crossing symlinks or filesystems, and checks a per-request identity
+  proof before the mount is trusted. A native directory that cannot name a drive-absolute path
+  keeps its native meaning alone.
+- Windows: `shell_execute` takes an optional `wsl` parameter that routes the command through the
+  managed WSL target as a one-shot confined call, a call-bound channel created and destroyed
+  within the call rather than a persistent endpoint. Raw `wsl.exe` in `shell_execute` keeps its
+  current behavior.
+- Windows: the WSL subshell tools are available to sub-agents under the parent's ceiling. A
+  sub-agent may narrow its level, directories, and network access, never widen them. The parent
+  sets the ceiling; the sub-agent's grants are a subset enforced by the target's admission
+  checks.
+- Memory facts record where they apply separately from where they were observed: `scope` names a
+  Windows host, a particular WSL distro, or is empty for portable. The
+  scope is emitted in exports only when set. Target-specific notes are searchable by target and
+  do not automatically become inline instructions in unrelated sessions.
+- Windows releases use an installed `meka-runner` or deploy a bundled copy on demand, without any
+  guest interpreter or prior setup.
 - Custom request headers on accounts and profiles, as `headers`: sent as written on every request
   to the model, a profile's entry overriding the account's under one name, and a `${VAR}` in a
   value resolved at send. Listings show the names alone, since a value may hold a secret.
 
 ### Changed
 
+- The managed WSL runner speaks protocol version 7: a command's start is authorized by a permit
+  exchange, every control frame names the operation it belongs to, snapshot staging and export
+  travel on runner-owned typed transfers behind a start gate before the sandbox forks a command,
+  and no raw command byte can be read as a teardown acknowledgement. A runner of another version
+  is refused at the first exchange with both versions named; install the matching Linux `meka`
+  binary under the configured runner path, or remove it so the bundled runner deploys.
+- WSL directory grants do not apply to native Windows tools.
+- `subshell_export` takes no `overwrite` option and writes to fresh destination names only: a
+  name that already exists is refused when the plan is made, before any temporary is created.
+- Exports publish only to local fixed NTFS and ReFS volumes. A DrvFS, network or unrecognized
+  destination is refused before the copy, since publication bound to the checked parent cannot be
+  promised there.
+- Export publication is bound to the destination that was checked: the parent is held against
+  replacement through the commit, and a file takes its name by a handle-relative no-replace move.
+  A publish stopped partway reports what landed and what did not.
+- A stopped WSL command reports what was observed: the guest reaped it, it never started, or its
+  end is unconfirmed. The guest's end is never inferred from the launcher's.
+- WSL transfers enforce declared per-file and total byte budgets as the manifest arrives, and the
+  documented ceilings for entries, depth and path length hold while the transfer runs.
+- A memory scope is matched exactly as stored: case and spacing are part of the target name, and a
+  scope no session can match applies nowhere.
+- **Breaking:** A stop request for a background task is recorded as intent and not reported as an
+  outcome: when no live runner here can be signaled, `DELETE /v1/tasks/{id}` answers `202` with a
+  `TaskStopAccepted` body and the row stays open until its work reports or the sweep retires it. A
+  task another process runs takes the recorded request from its own runner, and work that finished
+  just before the stop reached it keeps its result.
+- A memory-store read that fails does not render as an empty store. The last index read through
+  the same project view is rebuilt against the live routes, expiry and inline budget, and a view
+  with no such records says the state is unknown. A route that comes back during the outage
+  restores the cached body, and a bulk loss of standing rules is retracted in words even when the
+  ordinary update line is cut by its budget.
+- Releasing a session now waits, bounded, for its detached tasks before the session lock can move,
+  so a reopen or idle sweep cannot retire a row that a still-running previous owner is about to
+  finish. The screen's exit and resume paths keep the lock until that teardown is done.
+- A transfer whose runner exits nonzero, times out or overruns its diagnostic bound does not
+  drain queued frames through the visitor after the failure is known. A guest export holds every
+  destination as a private temporary until the response's done frame and a successful runner
+  exit, so a transfer that fails after some files arrived leaves no destination behind.
+- Scratch quota accounting and reaping work from the opened workspace descriptors rather than
+  their paths, and removing a workspace removes nested directories with the directory flag. A
+  staged workspace is deleted at close as the tool documents.
 - A response's unordered list items open with a dash (`–`), not the `•` an act's status rows wear,
   so a list's rows are never read as tool calls where both sit at column 0.
 
@@ -77,6 +148,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the paste markers that make one prompt of a run are visible.
 - Esc stops a running turn in the append renderer, as its working row promises and the screen's
   Esc does: until now the row named the key but only Ctrl+C stopped the turn.
+- A Windows workspace grant that is a drive root, or that contains Meka's private directories, is
+  refused before the guest can mount it, and a grant's canonical path decides overlap rather than
+  its spelling.
+- `subshell_close` waits for the guest namespace to end and reports an unconfirmed teardown,
+  an export stops when its handle closes, and scratch staging refuses hard links, records a
+  SHA-256 digest for each staged file, re-checks a copy back over the source, and refuses to adopt
+  a scratch root it cannot scan. A guest setup that outlives its lease is re-checked before it
+  runs.
+- `subshell_export` publishes each copy without clobbering: a copy is staged as a sealed temporary
+  whose identity, length and SHA-256 digest are rechecked at the commit, and an absent target
+  takes its name only while it is still absent, so a destination that appeared while the copies
+  were staged keeps its own bytes and nothing is replaced.
+- `subshell_open` refuses `workspace` mounts alongside `scratch`, whose snapshot is the only
+  directory a scratch handle mounts.
+- A stopped background task is `stopping` until its own result records how it ended, so a stop is
+  never presented as a tool result the work did not produce. An in-process cancel that finds no
+  live handle records the row as canceled with an unconfirmed teardown, and a `stopping` row left
+  by a dead process is retired as interrupted with the same wording. A caller that cannot know
+  whether another process owns the task, such as `meka task cancel` or the HTTP API, leaves the
+  row `stopping` for its owner or the sweep instead of writing a terminal status.
+- Memory scopes apply only in sessions that are on the named target, a scope name may use the
+  target's configured spelling including spaces, and `meka memory export` refuses a stored scope
+  that a later import would reject. A note whose target stops being reachable leaves force at once,
+  and its return is announced once, so a body is never carried as a standing rule where it does
+  not apply.
+- A Windows release build's managed-WSL payloads are checked as ELF64 little-endian x86-64
+  executables: a non-zero entry must lie in a `PT_LOAD`, every `PT_LOAD` keeps its file bytes
+  within its memory bytes and names a power-of-two alignment congruent with its file offset, the
+  program header stride is Linux's exact 56 bytes, and the table, not just each entry, must fit
+  the image. Inputs are read through their size ceiling rather than after it, and a `PT_INTERP`
+  segment is refused, so a dynamically linked or malformed payload fails the build instead of the
+  deployment.
+- The memory index a turn reads and the listing `meka memory list` reads select each row's stored
+  `scope`, so a target-scoped note is never decoded as portable and carried as a standing
+  instruction on machines it does not apply to.
+- A WSL command stopped by a permission downgrade, a closed handle or the turn is ended through
+  its output collector: what it printed before the stop is kept, and the result says the guest
+  command's state is unknown; the local launcher's reap is not taken as the namespace's end. Both
+  `shell_execute`'s `wsl` route and `subshell_execute` share that supervision.
+- Closing a subshell handle shuts new admission before it cancels: a call that arrives after the
+  close is refused and never starts in a scope the close released, while one admitted first is
+  counted and the close waits for it. A scratch stage that produced no manifest is left to the
+  guest reaper, because the host has no evidence it owns the workspace it would remove.
+- `DELETE /v1/tasks/{id}`, `/task cancel` and `meka task cancel` record a stop request and signal
+  a live runner instead of writing a terminal row from a caller that cannot observe the teardown.
+  A row with no live owner stays `stopping` until its owner reports or the session sweep retires
+  it.
+- A sandboxed shell configured through a WSL route is admitted when the native sandbox is
+  unavailable, since a native sandbox cannot apply to the route.
 
 ## [0.96.2] - 2026-11-22
 

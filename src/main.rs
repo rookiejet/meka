@@ -57,6 +57,7 @@ mod skills;
 mod stats;
 mod store;
 mod streams;
+mod subshell;
 mod sync;
 mod text;
 mod tokens;
@@ -90,6 +91,32 @@ fn main() -> anyhow::Result<()> {
         let error = crate::sandbox::run_confined(writable, readable, scratch, command);
         eprintln!("meka confine: failed to run the command inside the sandbox: {error}");
         std::process::exit(126);
+    }
+    // The guest protocol opens no session or store. The inner verb must stay single-threaded
+    // until it applies Landlock, just like `confine`.
+    #[cfg(target_os = "linux")]
+    match &cli.command {
+        Some(cli::Command::SubshellRunner) => {
+            std::process::exit(crate::sandbox::wsl_guest::run());
+        }
+        Some(cli::Command::SubshellExec {
+            ready_descriptor,
+            start_descriptor,
+            writable,
+            read_only,
+            script,
+        }) => {
+            let error = crate::sandbox::wsl_guest::run_command(
+                *ready_descriptor,
+                *start_descriptor,
+                writable,
+                read_only,
+                script,
+            );
+            eprintln!("meka subshell-command: {error:#}");
+            std::process::exit(126);
+        }
+        _ => {}
     }
     // Before anything else reads the prompt: `-p -` is stdin's, and every later consumer
     // (`overrides()`, the skill prompt, the oneshot check) wants the words rather than the dash.
@@ -317,8 +344,10 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                     crate::cli::schedule::run(&store, action, cli_ref).await
                 }
                 #[cfg(target_os = "linux")]
-                cli::Command::Confine { .. } => {
-                    anyhow::bail!("`confine` is handled before startup")
+                cli::Command::Confine { .. }
+                | cli::Command::SubshellRunner
+                | cli::Command::SubshellExec { .. } => {
+                    anyhow::bail!("the sandbox command is handled before startup")
                 }
                 #[allow(
                     clippy::unreachable,

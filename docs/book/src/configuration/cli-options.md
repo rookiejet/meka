@@ -391,6 +391,14 @@ meka --permission read --additional-readable-directory ~/reference
 A path that does not resolve is reported as a warning and kept, as the workspace flag's is. The
 flag reaches the same hosts the workspace flag does, and is likewise never recorded on the session.
 
+**Windows:** Both additional directory flags accept `\\wsl.localhost\<distro>\...` and
+`\\wsl$\<distro>\...` as grants for the
+[`subshell_*` tools](../tools/shell.md#subshell_open--subshell_execute--subshell_export--subshell_close).
+These paths are never native Windows roots. They require a matching [`[shell.wsl]`](./config-file.md#shellwsl)
+target and apply to top-level interactive, one-shot and ACP sessions, not to sub-agents or
+`meka serve`. Pass the grants again on resume. To use the native Linux tools instead, run Meka
+inside WSL and pass Linux directory paths.
+
 ### `--sandbox-backend <BACKEND>`
 
 Pick the sandbox backend for this run: `landlock`, `bubblewrap` or `bubblewrap-landlock` on Linux,

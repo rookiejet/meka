@@ -10,6 +10,45 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 Meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## Unreleased
+
+**WSL paths no longer grant native Windows tool access.** In either additional directory flag,
+`\\wsl.localhost\<distro>\...` and `\\wsl$\<distro>\...` now grant access only to the
+[`subshell_*` tools](../tools/shell.md#subshell_open--subshell_execute--subshell_export--subshell_close)
+and require a configured `[shell.wsl]`
+target. Alternatively, run Meka inside the distribution and pass Linux directory paths.
+The default installed runner path is `/usr/local/bin/meka-runner`; Windows release builds can
+run their bundled copy when that file is absent. An explicit `runner` path is still accepted.
+**Breaking:** The runner speaks protocol version 7. A runner installed by an earlier Meka speaks an older
+version and is refused at the first exchange, with both versions named, rather than run under a
+protocol it does not follow; replace it with the matching Linux `meka` binary. Protocol 7 frames a
+command's stdout and stderr on the runner's output beside `ready`, `started`, `stopped` and `done`
+control frames, every frame naming its operation, and authorizes the start with one permit line the
+host commits under the session's live permission. It builds on protocol 6's runner-owned staging and
+export transfers, so a current runner and controller must be paired.
+
+**Exports are bound to the destination they checked.** `subshell_export` now publishes through the
+pinned destination directory with a no-replace rename and an identity-checked temporary, and
+admits only a local fixed NTFS or ReFS destination: a DrvFS, network-backed or unrecognized volume
+is refused before any copy. A stop or downgrade during an export leaves the files already
+published in place and the error says how many were published before it and remain.
+
+**Breaking:** `subshell_export` no longer replaces anything. An existing destination name is
+refused when the plan is made, an entry that appears during the copy is refused at the publish,
+and an `overwrite` argument is a migration error naming the removal. Export to a fresh name.
+
+**A stopped WSL command reports only what its end proved.** The result distinguishes a command
+the guest reaped (with the status it reported), a command that never started because no start
+permit was acknowledged, and one whose guest end is unconfirmed; a local launcher's exit no longer
+stands in for the guest's teardown.
+
+**Windows releases carry the WSL payload.** The `meka-windows-amd64.zip` archive bundles the Linux
+`meka-runner` and the `meka-wsl-loader` that deploys it, so a managed WSL target works on a guest
+with no installed runner. A Windows binary built from source bundles the pair only when both
+`MEKA_WSL_RUNNER` and `MEKA_WSL_LOADER` named them at build time; one built without them runs only
+the runner installed in the distribution. See
+[Installation](./installation.md#building-from-source).
+
 ## 0.95 to 0.96
 
 **A working directory whose path is not valid Unicode is refused.** That is a path holding bytes that are not UTF-8, or on Windows an unpaired surrogate; any other name, in any script, is unaffected. Meka used to run there and record a different directory, with the unreadable part replaced, which it then told the model and every client. Now the screen and a one-shot run do not start in such a directory or beneath one, `/cd`, an editor's `cwd` and the HTTP API's `working_directory` refuse one, and a `meka serve` started there refuses a session that names no directory. Rename the directory, or start Meka from one outside it. A session recorded there earlier names a directory that does not exist, and a resume opens it where Meka is launched, with the warning a removed directory gets.

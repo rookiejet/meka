@@ -337,6 +337,7 @@ pub(crate) async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()
             load: args.load,
             references,
             source,
+            scope: None,
             expires_at,
             verified: args.verified,
         })
@@ -660,6 +661,15 @@ pub(crate) async fn run_export(
                 && let Err(reason) = crate::entry::validate_entry_name(&memory.project, "project")
             {
                 return Some(format!("{} ({})", memory.name, reason));
+            }
+            // A stored scope no current rule can spell would export as a file the import reads
+            // back to a scope no session ever matches: a note that silently stops applying.
+            if let Err(reason) = memory::normalize_scope(&memory.scope) {
+                return Some(format!(
+                    "{} ({}; repair its scope with `meka memory write <name> --scope portable`, \
+                     or name an existing target)",
+                    memory.name, reason
+                ));
             }
             // The import holds a file's description to what a write door asks of one, so a stored
             // description that fails it (a row no door wrote) would be a file the import refuses,

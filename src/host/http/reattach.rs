@@ -321,6 +321,12 @@ pub(crate) async fn ensure_session_loaded_holding(
     // description, so re-attach cannot take a lock the same process holds) and reads without one.
     // `session-locked` (not `turn-in-flight`) for a held row: this is a cross-process file-lock
     // conflict, not an in-process turn concurrency issue.
+    //
+    // A release whose work outlived its grace is the same shape as the fork case: this process
+    // still holds the session's flock, over in the released-work registry. Adopt it rather than
+    // locking anew, which the flock would refuse; the work left behind stays where it is, and
+    // what rebuilds here must still signal, wait for and sweep around it.
+    let held_lock = held_lock.or_else(|| crate::background::take_released_lock(id));
     let (session_lock, summary) = match held_lock {
         Some(lock) => {
             let summary = state
@@ -455,7 +461,9 @@ pub(crate) async fn ensure_session_loaded_holding(
     if !still_exists {
         // Released like an evicted entry, so its registry leaves the MCP manager's list now rather
         // than at the manager's next fan-out.
-        new_entry.release(state.shared.mcp_manager.as_ref()).await;
+        new_entry
+            .release_and_wait(state.shared.mcp_manager.as_ref())
+            .await;
         return Err(session_not_found(id));
     }
     let mut sessions = state.sessions.write().await;

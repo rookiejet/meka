@@ -2217,8 +2217,26 @@ async fn build_subagent(
     // worker has no prompt gauge and no session entry watching it, and it never switches, so
     // nothing outside needs the handle. The write fence and the shell sandbox are both built from
     // `roots` by `register_core_tools`, so a bounded worker's boundary is what these cells say.
+    // A worker that stated a scope of its own holds different directories from its parent, so it
+    // may not keep the parent's path-addressed targets; a bare worker holds the parent's handles.
+    // A spec whose scope cannot be read withholds them too.
+    let inherits_targets = matches!(spec.stated_scope(), Ok(None));
     let sub_cells = crate::session::SessionCells {
         permission: sub_shared_perm.clone(),
+        // Guest targets are addressed by path, and no target-qualified grant exists, so a
+        // worker with a scope of its own would reach a directory that scope withheld if it
+        // inherited them. A bare worker holds exactly its parent's directories and may use what
+        // its parent may use.
+        #[cfg(windows)]
+        wsl: if inherits_targets {
+            params.cells.wsl.clone()
+        } else {
+            None
+        },
+        // Carried with the target, not with the directories a worker was handed: the target's
+        // grants are the ones `request` proves, and a worker holding the target holds them.
+        #[cfg(windows)]
+        wsl_needs_workspace: inherits_targets && params.cells.wsl_needs_workspace,
         cwd: workspace.cwd,
         roots: workspace.roots,
         read_only_roots: workspace.read_only_roots,
@@ -3535,6 +3553,7 @@ mod tests {
             frontend: Arc::clone(&recorder) as Arc<dyn crate::frontend::Frontend>,
             cancellation: CancellationToken::new(),
             task_id: Some("7f3a1c22-0000-4000-8000-000000000000".to_string()),
+            teardown: None,
         };
 
         let spawn = spawn_tool_for(params.clone(), Arc::clone(&provider));
@@ -7877,6 +7896,7 @@ mod tests {
             frontend: Arc::new(crate::frontend::SilentFrontend),
             cancellation: CancellationToken::new(),
             task_id: None,
+            teardown: None,
         };
 
         let spawning_prompt = Uuid::new_v4();

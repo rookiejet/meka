@@ -14127,10 +14127,11 @@ fn webhook_payloads_carry_no_message_content() {
 }
 
 /// The real cancel path, which the unknown-id and empty-list tests never reach: resolving an
-/// 8-character prefix, recording the cancellation *before* signaling, and signaling through the
+/// 8-character prefix, recording the stop request *before* signaling, and signaling through the
 /// `BackgroundTasks` handle hoisted onto `SessionEntry`. That hoist is what lets the endpoint
 /// answer while a turn holds the runtime mutex, and if it ever captured a different registry than
-/// the agent dispatches through, this endpoint would report 204 over a task that kept running.
+/// the agent dispatches through, the row would stay `stopping` because nothing here would hear the
+/// work report.
 #[test]
 fn canceling_a_running_background_task_stops_it() {
     let script = serde_json::json!([
@@ -14180,21 +14181,41 @@ fn canceling_a_running_background_task_stops_it() {
         .expect("send");
     assert_eq!(cancel.status(), 204, "the full id names the task");
 
-    let after: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/tasks?session={id}"))
-        .send()
-        .expect("send")
-        .json()
-        .expect("parse");
-    let task = after["tasks"]
-        .as_array()
-        .expect("tasks")
-        .iter()
-        .find(|task| task["id"] == task_id.as_str())
-        .expect("the task must still be listed");
-    assert_eq!(
-        task["status"], "canceled",
-        "the cancellation must be recorded, not just signaled: {after}"
+    // The request is recorded before the signal: the row is `stopping`, not `canceled`, until the
+    // work this process signaled reports how it ended. Nothing the endpoint writes may stand in
+    // for that report.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let task = loop {
+        let after: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/tasks?session={id}"))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        let task = after["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .find(|task| task["id"] == task_id.as_str())
+            .expect("the task must still be listed")
+            .clone();
+        if task["status"] == "canceled" {
+            break task;
+        }
+        assert!(
+            matches!(task["status"].as_str(), Some("stopping" | "running")),
+            "a stop request is not an outcome: {after}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the task did not report: {after}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let outcome = task["outcome"].as_str().unwrap_or_default();
+    assert!(
+        outcome.contains("local teardown is confirmed"),
+        "the signaled work must have reported its own end: {task}"
     );
 }
 
@@ -14391,6 +14412,28 @@ fn an_outcome_rides_its_turn_after_the_client_hangs_up() {
             .expect("parse");
         session["turn_in_flight"] == false
     });
+    // The stop records its intent, and the work's own end is what writes the outcome a claim
+    // reads, so the dance below runs only once the canceled outcome is actually waiting to ride;
+    // sent sooner, the turn's opening claim races the kill that delivers it.
+    support::wait_until(
+        "the canceled outcome to be waiting to ride",
+        Duration::from_secs(30),
+        || {
+            let tasks: serde_json::Value = harness
+                .request(reqwest::Method::GET, &format!("/v1/tasks?session={id}"))
+                .send()
+                .expect("send")
+                .json()
+                .expect("parse");
+            tasks["tasks"].as_array().is_some_and(|tasks| {
+                tasks.iter().any(|task| {
+                    task["id"] == task_id
+                        && task["status"] == "canceled"
+                        && task.get("delivered_at").is_none()
+                })
+            })
+        },
+    );
 
     // The feeds replay the first turn, so what is waited for is another turn's.
     let first_turn = harness.newest_turn(&id, 1);

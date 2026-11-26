@@ -59,6 +59,40 @@ cd meka
 cargo build --release
 ```
 
+Windows release builds bundle two Linux executables — the runner, and the `meka-wsl-loader` that
+deploys it — so [managed WSL](../tools/shell.md#subshell_open--subshell_execute--subshell_export--subshell_close)
+works on a guest with no runner installed. Both are built from the same tree and speak runner
+protocol 5. A Windows build from source carries them only when
+**both** `MEKA_WSL_RUNNER` and `MEKA_WSL_LOADER` are set, each naming a Linux x86-64 ELF executable.
+A statically linked musl build — a static-pie executable without an `INTERP` program header naming
+a loader the guest may not have — is the supported shape. Build the pair for x86-64 Linux first —
+with `musl-tools` and the `x86_64-unknown-linux-musl` target installed — on the distribution, in a
+container, or in CI:
+
+```bash
+cargo build --release --target x86_64-unknown-linux-musl   # meka and meka-wsl-loader
+```
+
+Then build Meka on Windows with both variables naming those files:
+
+```powershell
+$env:MEKA_WSL_RUNNER = 'C:\payload\meka'
+$env:MEKA_WSL_LOADER = 'C:\payload\meka-wsl-loader'
+cargo build --release
+```
+
+The loader may be at most 16 MiB and the runner at most 128 MiB; each input is read through that
+ceiling, and the build refuses one variable without the other. It also refuses a file that is not a
+64-bit little-endian x86-64 ELF executable of type `ET_EXEC` or `ET_DYN`: the header and every
+program header must fit the image, the program-header stride must be Linux's exact 56 bytes, at
+least one `PT_LOAD` must have memory bytes, every load segment's file bytes must fit its memory
+bytes and a power-of-two alignment congruent with its file offset, a non-zero entry point must lie
+inside a load segment, and a `PT_INTERP` segment is refused. That is a format and contract check,
+not proof that the payload runs on a particular kernel or distribution: build it from a trusted
+toolchain. Both are embedded at build time, not read from the environment at runtime. A Windows
+build without them refuses managed WSL deployment: it runs only a runner already installed in the
+distribution, and a guest without one is told this build has none to deploy.
+
 The binary will be at `target/release/meka`. Copy it somewhere on your `$PATH`:
 
 ```bash

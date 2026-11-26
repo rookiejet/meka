@@ -194,6 +194,7 @@ impl crate::schedule::GateTools for GateToolset {
             frontend: std::sync::Arc::new(crate::frontend::SilentFrontend),
             cancellation: cancellation.clone(),
             task_id: None,
+            teardown: None,
         };
         let output = match tokio::time::timeout(timeout, tool.execute(arguments, context)).await {
             Ok(Ok(output)) => output,

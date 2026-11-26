@@ -2270,25 +2270,46 @@ impl AppendState {
             self.reply("No active session yet.");
             return;
         };
-        let cancelled =
-            match crate::cli::background::cancel(&self.launch.store, session_id, id.as_deref())
-                .await
-            {
-                Ok(cancelled) => cancelled,
-                Err(error) => {
-                    self.reply(error.to_string());
-                    return;
-                }
-            };
-        if cancelled.is_empty() {
+        // The one stop path, shared with the screen's `/task cancel`: the live owner is claimed
+        // and signaled before the request is recorded, and a task with no live runner here is
+        // recorded, never claimed as stopped.
+        let tasks = self.launch.agent.get().background_tasks();
+        let reports = match crate::background::stop_by_prefix(
+            &tasks,
+            &self.launch.store,
+            session_id,
+            id.as_deref(),
+            crate::store::background::StopReason::UserRequest,
+        )
+        .await
+        {
+            Ok(reports) => reports,
+            Err(error) => {
+                self.reply(error.to_string());
+                return;
+            }
+        };
+        let mut asked = 0;
+        let mut unconfirmed = 0;
+        for (_, report) in &reports {
+            match report {
+                crate::background::StopReport::AlreadyEnded => {}
+                crate::background::StopReport::NotSignaled { .. } => unconfirmed += 1,
+                crate::background::StopReport::Signaled { .. } => asked += 1,
+            }
+        }
+        if asked == 0 && unconfirmed == 0 {
             self.reply("No running background tasks.");
             return;
         }
-        let tasks = self.launch.agent.get().background_tasks();
-        for task_id in &cancelled {
-            tasks.cancel(task_id).await;
+        let mut note = format!("Canceling {asked} background task(s).");
+        if unconfirmed > 0 {
+            note.push_str(&format!(
+                " {unconfirmed} had no live runner here, so their stops are recorded but \
+                 unconfirmed and their rows stay open."
+            ));
         }
-        self.note(format!("Canceling {} background task(s).", cancelled.len()));
+        self.note(note);
     }
 
     /// A listing, cut like the screen's panels and standing in place of one.

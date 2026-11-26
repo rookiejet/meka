@@ -3,7 +3,8 @@
 //!
 //! Memories are rows in the `memories` table of the store (`MEKA_DATA_DIR`), one per note,
 //! carrying a required one-line `description` and an optional body, priority, tag set, load
-//! policy, references, source, verification stamp and expiry. A memory is in one of two tiers:
+//! policy, references, source, target scope, verification stamp and expiry. A memory is in one of
+//! two tiers:
 //! the global tier, which every session sees, or a project's, which the sessions on that project
 //! see beside the global ones. Neither tier is bound to a session or a directory: a project is a
 //! row the operator adds with `meka project add` and a session opens by name, and the motivating
@@ -47,6 +48,11 @@ pub(crate) struct Memory {
     /// The project whose tier the memory is in; empty for the global tier.
     pub(crate) project: String,
     pub(crate) description: String,
+    /// Where the fact applies, separate from where it was observed: a Windows host, a particular
+    /// WSL distro, or `portable` across targets. Empty means portable.
+    /// Target-specific notes are searchable by target and do not automatically become inline
+    /// instructions in unrelated sessions.
+    pub(crate) scope: String,
     /// How important the note is: where it sorts in the index and how heavily search weighs it.
     /// Not whether it is in context; that is [`Self::load`].
     pub(crate) priority: u8,
@@ -374,6 +380,95 @@ pub(crate) fn normalize_source(source: &str) -> Result<String, String> {
     Ok(source)
 }
 
+/// The one scope that holds on every target. Stored as the empty string, which is also what an
+/// absent `scope` in an export means and what every memory written before the field reads as.
+pub(crate) const SCOPE_PORTABLE: &str = "portable";
+
+/// The scope of a fact that holds on the Windows host.
+pub(crate) const SCOPE_WINDOWS: &str = "windows";
+
+/// Longest the name after a `wsl:` prefix may be, sized for a distribution name. Past this it is
+/// a sentence, not a key.
+pub(crate) const MAX_SCOPE_NAME_CHARS: usize = 64;
+
+/// Validate a scope on its way to the store, normalizing the one spelling that is a synonym.
+///
+/// The vocabulary is closed and small: `""` (portable, the fact holds on every target),
+/// `portable`, which normalizes to `""` so a store holds one spelling of every fact, `windows`
+/// for the host, and `wsl:<distro>` for one WSL distribution. A name is 1 to
+/// [`MAX_SCOPE_NAME_CHARS`] characters, trimmed, without control
+/// characters, quotes, slashes or backslashes, and not starting with `-`: the same shape a target
+/// name may take, so every configured target can be spelled rather than only the ones that happen
+/// to look like identifiers. A WSL distribution named `Ubuntu 22.04` is a target like any other.
+///
+/// A scope is compared byte for byte against the target keys a session reports (see
+/// [`scope_applies`]), so a scope naming a target no session can be on would be a note listed but
+/// never inlined: a silent outcome. Refusing it here is what turns that into a message, the same
+/// way [`validate_tag`] refuses a label the histogram would otherwise render wrongly.
+pub(crate) fn normalize_scope(raw: &str) -> Result<String, String> {
+    let scope = raw.trim();
+    if scope.is_empty() || scope == SCOPE_PORTABLE {
+        return Ok(String::new());
+    }
+    if scope == SCOPE_WINDOWS {
+        return Ok(scope.to_string());
+    }
+    let name = if let Some(name) = scope.strip_prefix("wsl:") {
+        name
+    } else {
+        return Err(format!(
+            "unknown scope '{}'; use 'portable' (or \"\"), 'windows' or 'wsl:<distro>'",
+            crate::text::sanitize_text(scope)
+        ));
+    };
+    if name.is_empty()
+        || name != name.trim()
+        || name.starts_with('-')
+        || name.chars().count() > MAX_SCOPE_NAME_CHARS
+        || name
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '"' | '/' | '\\'))
+    {
+        return Err(format!(
+            "scope '{}' needs a name after its prefix of 1 to {MAX_SCOPE_NAME_CHARS} characters, \
+             trimmed, without control characters, quotes, slashes or backslashes, and not starting \
+             with '-'",
+            crate::text::sanitize_text(scope)
+        ));
+    }
+    Ok(scope.to_string())
+}
+
+/// Whether a memory with this scope applies to a session holding `active` target keys.
+///
+/// The empty scope is portable and applies everywhere; a target-specific one applies only where
+/// the session is actually on that target. Deliberately a question about the *session's* targets
+/// rather than about where the fact was observed: a note can be written on Windows about a WSL
+/// distribution, and it belongs to that distribution.
+///
+/// The comparison is the raw stored key against the raw route keys a session reports, byte for
+/// byte. A stored spelling [`normalize_scope`] would rewrite or refuse is never applicable:
+/// normalizing it here would turn a key no route can hold into one that does, and an invalid
+/// scope must not become a target or portable by being read. Byte comparison is also what lets a
+/// target name with repeated internal spaces match, since no display sanitization (which
+/// collapses those runs) sits between the two keys.
+///
+/// This decides inline rendering alone. A memory of another target is still listed by
+/// description, because the description is a fact worth having in the index and
+/// `memory_search` reaches every scope; what a scope withholds is the body, which for an
+/// `inline` memory is an instruction the model would otherwise follow in the wrong place.
+pub(crate) fn scope_applies(scope: &str, active: &[String]) -> bool {
+    if scope.is_empty() {
+        return true;
+    }
+    // A noncanonical stored spelling (an untrimmed key, the synonym `portable`, anything the
+    // write doors refuse) is left unapplied rather than normalized into one that does.
+    if normalize_scope(scope).ok().as_deref() != Some(scope) {
+        return false;
+    }
+    active.iter().any(|key| key == scope)
+}
+
 /// Parse the instant a memory stops applying: an RFC 3339 timestamp, or a `YYYY-MM-DD` date
 /// meaning the whole of that day in local time.
 ///
@@ -617,6 +712,9 @@ pub(crate) struct MemoryFrontmatter {
     /// The project the memory belongs to, emitted only for a project memory, so a file without the
     /// key is a global memory and an export that never carried the key reads back unchanged.
     pub(crate) project: Option<String>,
+    /// Where the fact applies, emitted only when set: a Windows host or a particular WSL distro.
+    /// `portable` is the default and is not emitted.
+    pub(crate) scope: Option<String>,
     pub(crate) priority: u8,
     pub(crate) load: Load,
     /// The `created:` value as it will appear in the file, RFC 3339.
@@ -646,7 +744,8 @@ pub(crate) struct MemoryFrontmatter {
 /// JSON because the point of an export is to be read and edited by a person, and to be greppable
 /// in a directory the way the rest of a notes tree is.
 ///
-/// `project` is emitted only for a project memory, `priority` only when it differs from
+/// `project` is emitted only for a project memory, `scope` only for a target-specific one,
+/// `priority` only when it differs from
 /// [`DEFAULT_PRIORITY`], `load` only when it is not the default, `created` only when known,
 /// `verified` only when it differs from `created`, `expires`, `source`, `references` and `tags`
 /// only when set, so the common case stays a two-line header. The same text is what a write or a
@@ -666,6 +765,9 @@ pub(crate) fn render_memory(frontmatter: &MemoryFrontmatter, body: &str) -> Stri
     );
     if let Some(project) = &frontmatter.project {
         front.insert("project".into(), project.as_str().into());
+    }
+    if let Some(scope) = &frontmatter.scope {
+        front.insert("scope".into(), scope.as_str().into());
     }
     if frontmatter.priority != DEFAULT_PRIORITY {
         front.insert("priority".into(), u64::from(frontmatter.priority).into());
@@ -760,6 +862,7 @@ pub(crate) fn export_memory(memory: &Memory) -> String {
         &MemoryFrontmatter {
             description: memory.description.clone(),
             project: (!memory.project.is_empty()).then(|| memory.project.clone()),
+            scope: (!memory.scope.is_empty()).then(|| memory.scope.clone()),
             priority: memory.priority,
             load: memory.load,
             created: Some(render_stamp(memory.created_at)),
@@ -810,6 +913,10 @@ pub(crate) struct ImportedMemory {
     /// Empty for the global tier.
     pub(crate) project: String,
     pub(crate) description: String,
+    /// Where the fact applies, normalized as [`normalize_scope`] normalizes it: empty for
+    /// portable, `windows` or `wsl:<distro>`. Restored as the file states it, so
+    /// an import keeps the target a note belongs to.
+    pub(crate) scope: String,
     pub(crate) priority: u8,
     pub(crate) load: Load,
     pub(crate) created_at: SystemTime,
@@ -850,6 +957,7 @@ pub(crate) fn memory_from_export(
     struct Frontmatter {
         description: String,
         project: Option<String>,
+        scope: Option<String>,
         priority: Option<u8>,
         load: Option<Load>,
         created: Option<String>,
@@ -874,6 +982,13 @@ pub(crate) fn memory_from_export(
         }
         None => String::new(),
     };
+    // Normalized at the door the write tool normalizes at, so `portable` and `""` are one stored
+    // spelling and a scope naming no target a session can be on is refused by name rather than
+    // stored as a note that is never inlined.
+    let scope = match header.scope {
+        Some(scope) => normalize_scope(&scope)?,
+        None => String::new(),
+    };
     let stamp = |field: &str, raw: Option<String>| -> Result<Option<SystemTime>, String> {
         raw.map(|raw| parse_rfc3339(&raw).map_err(|reason| format!("{field} {reason}")))
             .transpose()
@@ -885,6 +1000,7 @@ pub(crate) fn memory_from_export(
         name: name.to_string(),
         project,
         description,
+        scope,
         priority: parse_priority(header.priority.map(i64::from), name),
         load: header.load.unwrap_or_default(),
         created_at,
@@ -1066,6 +1182,7 @@ mod tests {
             name: "note".to_string(),
             project: String::new(),
             description: "a description: with a colon".to_string(),
+            scope: String::new(),
             priority: 2,
             load: Load::Search,
             references: vec![
@@ -1139,6 +1256,7 @@ mod tests {
             name: "note".to_string(),
             project: String::new(),
             description: "plain".to_string(),
+            scope: String::new(),
             priority: DEFAULT_PRIORITY,
             load: Load::default(),
             references: Vec::new(),
@@ -1179,6 +1297,7 @@ mod tests {
             name: "note".to_string(),
             project: String::new(),
             description: "plain".to_string(),
+            scope: String::new(),
             priority: DEFAULT_PRIORITY,
             load: Load::default(),
             references: Vec::new(),
@@ -1320,6 +1439,7 @@ mod tests {
             name: "deploy-host".to_string(),
             project: "ops".to_string(),
             description: "Where deploys run: the short version".to_string(),
+            scope: String::new(),
             priority: 2,
             load: Load::Inline,
             created_at: stamp("2026-01-02T03:04:05.123456789+00:00"),
@@ -1401,6 +1521,129 @@ mod tests {
         assert_eq!(normalize_source("").expect("a clear"), "");
         assert!(normalize_source(&"s".repeat(MAX_SOURCE_CHARS)).is_ok());
         assert!(normalize_source(&"s".repeat(MAX_SOURCE_CHARS + 1)).is_err());
+    }
+
+    /// The scope vocabulary: portable is stored empty, so a store holds one spelling of every
+    /// fact and a portable export keeps its short header; the two target forms are kept as
+    /// written; and anything else is refused with the spellings that would have been accepted.
+    #[test]
+    fn a_scope_is_validated_and_portable_is_stored_as_empty() {
+        for (raw, kept) in [
+            ("", ""),
+            ("  ", ""),
+            ("portable", ""),
+            (" portable ", ""),
+            ("windows", "windows"),
+            ("wsl:voidlinux-glibc", "wsl:voidlinux-glibc"),
+            ("wsl:a.b_c-1", "wsl:a.b_c-1"),
+            // A target name is the configuration's, not an identifier subset of it: a distro may
+            // be registered as `Ubuntu 22.04`, and its notes must be spellable.
+            ("wsl:Ubuntu 22.04", "wsl:Ubuntu 22.04"),
+            ("wsl:Ubuntu  22.04", "wsl:Ubuntu  22.04"),
+        ] {
+            assert_eq!(normalize_scope(raw), Ok(kept.to_string()), "{raw:?}");
+        }
+        assert!(normalize_scope(&format!("wsl:{}", "d".repeat(MAX_SCOPE_NAME_CHARS))).is_ok());
+        for bad in [
+            "wsl:",
+            &format!("wsl:{}", "d".repeat(MAX_SCOPE_NAME_CHARS + 1)),
+            "wsl:has\\slash",
+            "wsl:has\"quote",
+            "wsl:-leading",
+            "wsl: leading",
+            "wsl:na\u{7f}me",
+            "Windows",
+            "portable-windows",
+            "linux",
+            "windows:",
+        ] {
+            assert!(normalize_scope(bad).is_err(), "{bad:?} must be refused");
+        }
+        // The refusal is text the model reads, so it names what would have been accepted.
+        let refusal = normalize_scope("linux").expect_err("unknown");
+        assert!(refusal.contains("unknown scope 'linux'"), "{refusal}");
+        assert!(
+            refusal.contains("'portable'") && refusal.contains("'wsl:<distro>'"),
+            "{refusal}"
+        );
+        let refusal = normalize_scope("wsl:has\\slash").expect_err("a bad name");
+        assert!(
+            refusal.contains("quotes, slashes") && refusal.contains("1 to"),
+            "{refusal}"
+        );
+
+        // Portable is every target's fact; a target-specific one applies only where the session
+        // is actually on that target.
+        let active = ["windows".to_string(), "wsl:build".to_string()];
+        assert!(scope_applies("", &active));
+        assert!(scope_applies("windows", &active));
+        assert!(scope_applies("wsl:build", &active));
+        assert!(!scope_applies("wsl:voidlinux-glibc", &active));
+        assert!(!scope_applies("wsl:prod", &active));
+        assert!(!scope_applies("wsl:prod", &[]));
+    }
+
+    /// Applicability is the raw stored key against the raw route keys: a valid target name with
+    /// repeated internal spaces matches exactly, and a stored spelling the write doors would
+    /// rewrite or refuse never becomes applicable by being normalized into one that is.
+    #[test]
+    fn a_scope_applies_only_by_exact_raw_key() {
+        let active = ["wsl:Ubuntu  22.04".to_string(), "wsl:build".to_string()];
+        assert!(scope_applies("wsl:Ubuntu  22.04", &active));
+        assert!(
+            !scope_applies("wsl:Ubuntu 22.04", &active),
+            "the collapsed spelling names a different key"
+        );
+        assert!(!scope_applies("wsl:build ", &active), "an untrimmed key");
+        assert!(!scope_applies(" wsl:build", &active), "an untrimmed key");
+        assert!(!scope_applies("wsl:build\n", &active), "an untrimmed key");
+        assert!(
+            !scope_applies("wsl:BUILD", &active),
+            "keys compare case-sensitively"
+        );
+        // The synonym and invalid spellings stay unapplied: not into a valid target, and not
+        // into portable either, whatever the session holds.
+        assert!(!scope_applies("portable", &active));
+        assert!(!scope_applies("portable", &[]));
+        assert!(!scope_applies("wsl:build\n", &[]));
+    }
+
+    /// An export carries a target scope and the import reads it back; a portable memory writes no
+    /// such key, so the common header did not grow a field; and a scope no session can match is
+    /// refused by the import at the same door the write tool refuses it at.
+    #[test]
+    fn an_export_carries_a_scope_and_the_import_reads_it_back() {
+        let scoped = Memory {
+            scope: "wsl:build-host".to_string(),
+            ..plain_memory()
+        };
+        let file = export_memory(&scoped);
+        let (frontmatter, _) = crate::entry::split_frontmatter(&file).expect("frontmatter");
+        let parsed: yaml_serde::Value = yaml_serde::from_str(frontmatter).expect("yaml");
+        assert_eq!(parsed["scope"].as_str(), Some("wsl:build-host"), "{file}");
+        assert_eq!(reimported(&scoped).scope, "wsl:build-host");
+
+        let portable = plain_memory();
+        let file = export_memory(&portable);
+        assert!(!file.contains("scope:"), "{file}");
+        assert_eq!(reimported(&portable).scope, "");
+
+        // A hand-written file may spell the default out; the import normalizes it away.
+        let spelled = "---\ndescription: plain\nscope: portable\n---\n\n\n";
+        let (frontmatter, body) = split_memory_file(spelled).expect("framed");
+        let frontmatter: yaml_serde::Value = yaml_serde::from_str(frontmatter).expect("yaml");
+        assert_eq!(
+            memory_from_export("note", frontmatter, body)
+                .expect("imports")
+                .scope,
+            ""
+        );
+
+        let refused = "---\ndescription: plain\nscope: linux\n---\n\n\n";
+        let (frontmatter, body) = split_memory_file(refused).expect("framed");
+        let frontmatter: yaml_serde::Value = yaml_serde::from_str(frontmatter).expect("yaml");
+        let refusal = memory_from_export("note", frontmatter, body).expect_err("unknown scope");
+        assert!(refusal.contains("unknown scope 'linux'"), "{refusal}");
     }
 
     /// An expiry is a timestamp, or a date meaning the whole of that day: the memory holds
@@ -1491,6 +1734,7 @@ mod tests {
             name: "note".to_string(),
             project: String::new(),
             description: "plain".to_string(),
+            scope: String::new(),
             priority: DEFAULT_PRIORITY,
             load: Load::default(),
             references: Vec::new(),
@@ -1551,6 +1795,7 @@ mod tests {
             name: "deploy-host".to_string(),
             project: "ops".to_string(),
             description: "Where deploys run".to_string(),
+            scope: String::new(),
             priority: 2,
             load: Load::Inline,
             references: vec!["runbook".to_string(), "https://example.com/x".to_string()],
@@ -1571,6 +1816,7 @@ mod tests {
             name: "deploy-host".to_string(),
             project: "ops".to_string(),
             description: "Where deploys run".to_string(),
+            scope: String::new(),
             priority: 2,
             load: Load::Inline,
             created_at: memory.created_at,

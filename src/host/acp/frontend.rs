@@ -1493,7 +1493,7 @@ pub(super) fn tool_kind_for(name: &str) -> ToolKind {
         "file_edit" | "file_write" | "skill_write" | "skill_edit" => ToolKind::Edit,
         "skill_delete" => ToolKind::Delete,
         "file_find" | "file_search" => ToolKind::Search,
-        "shell_execute" => ToolKind::Execute,
+        "shell_execute" | "subshell_execute" => ToolKind::Execute,
         "web_fetch" => ToolKind::Fetch,
         // The list tools plan rather than touch anything, so a client never opens its diff view
         // for them.

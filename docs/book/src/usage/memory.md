@@ -9,6 +9,7 @@ Without it, an agent's only state is its context window. When a long session com
 - Memories are rows in the `memories` table of the store (`~/.local/share/meka/meka.db`, or under `MEKA_DATA_DIR`), one row per memory.
 - The store is scoped to the **Meka instance**, not to a session or a directory. Everything sharing a `MEKA_DATA_DIR` shares one memory; pointing a deployment at its own data dir gives it its own. Within it, a memory is global or a [project](./projects.md)'s; see [Tiers](#tiers).
 - The per-turn context includes a bounded memory index, updated when it changes. A memory's `load` decides how it gets there: an `inline` body is rendered whole, within a budget every inline body shares, an `index` memory is listed by its description, and a `search` memory is reached by `memory_search` alone. Other bodies are read on demand with `memory_read`.
+- A turn that cannot read the store re-renders the last index read through the same project view, against the live targets, expiry and budget; with no such records it says the state is unknown rather than showing an empty store, and a memory is never reported deleted because a read failed.
 - The index is re-stated in full at the start of a session, after every compaction, and whenever it scrolls out of the context window. This is what makes memory survive compaction.
 - The agent is told to save durable preferences, constraints, decisions, and facts, to keep temporary task state in the scratchpad, and that current instructions and corrections take precedence over stored preferences.
 - Memories are available at every permission level except **none**; all five memory tools ask only for **read**. Writing a memory therefore needs no write authority over your files, and `workspace`'s boundary does not apply to it: the store belongs to Meka, not to your working tree.
@@ -33,6 +34,7 @@ A memory is in one of two tiers: **global**, which every session sees, or a **pr
 | `description` | One line used in the bounded index. Make it stand on its own. |
 | `priority` | `0`–`9`, default `5`: how important the note is, not whether it loads. See [Priority](#priority). |
 | `load` | How the memory reaches the context: `inline`, `index` (default) or `search`. See [Loading](#loading). |
+| `scope` | Which machine the note applies to: `""`/`portable` (every session), `windows` or `wsl:<distro>`. A target-specific body is inlined only in a session on that target. See [Scope](#scope). |
 | `tags` | Lowercase labels (`[a-z0-9-]`, at most 10) for grouping and filtering. |
 | `body` | Detail, loaded on demand by `memory_read`, or in context every turn when `load` is `inline`. |
 | `references` | What the memory depends on: memory names, paths, URLs, external ids. See [References and backlinks](#references-and-backlinks). |
@@ -53,7 +55,7 @@ The rule is enforced by the `INSERT ... ON CONFLICT DO UPDATE` statement itself,
 
 ### Omitting a field keeps what is there
 
-`memory_write`'s `body`, `tags`, `priority`, `load`, `references`, `source` and `expires` are all optional, and omitting any of them **keeps whatever the memory already had**. That makes a metadata-only update (a reworded description, say) a single call that cannot cost the note its contents, its labels, its rank, its dependencies or its deadline. To clear the body, the source or the expiry, pass `""`; to clear a list, pass `[]`. A blank in any other field is the field omitted.
+`memory_write`'s `body`, `tags`, `priority`, `load`, `scope`, `references`, `source` and `expires` are all optional, and omitting any of them **keeps whatever the memory already had**. That makes a metadata-only update (a reworded description, say) a single call that cannot cost the note its contents, its labels, its rank, its dependencies or its deadline. To clear the body, the source, the expiry or the scope, pass `""` (for the scope, `portable` says the same thing); to clear a list, pass `[]`. A blank in any other field is the field omitted.
 
 `PUT /v1/memories/{name}` and `meka memory add <name> --force` follow the same rule.
 
@@ -84,11 +86,36 @@ Because the agent picks a priority at write time and everything feels important 
 
 | Value | What the per-turn context carries |
 |---|---|
-| `inline` | The whole body, every turn. For a standing directive the body is the directive, and leaving it behind a tool call means the agent has to look the rule up before it can follow it. Inline bodies share one budget; see [The inline budget](#the-inline-budget). |
+| `inline` | The whole body, every turn. For a standing directive the body is the directive, and leaving it behind a tool call means the agent has to look the rule up before it can follow it. Inline bodies share one budget; see [The inline budget](#the-inline-budget). A body with a target [`scope`](#scope) is carried only in a session on that target; elsewhere the memory is listed by description. |
 | `index` | The description, as one line of the index. The default. |
 | `search` | Nothing. The memory is reached by `memory_search` alone: a runbook, a reference note, anything worth keeping that is not worth a line every turn. |
 
 The index ends with a count of the memories it lists nowhere, the search-only ones and the [expired](#expiry) ones, so the agent knows there is more than it can see. On upgrade from a release before `load`, every priority-0 memory becomes `inline` and everything else `index`, which is what the priority used to mean.
+
+## Scope
+
+`scope` says which machine a note applies to. It is independent of `load`: `load` says how a memory reaches the context, `scope` says where it is allowed to. The two meet at the inline band, where the body *is* an instruction, and a note about the build server's toolchain must not stand as a rule on a laptop with no build server.
+
+| Value | Applies in |
+|---|---|
+| `""` (portable, the default) | every session. |
+| `portable` | the same thing, spelled out; stored as `""`, so an export of a portable memory carries no `scope` key. |
+| `windows` | a session running the Windows build. |
+| `wsl:<distro>` | a session with that WSL target, e.g. `wsl:voidlinux-glibc`. |
+
+`<distro>` is the name the configuration uses: 1–64 characters, trimmed, with no
+control characters, quotes or slashes, and not starting with `-`. Spaces are allowed where the
+name has them, so a distro registered as `Ubuntu 22.04` is scoped `wsl:Ubuntu 22.04`. Anything else
+is refused where it is written, by `memory_write` and by `meka memory import`, with the spellings
+that would have been accepted: a scope no session can match would store a note that is listed
+forever and inlined never. `meka memory export` checks the same rule before it writes, so a stored
+scope that an older version accepted cannot be carried into a backup that a later import refuses.
+
+A session's active scopes come from the targets it can actually reach: `windows` on the Windows build and `wsl:<distro>` for a WSL target whose grants are selectable at the session's level. `shell_execute` must be admitted and its live requirement, including `[tools.tool_permissions]`, met at the session's level. Matching is exact against the name as stored, case and spacing included; the display form exists for reading alone. A stored scope no session could ever match applies nowhere and is never reinterpreted as portable or as some other target. A memory scoped to a target the session is not on is **still listed in the `[Memory]` index** by name, description, priority and tags, so the agent knows it exists and `memory_search` and `memory_read` reach it. What it loses is the inline body: it does not appear in the standing band, so its text is not in context as an instruction. A target that stops being reachable takes its notes out of force at the next turn and the change is announced once; when more notes leave at once than the update line can name, the announcement supersedes the earlier rule copies by target, so no copy stands in context unclaimed. When the target returns, the body is restored and that is announced too, or the note is said to be merely reachable again when the inline budget does not take its body. A portable memory behaves exactly as it always did.
+
+The [inline budget](#the-inline-budget) is counted over every inline body in force, whatever its scope. The store is shared, and which targets the next session is on is not known at write time, so the limit a write door enforces has to hold for every host.
+
+Scope is carried by an export and restored by an import, so a backup taken on one machine puts each note back on the machine it belongs to. It is not exposed by `meka memory add` or the HTTP API: those write portable memories and leave the scope of an existing memory untouched.
 
 ## The inline budget
 
@@ -287,7 +314,7 @@ On the screen, `/memory` is a picker of what is saved, by name and description, 
 
 ## Export and import
 
-`meka memory export` writes one `<name>.md` per memory: YAML frontmatter carrying `description`, `project` for a project memory, `priority` and `load` when they are not the defaults, `created`, `verified` when it differs from `created`, `expires`, `source`, `read_count`, `references` and `tags` when they are set, followed by the body. A project's memories go under a directory of the project's name, so two projects holding one name write two files; the global tier is at the root. Beside the files sits `export.toml`, carrying the snapshot's `format_version`. `--project <name>` exports one tier. That is the `grep`, git and backup answer now that memories live in the store rather than in files.
+`meka memory export` writes one `<name>.md` per memory: YAML frontmatter carrying `description`, `project` for a project memory, `priority` and `load` when they are not the defaults, `scope` when it is not portable, `created`, `verified` when it differs from `created`, `expires`, `source`, `read_count`, `references` and `tags` when they are set, followed by the body. A project's memories go under a directory of the project's name, so two projects holding one name write two files; the global tier is at the root. Beside the files sits `export.toml`, carrying the snapshot's `format_version`. `--project <name>` exports one tier. That is the `grep`, git and backup answer now that memories live in the store rather than in files.
 
 `read_count` is there because it is the one value a file cannot otherwise reconstruct. Descriptions, bodies and dates are all in the note; how often the agent has actually opened it is not, and a restored backup with every counter at zero would silently lose each memory's accumulated ranking weight.
 
@@ -303,7 +330,7 @@ What lands on disk is byte-exact: bodies, tags, priorities and recorded dates ar
 
 Descriptions are the one field normalized rather than preserved: every write door collapses a description to a single line before storing it, so what comes back is what was stored. A description that says nothing once control and format characters are left out, which no write door accepts, is one the import would refuse, so `meka memory export` refuses the whole run and names it rather than writing a snapshot that would not read back.
 
-An export reads back with any tool that understands YAML frontmatter, and `meka memory import <dir>` reads it back into a store: every file of the snapshot in one transaction, so nothing lands unless everything does. The project of each memory is read from its frontmatter and must exist, so `meka project add <name>` comes first on the other installation; `created`, `verified` and `read_count` are restored as written, which is what makes the import a restore rather than a copy. A memory the store already holds in the same tier is refused by name until `--force`, which overwrites it with the file; a name a global memory and a project memory would then share is refused outright, since no tier may hold the other's name; and the inline budget holds over the whole import as it holds over a write. The manifest is read first: a snapshot an older Meka wrote at another `format_version` is brought forward in one place, the migration module, or refused by version.
+An export reads back with any tool that understands YAML frontmatter, and `meka memory import <dir>` reads it back into a store: every file of the snapshot in one transaction, so nothing lands unless everything does. The project of each memory is read from its frontmatter and must exist, so `meka project add <name>` comes first on the other installation; `created`, `verified` and `read_count` are restored as written, which is what makes the import a restore rather than a copy, and so is `scope`, validated by the same rules `memory_write` applies: a file naming a scope no session can match is refused with the spellings that would have been accepted, rather than imported as a note that will never be inlined. A memory the store already holds in the same tier is refused by name until `--force`, which overwrites it with the file; a name a global memory and a project memory would then share is refused outright, since no tier may hold the other's name; and the inline budget holds over the whole import as it holds over a write. The manifest is read first: a snapshot an older Meka wrote at another `format_version` is brought forward in one place, the migration module, or refused by version.
 
 The store stays the one source of truth. An export is a snapshot nothing reads until you import it, and an import is a one-time act, the way a session archive's is; Meka never watches the directory.
 

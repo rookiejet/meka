@@ -977,6 +977,9 @@ pub(crate) struct WriteRequest {
     pub(crate) load: Option<crate::memory::Load>,
     pub(crate) references: Option<Vec<String>>,
     pub(crate) source: Option<String>,
+    /// Where the fact applies: `None` keeps the stored scope, `Some("")` clears it to portable,
+    /// anything else names a target.
+    pub(crate) scope: Option<String>,
     /// Outer `None` keeps the stored expiry; `Some(None)` clears it.
     pub(crate) expires_at: Option<Option<SystemTime>>,
     /// Whether this write verifies the fact holds, which is the one thing that moves
@@ -1024,6 +1027,7 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         name: row.get(0)?,
         project: row.get(13)?,
         description: row.get(1)?,
+        scope: row.get(14)?,
         tags: tags
             .split_whitespace()
             .map(keepable_tag)
@@ -1048,7 +1052,7 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
 /// a string or a number that would survive being put in the wrong slot.
 const MEMORY_COLUMNS: &str = "name, description, tags, priority, created_at, updated_at, \
                               read_count, body, load, reference_list, source, verified_at, \
-                              expires_at, project";
+                              expires_at, project, scope";
 
 /// The references a stored row holds, or none when the column is not the JSON array of one-line
 /// strings every write door stores.
@@ -1469,7 +1473,7 @@ impl MemoryStore {
                 let mut statement = connection.prepare(&format!(
                     "SELECT name, description, tags, priority, created_at, updated_at, read_count,
                             CASE WHEN load = ?1 THEN body ELSE NULL END,
-                            load, reference_list, source, verified_at, expires_at, project
+                            load, reference_list, source, verified_at, expires_at, project, scope
                      FROM memories
                      WHERE 1 {clause}
                      ORDER BY priority ASC, created_at DESC, name ASC"
@@ -1497,7 +1501,8 @@ impl MemoryStore {
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(&format!(
                     "SELECT name, description, tags, priority, created_at, updated_at, read_count,
-                            NULL, load, reference_list, source, verified_at, expires_at, project
+                            NULL, load, reference_list, source, verified_at, expires_at, project,
+                            scope
                      FROM memories
                      WHERE 1 {clause}
                      ORDER BY priority ASC, created_at DESC, name ASC"
@@ -1809,10 +1814,11 @@ impl MemoryStore {
                     // "clear it" and "not mentioned" and the flag tells them apart.
                     "INSERT INTO memories
                          (name, project, description, tags, body, priority, created_at,
-                          updated_at, load, reference_list, source, verified_at, expires_at)
+                          updated_at, load, reference_list, source, scope, verified_at, expires_at)
                      VALUES (?1, ?15, COALESCE(?2, ''), COALESCE(?3, ''), COALESCE(?4, ''),
                              COALESCE(?5, ?7), ?6, ?6,
-                             COALESCE(?8, ?9), COALESCE(?10, '[]'), COALESCE(?11, ''), ?6, ?12)
+                             COALESCE(?8, ?9), COALESCE(?10, '[]'), COALESCE(?11, ''),
+                             COALESCE(?16, ''), ?6, ?12)
                      ON CONFLICT(project, name) DO UPDATE SET
                          description    = COALESCE(?2, memories.description),
                          tags           = COALESCE(?3, memories.tags),
@@ -1822,6 +1828,7 @@ impl MemoryStore {
                          load           = COALESCE(?8, memories.load),
                          reference_list = COALESCE(?10, memories.reference_list),
                          source         = COALESCE(?11, memories.source),
+                         scope          = COALESCE(?16, memories.scope),
                          verified_at    = CASE WHEN ?14 THEN excluded.updated_at
                                                ELSE memories.verified_at END,
                          expires_at     = CASE WHEN ?13 THEN ?12 ELSE memories.expires_at END",
@@ -1844,6 +1851,7 @@ impl MemoryStore {
                         request.expires_at.is_some(),
                         request.verified,
                         tier.project,
+                        request.scope,
                     ],
                 )?;
                 if let Some(refusal) = inline_budget_refusal(
@@ -1890,9 +1898,9 @@ impl MemoryStore {
     /// The rules every write door applies are applied here, over the whole import and before the
     /// commit: a project the store does not have, a name the store holds in the same tier, which
     /// `force` alone overwrites, a name a global memory and a project memory would then share,
-    /// and the inline budget, measured as [`Self::write`] measures it. `created_at`, `verified_at`
-    /// and `read_count` are the file's, which is what makes an import a restore; `updated_at` is
-    /// now, since the row is written now.
+    /// and the inline budget, measured as [`Self::write`] measures it. `created_at`, `verified_at`,
+    /// `read_count` and the target `scope` are the file's, which is what makes an import a
+    /// restore; `updated_at` is now, since the row is written now.
     pub(crate) async fn import(
         &self,
         entries: Vec<crate::memory::ImportedMemory>,
@@ -1931,9 +1939,9 @@ impl MemoryStore {
                     transaction.execute(
                         "INSERT INTO memories
                              (name, project, description, tags, body, priority, created_at,
-                              updated_at, read_count, load, reference_list, source, verified_at,
-                              expires_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                              updated_at, read_count, load, reference_list, source, scope,
+                              verified_at, expires_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                          ON CONFLICT(project, name) DO UPDATE SET
                              description    = excluded.description,
                              tags           = excluded.tags,
@@ -1945,6 +1953,7 @@ impl MemoryStore {
                              load           = excluded.load,
                              reference_list = excluded.reference_list,
                              source         = excluded.source,
+                             scope          = excluded.scope,
                              verified_at    = excluded.verified_at,
                              expires_at     = excluded.expires_at",
                         rusqlite::params![
@@ -1960,6 +1969,7 @@ impl MemoryStore {
                             entry.load.name(),
                             references_column(&entry.references),
                             entry.source,
+                            entry.scope,
                             crate::memory::render_stamp(entry.verified_at),
                             entry.expires_at.map(crate::memory::render_stamp),
                         ],
@@ -5577,6 +5587,7 @@ mod tests {
             name: name.to_string(),
             project: project.to_string(),
             description: description.to_string(),
+            scope: String::new(),
             priority: 3,
             load: Load::Index,
             created_at: stamp("2024-05-06T07:08:09+00:00"),
@@ -5589,11 +5600,16 @@ mod tests {
             body: "the body".to_string(),
         };
 
+        let scoped = |name: &str, project: &str, description: &str, scope: &str| ImportedMemory {
+            scope: scope.to_string(),
+            ..entry(name, project, description)
+        };
+
         let count = store
             .import(
                 vec![
                     entry("tone", "", "Be brief"),
-                    entry("stack", "p", "Uses pnpm"),
+                    scoped("stack", "p", "Uses pnpm", "wsl:voidlinux-glibc"),
                 ],
                 false,
             )
@@ -5612,12 +5628,17 @@ mod tests {
         assert_eq!(tone.tags, ["t"]);
         assert_eq!(tone.references, ["other"]);
         assert_eq!(tone.source, "a test");
+        assert_eq!(tone.scope, "", "a file with no scope is portable");
         let stack = store
             .get("stack", &MemoryView::Project("p".to_string()))
             .await
             .expect("get")
             .expect("stack");
         assert_eq!(stack.project, "p");
+        assert_eq!(
+            stack.scope, "wsl:voidlinux-glibc",
+            "the scope the file states is restored"
+        );
         assert_eq!(
             names_of(&store.export_all(&MemoryView::All).await.expect("all")),
             ["tone", "stack"]
@@ -5648,6 +5669,22 @@ mod tests {
             .expect("get")
             .expect("tone");
         assert_eq!(overwritten.description, "Be briefer");
+
+        // The scope is the file's on every write, so an export that no longer states one clears
+        // it: the row is what the snapshot says, not a merge with what was stored.
+        store
+            .import(vec![entry("stack", "p", "Uses pnpm")], true)
+            .await
+            .expect("overwritten");
+        let stack = store
+            .get("stack", &MemoryView::Project("p".to_string()))
+            .await
+            .expect("get")
+            .expect("stack");
+        assert_eq!(
+            stack.scope, "",
+            "the file's portable scope replaced the stored one"
+        );
 
         // All or nothing: the good file beside a bad one does not land.
         let refused = store
@@ -5713,5 +5750,54 @@ mod tests {
                 .expect("get")
                 .is_none()
         );
+    }
+
+    /// The index a turn reads and the listing an operator reads carry the stored scope. A
+    /// projection that left the column out decodes every row as portable, so a note about one
+    /// machine becomes a standing instruction everywhere before any renderer sees it.
+    #[tokio::test]
+    async fn the_index_and_listing_keep_each_memory_target_scope() {
+        let store = MemoryStore::for_test().await.expect("store");
+        store
+            .write(WriteRequest {
+                scope: Some("wsl:voidlinux".to_string()),
+                ..inline("scoped", "Applies over there")
+            })
+            .await
+            .expect("scoped");
+        store
+            .write(inline("portable", "Applies here"))
+            .await
+            .expect("portable");
+
+        let indexed = store.index(&MemoryView::All).await.expect("index");
+        let scope_of_index = |name: &str| {
+            indexed
+                .iter()
+                .find(|memory| memory.name == name)
+                .map(|memory| memory.scope.as_str())
+                .unwrap_or_else(|| panic!("{name} is in the index"))
+        };
+        assert_eq!(scope_of_index("scoped"), "wsl:voidlinux");
+        assert_eq!(scope_of_index("portable"), "");
+
+        let listed = store
+            .list(&MemoryFilter {
+                view: MemoryView::All,
+                referencing: None,
+                unverified_for: None,
+                expired: false,
+            })
+            .await
+            .expect("list");
+        let scope_of_list = |name: &str| {
+            listed
+                .iter()
+                .find(|memory| memory.name == name)
+                .map(|memory| memory.scope.as_str())
+                .unwrap_or_else(|| panic!("{name} is in the listing"))
+        };
+        assert_eq!(scope_of_list("scoped"), "wsl:voidlinux");
+        assert_eq!(scope_of_list("portable"), "");
     }
 }

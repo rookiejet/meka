@@ -91,33 +91,48 @@ fn show_lines(task: &crate::store::background::BackgroundTask) -> String {
     out
 }
 
-/// Cancel one task in `session` by full or unique-prefix id, or every running one.
+/// Ask one task in `session` to stop by full or unique-prefix id, or every running one.
 ///
-/// Records the terminal outcome; signaling the live handle is the caller's job, since only the
-/// process that started a task holds its token.
+/// Record-only, for a caller in a process that owns no live handle: recording the request is all
+/// such a caller can do, and claiming a teardown it cannot observe is the one thing it must not.
+/// The in-process surfaces go through [`crate::background::BackgroundTasks::request_stop`], which
+/// signals the owner first and records second; here the record *is* the request, and a row that
+/// ends up `stopping` without its owner ever hearing of it is what a retry re-signals.
+///
+/// Answers the ids whose stop is now in force: the ones the write moved, plus one already
+/// `stopping`: its request stands, and the caller reports it as asked rather than as finished.
+/// Nothing here writes a terminal status: the row stays `stopping` until the work reports how it
+/// ended, or the owner-loss sweep retires it.
+// Kept exercised only by its own tests: the screens moved to the stop service, and the CLI's
+// `task cancel` is the remaining door this exists for.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn cancel(
     store: &Store,
     session: uuid::Uuid,
     id_prefix: Option<&str>,
 ) -> Result<Vec<String>> {
+    let store = store.background_store();
     let Some(id_prefix) = id_prefix else {
-        let store = store.background_store();
-        let running = store
-            .list_running_background_tasks(session)
-            .await?
+        let open = store.list_running_background_tasks(session).await?;
+        let stopping: Vec<String> = open
+            .iter()
+            .filter(|task| task.status == TaskStatus::Stopping)
+            .map(|task| task.id.clone())
+            .collect();
+        let running: Vec<String> = open
             .into_iter()
+            .filter(|task| task.status != TaskStatus::Stopping)
             .map(|task| task.id)
             .collect();
-        return store
-            .stop_background_tasks(running, TaskStatus::Canceled)
-            .await;
+        let mut in_force = store.request_stop_background_tasks(running).await?;
+        // A row already `stopping` has its request recorded, possibly by a call whose signal
+        // never went out. Its stop is in force whether or not this call moved anything, so it is
+        // answered for; a caller that holds the owner re-signals it.
+        in_force.extend(stopping);
+        return Ok(in_force);
     };
 
-    let Some(task) = store
-        .background_store()
-        .resolve_background_task(session, id_prefix)
-        .await?
-    else {
+    let Some(task) = store.resolve_background_task(session, id_prefix).await? else {
         return Err(MekaError::Usage(format!(
             "no background task matching '{id_prefix}'"
         )));
@@ -129,18 +144,20 @@ pub(crate) async fn cancel(
             task.status.name()
         )));
     }
-    let stopped = store
-        .background_store()
-        .stop_background_tasks(vec![task.id.clone()], TaskStatus::Canceled)
+    if task.status == TaskStatus::Stopping {
+        return Ok(vec![task.id.clone()]);
+    }
+    let requested = store
+        .request_stop_background_tasks(vec![task.id.clone()])
         .await?;
-    // The task finished between the read above and the stop.
-    if stopped.is_empty() {
+    // The task finished between the read above and the request.
+    if requested.is_empty() {
         return Err(MekaError::Usage(format!(
             "task {} already finished",
             task.short_id()
         )));
     }
-    Ok(stopped)
+    Ok(requested)
 }
 
 #[cfg(test)]
@@ -272,7 +289,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_by_prefix_records_the_outcome() {
+    async fn cancel_by_prefix_records_the_request() {
         let (manager, session) = manager_with_session().await;
         let task = seed(&manager, session, "sleep 600").await;
 
@@ -281,13 +298,24 @@ mod tests {
             .expect("cancel");
         assert_eq!(canceled, vec![task.id.clone()]);
 
-        let undelivered = manager
+        // A request is not an outcome: the row stays `stopping` until its owner reports, and a
+        // process that holds no handle must not write a teardown it did not observe.
+        let running = manager
             .background_store()
-            .list_undelivered_background_tasks(session)
+            .list_running_background_tasks(session)
             .await
             .expect("list");
-        assert_eq!(undelivered.len(), 1);
-        assert_eq!(undelivered[0].status, TaskStatus::Canceled);
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].status, TaskStatus::Stopping);
+        assert!(
+            manager
+                .background_store()
+                .list_undelivered_background_tasks(session)
+                .await
+                .expect("list")
+                .is_empty(),
+            "a stop request is not a result the agent may be handed"
+        );
     }
 
     /// `/task cancel ""` must not stop the only running task.
@@ -328,13 +356,17 @@ mod tests {
 
         let canceled = cancel(&manager, session, None).await.expect("cancel all");
         assert_eq!(canceled.len(), 2);
+        let requested = manager
+            .background_store()
+            .list_running_background_tasks(session)
+            .await
+            .expect("list");
+        assert_eq!(requested.len(), 2);
         assert!(
-            manager
-                .background_store()
-                .list_running_background_tasks(session)
-                .await
-                .expect("list")
-                .is_empty()
+            requested
+                .iter()
+                .all(|task| task.status == TaskStatus::Stopping),
+            "{requested:?}"
         );
     }
 

@@ -181,6 +181,11 @@ impl ToolScope {
     /// admits. The server arm is what makes `deny_servers` and `allow_servers` cover tools
     /// registered through paths that never see a server name, so the lists cannot disagree.
     pub(crate) fn admits_tool(&self, name: &str) -> bool {
+        // The managed subshell family drives guest shell work, so it rides the shell tool's
+        // policy: a scope that does not admit `shell_execute` does not admit these either.
+        if crate::subshell::is_tool(name) && !self.admits_tool("shell_execute") {
+            return false;
+        }
         if self.denied_tools.contains(name) {
             return false;
         }
@@ -406,6 +411,10 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "skill_read",
     "skill_search",
     "skill_write",
+    "subshell_close",
+    "subshell_execute",
+    "subshell_export",
+    "subshell_open",
     "task_cancel",
     "task_list",
     "tool_load",
@@ -1205,6 +1214,7 @@ impl ToolRegistry {
         &self,
         core: &CoreMaterials,
         site: crate::session::ToolSite,
+        #[cfg(windows)] wsl_target: Option<Arc<crate::subshell::Target>>,
     ) -> Result<()> {
         let web_client_config = &core.web_client;
         let sandbox_enabled = core.sandbox_enabled;
@@ -1249,6 +1259,8 @@ impl ToolRegistry {
             }));
         }
         self.register_builtin(Arc::new(shell::ExecuteCommandTool {
+            #[cfg(windows)]
+            wsl_target,
             scope: write_scope,
             #[cfg(windows)]
             windows_grants: Arc::clone(crate::sandbox::windows::process_grants()),
@@ -1566,7 +1578,58 @@ impl ToolRegistry {
         if materials.background.enabled {
             registry.enable_background();
         }
-        registry.register_core_tools(&materials.core, cells.site())?;
+        registry.register_core_tools(
+            &materials.core,
+            cells.site(),
+            #[cfg(windows)]
+            cells.wsl.clone(),
+        )?;
+        #[cfg(windows)]
+        if let Some(target) = &cells.wsl {
+            let handles = Arc::new(crate::subshell::Handles::default());
+            registry.register_builtin(Arc::new(shell::SubshellOpenTool {
+                handles: Arc::clone(&handles),
+                target: Arc::clone(target),
+                permission: cells.permission.clone(),
+                required: crate::tools::effective_permission(
+                    &registry.permission_overrides,
+                    "subshell_open",
+                    Permission::Read,
+                ),
+                site: cells.site(),
+            }));
+            registry.register_builtin(Arc::new(shell::SubshellExecuteTool {
+                handles: Arc::clone(&handles),
+                target: Arc::clone(target),
+                permission: cells.permission.clone(),
+                required: crate::tools::effective_permission(
+                    &registry.permission_overrides,
+                    "subshell_execute",
+                    Permission::Read,
+                ),
+            }));
+            registry.register_builtin(Arc::new(shell::SubshellExportTool {
+                handles: Arc::clone(&handles),
+                target: Arc::clone(target),
+                permission: cells.permission.clone(),
+                required: crate::tools::effective_permission(
+                    &registry.permission_overrides,
+                    "subshell_export",
+                    Permission::Read,
+                ),
+                scope: registry.write_scope_or_deny_all(),
+                site: cells.site(),
+            }));
+            registry.register_builtin(Arc::new(shell::SubshellCloseTool {
+                handles,
+                permission: cells.permission.clone(),
+                required: crate::tools::effective_permission(
+                    &registry.permission_overrides,
+                    "subshell_close",
+                    Permission::Read,
+                ),
+            }));
+        }
         registry.register_session_scoped_tools(materials, cells, SessionScope {
             skills_managed: materials.skills_agent_managed,
             memory_access: crate::config::MemoryAccess::Write,
@@ -1644,7 +1707,12 @@ impl ToolRegistry {
     /// than trusting the level.
     pub(crate) fn for_gate(core: &CoreMaterials, site: crate::session::ToolSite) -> Result<Self> {
         let registry = Self::new_with_filter(core.builtin_filter.clone());
-        registry.register_core_tools(core, site)?;
+        registry.register_core_tools(
+            core,
+            site,
+            #[cfg(windows)]
+            None,
+        )?;
         Ok(registry)
     }
 
@@ -1671,7 +1739,58 @@ impl ToolRegistry {
             scope.tool_scope,
         );
         registry.publish_profile(&cells.profile);
-        registry.register_core_tools(&materials.core, cells.site())?;
+        registry.register_core_tools(
+            &materials.core,
+            cells.site(),
+            #[cfg(windows)]
+            cells.wsl.clone(),
+        )?;
+        #[cfg(windows)]
+        if let Some(target) = &cells.wsl {
+            let handles = Arc::new(crate::subshell::Handles::default());
+            registry.register_builtin(Arc::new(shell::SubshellOpenTool {
+                handles: Arc::clone(&handles),
+                target: Arc::clone(target),
+                permission: cells.permission.clone(),
+                required: crate::tools::effective_permission(
+                    &registry.permission_overrides,
+                    "subshell_open",
+                    Permission::Read,
+                ),
+                site: cells.site(),
+            }));
+            registry.register_builtin(Arc::new(shell::SubshellExecuteTool {
+                handles: Arc::clone(&handles),
+                target: Arc::clone(target),
+                permission: cells.permission.clone(),
+                required: crate::tools::effective_permission(
+                    &registry.permission_overrides,
+                    "subshell_execute",
+                    Permission::Read,
+                ),
+            }));
+            registry.register_builtin(Arc::new(shell::SubshellExportTool {
+                handles: Arc::clone(&handles),
+                target: Arc::clone(target),
+                permission: cells.permission.clone(),
+                required: crate::tools::effective_permission(
+                    &registry.permission_overrides,
+                    "subshell_export",
+                    Permission::Read,
+                ),
+                scope: registry.write_scope_or_deny_all(),
+                site: cells.site(),
+            }));
+            registry.register_builtin(Arc::new(shell::SubshellCloseTool {
+                handles,
+                permission: cells.permission.clone(),
+                required: crate::tools::effective_permission(
+                    &registry.permission_overrides,
+                    "subshell_close",
+                    Permission::Read,
+                ),
+            }));
+        }
         registry.register_session_scoped_tools(materials, cells, SessionScope {
             // Never, whatever the installation's `agent_managed` says. See the registration site.
             skills_managed: false,
@@ -3137,6 +3256,10 @@ mod tests {
     fn checkpoint_tool_names_exclude_acting_and_deleting() {
         for name in [
             "shell_execute",
+            "subshell_close",
+            "subshell_execute",
+            "subshell_export",
+            "subshell_open",
             "file_write",
             "file_edit",
             "scratchpad_save_file",

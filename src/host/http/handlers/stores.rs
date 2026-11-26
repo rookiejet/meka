@@ -634,6 +634,7 @@ pub(crate) async fn put_memory(
             load: body.load,
             references,
             source,
+            scope: None,
             expires_at,
             verified: body.verified.unwrap_or(false),
         })
