@@ -2536,34 +2536,53 @@ impl Screen {
                 }
                 None => self.reply("No active session yet"),
             },
-            // Recorded first, then signaled: `finish_background_task` only overwrites a `running`
-            // row, so a task finishing in the same instant cannot report success after the user
-            // was told it stopped. Answered here so a build can be stopped while a turn runs.
+            // The one stop path: the live owner is claimed and signaled before the request is
+            // recorded, and what the note says is what happened: a task with no live runner here
+            // is recorded, never claimed as stopped. Answered here so a build can be stopped while
+            // a turn runs.
             SlashCommand::TaskCancel { id } => match session_id {
                 Some(session) => {
-                    match crate::cli::background::cancel(&self.launch.store, session, id.as_deref())
-                        .await
+                    let tasks = self.launch.agent.get().background_tasks();
+                    match crate::background::stop_by_prefix(
+                        &tasks,
+                        &self.launch.store,
+                        session,
+                        id.as_deref(),
+                        crate::store::background::StopReason::UserRequest,
+                    )
+                    .await
                     {
-                        Ok(canceled) if canceled.is_empty() => {
-                            self.reply("No running background tasks");
-                        }
-                        Ok(canceled) => {
-                            for task_id in &canceled {
-                                self.launch
-                                    .agent
-                                    .get()
-                                    .background_tasks()
-                                    .cancel(task_id)
-                                    .await;
+                        Ok(reports) => {
+                            let mut asked = 0;
+                            let mut unconfirmed = 0;
+                            for (_, report) in &reports {
+                                match report {
+                                    crate::background::StopReport::AlreadyEnded => {}
+                                    crate::background::StopReport::NotSignaled { .. } => {
+                                        unconfirmed += 1;
+                                    }
+                                    crate::background::StopReport::Signaled { .. } => asked += 1,
+                                }
                             }
-                            self.push(Item::note(format!(
-                                "Canceling {}",
-                                crate::text::counted(
-                                    canceled.len() as u64,
-                                    "background task",
-                                    "background tasks"
-                                )
-                            )));
+                            if asked == 0 && unconfirmed == 0 {
+                                self.reply("No running background tasks");
+                            } else {
+                                let mut note = format!(
+                                    "Canceling {}",
+                                    crate::text::counted(
+                                        asked as u64,
+                                        "background task",
+                                        "background tasks"
+                                    )
+                                );
+                                if unconfirmed > 0 {
+                                    note.push_str(&format!(
+                                        "; {unconfirmed} had no live runner here, so their stops \
+                                         are recorded but unconfirmed and their rows stay open"
+                                    ));
+                                }
+                                self.push(Item::note(note));
+                            }
                         }
                         Err(error) => self.reply(error.to_string()),
                     }

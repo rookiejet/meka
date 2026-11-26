@@ -1079,6 +1079,26 @@ Default: `/var/run/jailbroker.sock`.
 jailbroker_socket = "/var/run/jailbroker.sock"
 ```
 
+### `[shell.wsl]`
+
+Windows only. Configure one trusted WSL 2 distribution. Unset by default; no distribution is
+selected automatically. This table has no effect without WSL paths in the run's additional
+directory flags. It requires `shell.sandbox = true` and is independent of
+`shell.sandbox_backend`, which selects the native Windows sandbox.
+
+```toml
+[shell.wsl]
+distribution = "Ubuntu"
+# runner = "/usr/local/bin/meka-runner"
+```
+
+Use the name from `wsl --list --verbose`, including its exact spelling in the grant paths.
+`runner` overrides the absolute Linux path checked for an installed binary; it defaults to
+`/usr/local/bin/meka-runner`. An absent runner selects the bundled copy if available, but a runner
+that is present and fails the installation checks is an error. See
+the [`subshell_*` tools](../tools/shell.md#subshell_open--subshell_execute--subshell_export--subshell_close)
+for guest requirements and usage.
+
 ## `[tools]`: built-in tool filters
 
 The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to Meka's built-in tools (`file_read`, `file_write`, `shell_execute`, etc.) via a top-level `[tools]` table. MCP per-server filtering is separate from this and keeps its own namespaces; this block only affects the built-ins.

@@ -1,5 +1,245 @@
 # Shell tool
 
+## `shell_execute` with `wsl`
+
+When a managed WSL target is configured, `shell_execute` takes an optional `wsl` parameter that
+routes the command through the managed WSL broker as a one-shot confined call instead of the
+native shell. The channel is call-bound: it is created and destroyed within the call, never a
+persistent endpoint. This is for a literal invocation from inside PowerShell; raw `wsl.exe`
+keeps its current behavior.
+
+| `wsl` parameter | Description |
+|---|---|
+| `working_directory` | Required, a granted WSL directory to mount at `/workspace`. |
+| `workspace` | Optional additional workspace grants, mounted at `/workspaces/0`, `/workspaces/1`, etc. |
+| `readable` | Optional additional read-only grants, mounted at `/references/0`, `/references/1`, etc. |
+| `read_only` | Optional. Mount everything read-only. |
+
+## `subshell_open` / `subshell_execute` / `subshell_export` / `subshell_close`
+
+Run POSIX shell commands on a configured WSL 2 distribution from a top-level Windows session.
+These tools do not change what PowerShell, Windows file tools, or a raw `wsl.exe` invocation can
+access. They are available to sub-agents under the parent's ceiling: a sub-agent may narrow its
+level, directories, and network access, never widen them. A scoped sub-agent does not inherit
+the WSL target; a bare worker holds the parent's directories. They are not available to
+schedule gates or HTTP sessions.
+
+### Setup and scope
+
+1. Check that the distro is WSL 2 with `wsl --list --verbose`. Its default Linux user must not be
+   root. It needs a Linux-native ext root filesystem, `/bin/sh`, GNU `env` and `stat` in `/usr/bin`,
+   a root-owned `/usr/bin/bwrap` with fd bind support, unprivileged user namespaces, seccomp and
+   Landlock ABI 6 or newer. The guest runner supports x86-64 and little-endian ARM64.
+2. Set [`[shell.wsl]`](../configuration/config-file.md#shellwsl) in the **Windows** config, then
+   grant one or more real Linux directories on the distro root filesystem:
+
+```powershell
+meka --permission workspace `
+  --additional-workspace-directory '\\wsl.localhost\Ubuntu\home\dev\project' `
+  --additional-readable-directory '\\wsl$\Ubuntu\home\dev\reference'
+```
+
+### Runner selection
+
+Meka tries `/usr/local/bin/meka-runner` first. An administrator can install the matching Linux
+Meka binary under that name without replacing an existing `meka` command. It must be an
+executable on the distro's root ext filesystem, owned by root with no setuid or setgid bits.
+The path may not contain symlinks or components writable by group or others. A present but
+untrusted or failing runner is an error, not a reason to try a different binary.
+
+The runner speaks a versioned protocol, currently version 6. Protocol 6 frames command stdout
+and stderr on the runner's stdout together with `started`, `stopped` and `done` control frames,
+so no raw command byte can be mistaken for a teardown proof; protocol 5 made staging and export
+runner-owned typed transfers; protocol 4 changed the hello line and the request shape. An
+installed runner left by an older Meka is refused at the first exchange with both versions named
+rather than misread; install the matching Linux Meka under the same name to upgrade it. The
+bundled runner is built from this tree and speaks the same version.
+
+If the path is absent, the Windows release deploys its bundled x86-64 `meka-runner` on demand:
+a bundled loader receives it over the launcher pipe, verifies it in a sealed anonymous Linux
+file, and runs it from there without writing an installation. No guest cache is kept and no
+interpreter in the distro is required. Deployment needs kernel support for executable, sealable
+memory files. It uses no downloads, guest credentials, or elevation. Use an installed runner on
+other guest architectures or when the distro restricts executable memory files.
+Neither form needs a Linux Meka config or store.
+
+### The handle
+
+`subshell_open` pins one admitted scope and returns a handle: a caller-chosen name of 1 to 64
+letters, digits, `.`, `_` or `-`. Every later call names the handle. `subshell_execute` runs one
+command in the scope, `subshell_export` copies files out of it, `subshell_close` ends it. The
+handle holds a scope, not a live shell: every call starts its own supervised launcher and guest
+sandbox, so what a command changes directory into, exports, or leaves running cannot carry
+authority into a later call. A handle belongs to the session that opened it and is released at
+close or at the session's end; the close report says how many running commands it stopped, and
+waits up to ten seconds for the guest namespace to end. A teardown not confirmed by then is
+reported as unconfirmed rather than presented as done. The
+guest runner is the command namespace's PID 1: it outlives the user shell, reaps it, and kills any
+process the shell left behind before it exits, so a stopped command's processes are ended with the
+namespace. If the Windows launcher itself is terminated before the runner can end, no guest
+acknowledgement reaches Meka and that teardown is unconfirmed.
+
+For example, open one with:
+
+```json
+{"handle":"work","working_directory":"/home/dev/project","readable":["/home/dev/reference"]}
+```
+
+| `subshell_open` parameter | Description |
+|-----------|-------------|
+| `handle` | Required, the name the other three tools address. |
+| `working_directory` | Required unless `scratch` is given, exact case-sensitive Linux path or Windows drive-absolute path of one grant. Mounted at `/workspace`. |
+| `scratch` | Optional, mutually exclusive with `working_directory`. Open the handle over a private Linux-native scratch workspace holding a snapshot of `source` instead of the live tree; see [Scratch workspaces](#scratch-workspaces). |
+| `workspace` | Optional additional workspace grants, mounted in order at `/workspaces/0`, `/workspaces/1`, and so on. Refused with `scratch`, whose mount table is the snapshot alone. |
+| `readable` | Optional additional workspace or readable grants, mounted read-only in order at `/references/0`, `/references/1`, and so on. |
+| `read_only` | Optional. Mount all selected roots read-only even at `workspace` or `unrestricted`. |
+
+The mount scope is fixed at open, and the guest has no network, Windows drives, or ambient
+Linux home directory. It has a private 256 MiB `/tmp`, discarded when the handle closes. Files
+written to a direct workspace persist. A grant not selected is not mounted; symlinks, mount
+crossings and overlapping grants are refused. A workspace directory the runner can resolve is
+also a Windows-backed guest view of the managed target: the guest reads the kernel's own mount
+table to find the drive mount and checks a per-request identity proof before the mount is
+trusted.
+
+### Scratch workspaces
+
+With `scratch` instead of `working_directory`, the handle runs over a private directory the
+guest creates under `/var/tmp/meka-scratch` rather than over a live tree. `source` names the
+directory to snapshot into it: a Windows path beneath one of the session's workspace roots, or
+a granted WSL directory. A Windows grant naming a drive root or one that overlaps Meka's private
+directories is refused before a scratch opens. The snapshot is one typed transfer. A guest source
+is walked by the runner itself: it opens every source directory and file, records each entry's
+length, modification time and SHA-256 digest, and refuses links, hard links and mount crossings
+while it copies. A Windows source is walked by the host under its native read fence and uploaded
+to the guest instead: every file is read through the handle it is identified at, to exactly the
+length it announced, and a file that changed, grew, or took another name while it was read refuses
+the snapshot. The runner writes what arrived into the workspace and refuses any file whose bytes
+do not hash to the digest announced for it, so the copy is what the fence read or nothing is. A
+Windows source is admitted against the file tools' read boundary before the request, and a
+guest source is admitted by the target's own grants and ancestor checks, since WSL grants are
+deliberately not part of the native read scope. A file
+with more than one hard link is refused because another name could change it after its bytes
+were copied. The staged size is bounded by `quota_mb` (1 to 8192 MiB, 1024 by default): a guest
+stage counts the bytes each write actually produces, and an upload is judged by the lengths its
+manifest announces before any byte of it is read, so a file that grows while it is staged cannot
+slip past the quota. The guest checks the workspace's allocated blocks before each command; one
+command can exceed the quota in its own writes, and the next call then refuses to run until the
+handle exports and closes. The directory
+is private to the guest user the runner runs as, and only it is bound into commands, at
+`/workspace`, so a build runs at Linux speed on the distro's own filesystem.
+
+A scratch workspace holds a copy, not a link: nothing written in it reaches the source on its
+own. Exporting is the only way out, and export paths may name `/workspace` or the staged path.
+When an export lands over the staged source region it is checked against what the snapshot
+recorded for each file, its length, modification time and SHA-256 digest: one that changed,
+disappeared, or appeared there since the snapshot refuses the whole export, and no option changes
+that, because copying over it would lose work the snapshot does not hold. The fresh-name rule below
+also applies there: an unchanged staged file is still an existing destination name, so a copy back
+to it is refused and must be exported under a new name.
+
+The workspace is deleted when the handle closes. A session that ends without closing leaves it
+to the guest reaper, which removes abandoned workspaces a day past their last use; a failed stage
+that produced no manifest is left there too, because the host cannot prove it owns that id. A
+scan that cannot read the scratch root refuses to open rather than adopting a directory it cannot
+account for. Both deletion paths lose what was never exported, by design: anything worth keeping
+must be exported first. Scratch mode runs at `workspace` or above, and cannot combine with
+`read_only` or `workspace` mounts.
+
+### Commands
+
+`subshell_execute` runs one POSIX shell script in the handle's sandbox. Each call is a fresh
+environment: what one command exports or changes directory into does not survive to the next
+call, so the handle's mount scope is the only thing it remembers.
+
+| `subshell_execute` parameter | Description |
+|-----------|-------------|
+| `handle` | Required, the open handle. |
+| `command` | Required, POSIX shell script, up to 64 KiB. |
+| `timeout_ms` | Optional, defaults to 30 seconds; at most one hour. |
+| `scratchpad` | Optional host scratchpad entry name for the output. |
+
+The tool requires at least `read`. At `read`, or if the working directory is a readable grant,
+all roots are read-only. Otherwise only the selected workspace mounts can be written, even at
+`unrestricted`. Output streams, the 64 MiB capture bound, cancellation and background tasks
+follow the native shell's tool behavior.
+
+A stop or timeout asks the guest to end its command and reap it, then waits a bounded grace for
+the guest's own terminal proof before the local launcher is torn down. What the result then says
+takes one of three shapes: the guest reported the reaped namespace and its status, the command
+never started because no start permit was acknowledged, or the end is unconfirmed. A local
+launcher's exit never stands in for the guest's end, and a run whose frames are missing is
+reported as broken, never as a clean result.
+
+### Exporting
+
+`subshell_export` copies files and directory trees out of the admitted scope into the session's
+current write boundary. A guest source is read by the runner and streamed over the typed
+transfer channel; the host writes every file to a private temporary and publishes them together
+only after the response's done frame and a successful runner exit, so a failed transfer leaves
+no destination behind. A native source is read by the host and published file by file. Nothing
+is created inside the guest, and the destination is the Windows path the copy lands in.
+
+| `subshell_export` parameter | Description |
+|-----------|-------------|
+| `handle` | Required, the open handle. |
+| `paths` | Required, absolute normalized Linux paths beneath the scope's grants. |
+| `destination` | Required, a Windows path in the session's write boundary. |
+
+Every destination name must be unused: an existing file is refused when the plan is made, before
+a temporary is created or a byte is copied, and the tool has no replacement path to offer. Export
+to a fresh name. This is a breaking change from earlier versions, where `overwrite` could ask for a
+replacement.
+
+Every source must name exactly what the scope admitted: nothing the scope would hide from the
+shell comes back through the export. Symlinks, hardlinks the handle's inodes do not account
+for, and any file under a symlinked or reparse directory are refused rather than followed, so
+the export cannot read outside the scope through a link it did not admit. A directory copies
+its whole tree under its own name; two sources with one basename are refused together. The
+destination is checked against the session's write boundary as it stands at the call and again
+at every target, so a permission downgrade or cancellation stops the export between files. A
+native export keeps what it already copied; a guest export publishes nothing until its transfer
+completes. Every guest name is checked as one Windows component before
+anything is written: a name holding a backslash, slash, colon, wildcard, control character, a
+reserved device name, a trailing dot or space, or a second planned target that differs only in
+case is refused rather than silently turned into a different path. Each destination component is
+created by name and must be a real directory, and a copy is written through no reparse point. The
+publish is no-clobber: a destination the plan found absent is moved into place only if it is still
+absent, so a file that appears during the copy is refused, never replaced, and the rename runs
+against the pinned destination directory handle rather than a pathname that could have been
+swapped. Exports are admitted only on a local fixed NTFS or ReFS volume; a DrvFS, network-backed
+or unrecognized destination is refused at the door, because those providers cannot promise the
+identity and no-replace guarantees the publication runs on. There is no move-aside, recheck or
+restore path and no pathname rename or delete fallback: cleanup removes only the object the
+export created. If a stop, close or permission downgrade wins between publications, the files
+already published remain where they landed and the error says how many were published before it
+and remain; the tool never claims a whole-tree publish or a clean slate when part of one landed.
+Files earlier commands created are exportable like any other, provided the destination name is
+free; there is no automatic copying. For a scratch handle the paths may name `/workspace` or the
+staged path, and a copy landing over the staged source region follows the conflict rule in
+[Scratch workspaces](#scratch-workspaces) and the fresh-name rule above.
+
+### Closing
+
+`subshell_close` takes one `handle`, reports what its stop observed (the commands it stopped and
+the end each one proved, distinguishing a command that never started, a guest-reaped end and an
+unconfirmed one) and releases the name for the session to reuse. A released name is free for a
+new handle at once; a close only ever reaches the handle it closed, never a later generation
+reusing the name. Naming a handle that was never opened, was already closed, or belongs to
+another session is refused with the names the session holds.
+
+### Permissions and lifecycle
+
+The tools require at least `read`. A stricter permission override on any of the four raises its
+minimum here; approval cannot replace that live session permission. A permission change never
+widens what an open handle can reach: a downgrade narrows its access at once and an upgrade
+opens none of the granted mounts, and every call re-checks the session's current level and
+roots before it acts. Disabling `shell_execute` disables these tools too. If using
+`[tools].allowed_tools`, name all four. The Windows Job Object supervises the launcher, not the
+Linux guest's memory; the guest runner tears down the command namespace it holds, but a launcher
+killed abruptly leaves that teardown unconfirmed, as above. The distro's administrator and system
+runtime are trusted; a sandbox setup failure never falls back to an ordinary WSL shell.
+
 ## `shell_execute`
 
 Execute a shell command and return its output.

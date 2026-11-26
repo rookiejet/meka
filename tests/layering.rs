@@ -69,11 +69,12 @@ const RANKS: &[(&str, u32)] = &[
     ("conversation", 16),
     ("config", 16),
     ("memory", 16),
+    ("subshell", 17),
     // What a reply spent, which the conversation records beside each reply.
     ("stats", 17),
     ("entry", 17),
-    ("permission", 17),
     ("checklist", 17),
+    ("permission", 18),
     // The redaction a stat counts.
     ("image", 18),
     // Leaves. `process` is the one door for every process Meka starts, below `sandbox`, which
@@ -768,6 +769,14 @@ const PROCESS_STARTERS: &[(&str, &str)] = &[
         "src/sandbox/windows.rs",
         "a confined Windows command, created suspended and assigned to the job \
          `process::open_job` makes before it runs",
+    ),
+    (
+        "src/sandbox/wsl_guest.rs",
+        "the WSL guest runner's Bubblewrap command, through `process::spawn_tree_with_pre_exec`",
+    ),
+    (
+        "src/sandbox/wsl_host.rs",
+        "the managed WSL launcher, through `process::spawn_tree`; its stdin leases the guest run",
     ),
     (
         "src/sandbox/landlock.rs",

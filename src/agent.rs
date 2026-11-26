@@ -88,6 +88,11 @@ pub(crate) struct Agent {
     /// fresh or rewound conversation. Compaction publishes the snapshot restored into its saved
     /// summary, so the continuing loop has that picture already.
     last_rendered_world: tokio::sync::RwLock<Option<crate::prompt::WorldSnapshot>>,
+    /// The memory index last read successfully, with the view it came through, so a failed read
+    /// can render what the store was last known to hold rather than announcing deletions. Kept
+    /// apart from `last_rendered_world`, which records only what the model was told: a body that
+    /// left that record because its target went out of reach is still recoverable here.
+    last_known_memories: tokio::sync::RwLock<Option<crate::prompt::KnownMemoryIndex>>,
     /// The turn this agent is running, for as long as it runs it, a compaction run between turns
     /// included, since that is a turn of its own. Every row the agent writes names it; the store
     /// is told rather than left to find an open turn, which a dead process can leave behind.
@@ -274,6 +279,7 @@ impl Agent {
             store: materials.store.clone(),
             last_rendered_checklist: tokio::sync::RwLock::new(None),
             last_rendered_world: tokio::sync::RwLock::new(None),
+            last_known_memories: tokio::sync::RwLock::new(None),
             current_turn: std::sync::Mutex::new(None),
             compaction_spend: std::sync::Mutex::new(crate::stats::TokenUsage::default()),
             store_behind: std::sync::atomic::AtomicBool::new(false),
@@ -866,6 +872,7 @@ impl Agent {
         // may have taken the one last accepted here.
         *crate::sync::lock(&self.served_by) = None;
         *self.last_rendered_world.write().await = None;
+        *self.last_known_memories.write().await = None;
         *crate::sync::lock(&self.context_compacted) = None;
         *crate::sync::lock(&self.main_thread.before_compaction) = None;
         self.note_tools_called(messages);

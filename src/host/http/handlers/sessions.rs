@@ -1922,7 +1922,9 @@ pub(crate) async fn delete_session(
         // them by, so `DELETE /v1/tasks/{task_id}` now 404s and only restarting the
         // server (which still would not reap the process group) ends it. The screen does the same
         // thing on its way out.
-        let signaled = entry.release(state.shared.mcp_manager.as_ref()).await;
+        let signaled = entry
+            .release_and_wait(state.shared.mcp_manager.as_ref())
+            .await;
         if signaled > 0 {
             tracing::info!(
                 "deleting session {id} signaled {signaled} running background task(s) to stop"

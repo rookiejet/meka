@@ -45,9 +45,10 @@ rank  module          holds
 16    config          config.toml, ResolvedConfig; profile.rs holds accounts and profiles
 16    memory          the memory entry
 17    entry           what skills and memories share: an indexed entry
-17    permission      levels, the enabled set, the shared cell, the approvals switch
+17    subshell        target-qualified grants and the host/guest command request
 17    checklist       the checklist: items, states, the open rule
-17    image           format detection and transcoding
+18    permission      levels, the enabled set, the shared cell, the approvals switch
+18    image           format detection and transcoding
 18    fs              private directories, atomic replace, file locks
 18    process         the one door for every process Meka starts: behind Meka for memory
 19    error           MekaError
@@ -216,7 +217,7 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | What a call's end is announced with | the settled result, so a surface is told what the conversation records: `Agent::announce_completions` for a round, once `save_explicit_scratchpad_results` and `persist_oversized_results` have run; the checkpoint's own `CheckpointCallCompleted`, once its save and `bound_checkpoint_result` have | a round (`run_tool_round`), a checkpoint's call (`run_checkpoint_turn`) |
 | Where a call's output goes when the call names a `scratchpad` entry | `tools::scratchpad::redirect`: saved under the name with the reference left in the result, or refused for a name a parent lent | a round's calls and a checkpoint's, through `save_to_named_entry`; a background call's report, in `background_outcome`, which writes the entry with the task's end; never a result whose `ToolOutput::is_output` is unset, which `Agent::tool_result` leaves unset for a tool whose `Tool::keeps_result_inline` is true (the scratchpad's tools, the checklist's and `context_replace`) |
 | What a blank or wrong-typed argument means | `tools/util.rs`: `require_str`, `optional_str`, their `_allowing_empty` forms and `string_or_list` (blank is "not given", a wrong type is refused by name, a blank list entry is dropped), with `text::deserialize_blank_as_none` for a serde-parsed tool; `tests/layering.rs` fails on a raw read outside its `RAW_ARGUMENT_READERS` ledger | every built-in's string and list arguments |
-| Where a process is started, and what it is handed for memory | `process::spawn_tree` and `process::spawn_with_pre_exec` (and `process::prepare` with `process::adopt` where rmcp makes the spawn): the highest `oom_score_adj` on Linux, a job capped at the machine's memory on Windows; `tests/layering.rs` lists every spawn site in its `PROCESS_STARTERS` ledger | the shell tool, the screen's `!command`, schedule gates, stdio MCP servers and an HTTP server's `headers_helper`, the Bubblewrap smoke test, the confined Windows command |
+| Where a process is started, and what it is handed for memory | `process::spawn_tree` and `process::spawn_with_pre_exec` (and `process::prepare` with `process::adopt` where rmcp makes the spawn): the highest `oom_score_adj` on Linux, a job capped at the machine's memory on Windows; `tests/layering.rs` lists every spawn site in its `PROCESS_STARTERS` ledger | the shell tool, the screen's `!command`, schedule gates, stdio MCP servers and an HTTP server's `headers_helper`, the Bubblewrap smoke test, the confined Windows command, the WSL controller's launcher and the guest runner's Bubblewrap monitor |
 | How a command is run, bounded and stopped | `process::run` over a `process::Tree` (a session of its own on Unix, the job on Windows; dropping it kills the tree): each stream drained under a `process::Keep` rule (a shared `OutputBudget` whose crossing ends the command, a head read to the pipe's end, or a tail with a count of what was let go), the tree killed on a stop, a timeout or a spent budget, and the drains collected within a drain timeout that keeps what they read, or at once on a stop | `shell_execute` (whose confined Windows command shares the drains), the screen's `!command`, a schedule gate's shell probe, an HTTP server's `headers_helper` |
 | How a host that serves the installation writes it, and what it serves | `SharedDeps::write_installation`, the one sequence: under `installation_doors`, `installation_as_written` parses the file once and refuses one that fails to parse, holds an MCP server entry the manager refuses, or, when it changed since the last whole read, anything `ResolvedConfig::validate` refuses; the edit decides on that parse and runs its door, which undoes its own file write when a later step fails, the file being served anyway when it moved; `serve_installation` then reads the file whole, holds it to everything startup holds a file to every time (`SharedDeps::servable`: `ResolvedConfig::validate`, the `[web]` client, and on `meka serve` the `[serve]` resolution, so an edit from outside landing between the door's write and this read is never served unchecked), replaces the catalog with the `[thinking]` budget and `[session].context_window` its profiles complete with, under the provider cache's lock so no build from the old catalog is cached after it (`ProviderRegistry::resolve`), resolves device ids, brings the manager to the file's entries (restarted when the connection differs, `installation::mcp::same_connection`, or when the store's count of the server's credential writes moved, `TokenStore::mcp_credential_generations`; reconfigured in place when the tool policy alone differs, `McpClientManager::reconfigure_server`), records the read for `config_changed`, and reads the instructions again, keeping the last text when they cannot be. A credential write counts only when it changes a row. A browser login obtains its credential outside it, the MCP flow against an in-memory store, and commits through it, refused when the account or the connection it began on changed (`account::commit_login`, `mcp::commit_login`); once its commit has begun, nothing that ends logins settles it. Every MCP credential row records the endpoint it was stored for, and a connect uses it for that endpoint alone (`mcp::auth::presentable`: OAuth tokens at their canonical resource URL, a bearer or a client secret on its origin; a client secret is then sent to the token endpoint the server's metadata names, or `/token` on its origin when it publishes none); a credential is never bound to a `url` the environment leaves unresolved (`installation::mcp::endpoint_of`); a revocation is read before a clear and before any secret the same edit stores, carries the client secret stored for the grant's own origin alone, and is sent after the write commits (`mcp::auth::Revocation`, `#[must_use]`, so a door that drops one does not compile clean). A profile rename repoints the live cells of every resident session and running sub-agent (`PublishedProfile::rename_profile`, `RunningSubagents::rename_profile`), refuses only what would run on another profile (`Store::sessions_run_on_profile_name`: a root on the name, a sub-agent pinned to it), and undoes exactly what it moved (`Store::undo_profile_move`). The typed refusals' HTTP wording lives in `ProblemDetail::for_error` alone. `PUT /v1/instructions` takes the same lock through `write_instructions` | every write of the installation over HTTP: accounts, profiles, MCP add, change, remove, secret and login commits, logout; `POST /v1/config/reload`, the write with no edit; the screen's `/mcp login` and `/mcp logout` |
 | What a model returned, and what a provider said about it | recorded as returned, part for part: each object to the element that stands for it (the response to the `ReplyRecord`, a Chat Completions message to its `Message`, a part to its block), keeping what nothing else holds as `provider_fields` (`provider::fields_beyond`), a stream folded as its protocol's reference client folds it (`provider::accumulate_delta`, Claude's `message_delta` and `citations_delta`, a Claude block and a Responses item in the place their `index` and `output_index` name through `StreamEvent::Place`, an item's parts in their index order (`responses_wire::Parts`), the Responses terminal `response`), without what restates the request (`responses_wire::response_fields`), and what has no element as `Unrecognized`; `Thinking.parts`, `Refusal`; how it stopped in `Stop` (`StopReason`, the provider's `word`, its `details`) inside the `ReplyRecord` of the `messages.reply` column, with the model, the profile and the usage, carried by `store::RecordedEvent` through the save doors; a cut reply whole under `ReplyCut` (`turn::cut_reply_rows`) with a `Repair` for its unrun calls; a compaction's rounds as `RecordedMessage`s, a failed one as `Event::CompactionFailed`; a kept copy restored to its row (`link_kept_copies`) with a `Repair` restating the view; what a surface shows is decided where it is drawn (`reasoning_text`, `Message::holds_no_answer`, `Message::shown_content`, `refusal_words`), a live reply's parts one at a time as they arrive (`turn::DrawOrder`) | the turn loop, the nudges, compaction, every wire's decoder, the history, the archive, a fork |
@@ -230,6 +231,7 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | Whether a profile name is configured | `config::require_profile`, raising `MekaError::ProfileNotConfigured` | `--profile` and `default_profile` selection, `resolve_profile_switch` and the resume repin (`host/assembly.rs`), HTTP create and `PATCH`, the provider registry, `meka profile use` |
 | What a session's row may move to, and what a failed write costs | `Store::update_session` taking a `SessionPatch`; the policy is `host::record_session_change` | screen `/permission`, `/approvals`, `/cd`; ACP `session/set_mode` and `session/set_config_option`; HTTP `PATCH`; the profile switch and resume reconciliation. A patch that fails to write the level, switch, directory or roots is warned about and the command continues; one carrying a profile fails the request. The one writer below `host` is the sub-agent tool recording the profile a worker ran on, which warns. |
 | Whether a working directory is accepted, and how it is spelled | `workspace::accept_cwd`, over `judge_directory`; `cwd_filter` for a listing filter | ACP `session/new`, `load`, `resume`, `fork`; screen `/cd`; HTTP create, `PATCH` and `?cwd=`; both import doors ask `judge_directory` of each directory an archive names, and leave out one it refuses |
+| Whether a CLI directory is native or belongs to WSL | `paths::WslDirectory::from_run_directory`, before `config::resolve_run_directories` consults the filesystem | both additional directory flags; WSL paths never enter the Windows workspace or read scope |
 | Whether a session accepts an image | `ResidentSession::accepts_images`, off the published profile's `vision` | HTTP `POST /turns`, ACP `session/prompt` |
 | A session's title | `Conversation::title` (the first user `Append` in the log with a non-blank `Text` block or another block carrying a person's words, whitespace collapsed, `TITLE_CHARS` = 200; `TITLE_ROW_WHERE_SQL` is the same rule in SQL) | `SessionSummary`, the HTTP turn response, ACP's title update (from the resident log after a first prompt, from the row on a load, resume or fork, since a hydrated log begins at the last boundary) |
 | Making a persisted session resident | `Store::open_session_row`: lock first, then read | screen and one-shot resume, `serve` re-attach (`ensure_session_loaded`), ACP `session/load` and `session/resume` |
@@ -311,6 +313,212 @@ And an upstream's own response text travels only when `[serve] relay_provider_er
 `provider_response`; `acp_error_for` appends it to `data`; both bound it with
 `error::bounded_upstream_body`. An MCP connector's reason, a `Database` and an `Io` never travel at
 all, on either.
+
+## Managed WSL guest runner
+
+The Windows controller keeps guest CLI grants separate from native `SharedRoots` and registers
+the `subshell_open`/`subshell_execute`/`subshell_export`/`subshell_close` family only in the
+top-level session registry when there is a target and a grant. It selects exact Linux paths and
+enforces the two shells' shared policy. A handle pins one selection and the level it was opened
+at narrowed to what the session holds at every use, so an upgrade never widens an open handle. A
+permission snapshot carries a cancellation token revoked on any downgrade, even if a raise
+follows, and a handle's own token stops the commands running under it at close. Exporting is
+runner-owned on the guest side: the controller names the admitted sources in a typed transfer
+request, the runner opens each one itself and streams a manifest and then file bytes, and the
+controller publishes the copies only after the transfer's done frame and a successful runner exit,
+re-checking the session's write boundary at the call and at every target. A native source is read
+by the host instead. The Windows process starts System32 `wsl.exe` with a fixed bootstrap and cleared
+environment. The bootstrap checks the installed runner and its ancestry before emitting an
+installed marker. If the path is absent, it stages the bundled deployment loader in a private
+temporary file, unlinked before its open descriptor is executed through procfs, and sends a
+deployment marker. The loader reads an eight-byte little-endian length, 32 SHA-256 bytes, and
+exactly that many payload bytes (at most 128 MiB) from the same pipe. It writes them into an
+executable memory file, seals it against modification, verifies the sealed bytes, and execs
+that file descriptor. The
+payload is part of the Windows binary, never loaded from a path selected by the session. The
+runner confirms its protocol version on stdout before the controller writes the command request
+on the same stdin pipe. No command or grant is in Windows arguments. Cancellation, timeout,
+output limit and host exit end the launcher's stdin lease. The Windows job supervises the
+launcher; the Linux runner supervises the command.
+
+The launcher's stdin is the host's only channel to the guest after the request, and the framed
+stdout stream is the guest's only channel back. Start authorization is a three-step exchange on
+those channels. The guest proves its sandbox and writes one `ready` frame carrying its operation
+identifier, then waits. The controller answers with one newline-terminated permit line naming the
+one deadline's remaining budget in milliseconds; the permit is enqueued and marked committed in
+one synchronous step under the authority the call was admitted at, so a downgrade or stop that won
+before the commit cannot be overtaken and one landing after it is supervised like any later stop.
+That commit is the start's commit point: a stop before it denies the permit and the command never
+runs; after it the command's effects may exist and stopping is teardown, not rollback. The guest
+reads the permit line and refuses anything but one bounded positive duration; only then does it
+fork the shell, whose start it reports in a `started` frame. A `started` frame the permit never
+authorized is a protocol failure, not a start. EOF on the permit line is the host's withdrawal:
+the guest tears its namespace down, reaps it, and reports what it reaped.
+
+The Linux binary has two internal entry points, `subshell-runner` and `subshell-exec`. Neither
+opens a session or a store. The guest enforces the grants it receives; it does not authorize them
+on behalf of the Windows session.
+
+The runner takes a single newline-terminated UTF-8 JSON request on a pipe. Protocol version 7
+has these fields: `version`, `op` (the operation identifier every later frame must echo),
+`access` (`read` or `workspace`), `working_directory`, `workspace` (an array of additional
+workspace paths), `readable` (an array of reference paths), `timeout_ms`, `script`, optionally
+`scratch` (`path`, `quota_bytes`, `create`), and optionally `transfer` (`stage` with one `source`,
+`upload`, `export` with `sources`, or `remove_scratch`). A version that is not exactly 7 is refused
+before
+any grant, command or transfer byte is read, and the refusal says how to replace a stale installed
+runner rather than falling back to a bundled one. A transfer request carries no script and runs in
+a guest directory. Each mount source is either a plain guest path string or a `WindowsRoot` object
+with `windows` (the operator's drive-absolute spelling) and `proof` (a per-request identity proof
+file name). The guest resolves the Windows root from the kernel's own mount table and checks the
+proof is a regular file in exactly the resolved directory before the mount is trusted, so a wrong
+translation fails closed. An export source is typed on the wire: a root that is either the
+request's own scratch workspace or one of its numbered mounts, plus validated relative components
+beneath it. No free-standing absolute path is accepted as an export source, and a component that
+is empty, `.`, `..`, or contains a separator or NUL is refused before anything is opened. The
+frame is limited to 128 KiB including its newline, the script to 64 KiB, the root set to 32
+directories, and the command timeout to one hour. The caller leaves stdin open without sending
+more data; EOF or another byte cancels the command. An upload's manifest line and the announced
+file bytes are the one thing that may follow the request on this pipe, in manifest order. The
+script gets null stdin and two piped
+output streams. The runner returns 124 on its timeout, 125 on lease loss and 126 on a setup
+failure, otherwise the command's status. A command can itself return any of those numbers, so the
+status alone is not a typed result; the host reconciles the launcher's status with the outcome the
+guest reported and refuses to present either when they disagree. An internal pipe distinguishes
+early sandbox failure from an ordinary command exit without interpreting command output.
+
+A command answer uses the same framed stream as a transfer: a `ready` frame once the sandbox is
+verified, a `started` frame before the shell runs, one `output` frame for each chunk of the
+shell's stdout or stderr with exactly that many bytes after it, a `stopped` frame carrying the
+reaped status after the last output chunk, and a `done` frame. Every frame echoes the request's
+operation identifier, and a frame naming another operation is refused wherever it appears. No raw
+command byte is written to the runner's stdout, so the controller can read control and output
+without a delimiter that a command could print; payload that happens to look like a control frame
+stays output, because only its announced length is read. The controller enforces the order and
+the output budget as frames arrive, and treats `started` followed by `stopped` as the guest's
+proof that it waited for the shell. The result speaks in three shapes only: the guest reported
+the reaped namespace (with the status it reported), the command never started because no start
+permit was acknowledged, or the end is unconfirmed. A launcher killed by a stop, timeout or lost
+lease writes no `stopped` frame, and a local launcher's exit is never derived into a guest end:
+missing proof stays unconfirmed.
+
+A transfer answer is a manifest frame naming every root and file with its length, modification
+time and SHA-256 digest, one file frame followed by exactly that many bytes for each file, and a
+done frame. The runner opens every source and every directory on the walk itself without crossing
+a symlink or a mount point, so a guest transfer never goes through a UNC view, and it holds each
+source's descriptor from the manifest through the last streamed byte. Files within exported
+directories are read through the descriptors the walk retained, never reopened by name, and
+proof and receipt artifacts are excluded from transfer data. What an export promises is per-file
+consistency: each file is what the plan admitted at the moment it was read; a source that changed
+while it was read publishes nothing. The controller writes each stream to a private temporary in
+the destination's own directory, checks the manifest and the arriving digest, and publishes every
+temporary only after the done frame and a successful runner exit: a transfer that fails after some
+of its files arrived leaves no destination behind for those files. A stage transfer copies a
+guest source into the scratch workspace. An upload installs a snapshot the host read under its own
+native read fence: its manifest line and the announced bytes follow the request on the pipe, the
+runner writes them into the workspace it owns, and a file whose received bytes do not hash to its
+announced digest refuses the whole snapshot. An export reads the admitted paths back; a
+remove-scratch transfer accepts only the runner's own workspace receipt.
+
+On the Windows side the publication is bound to the destination that was checked, not to
+pathnames. The export admits only a local fixed NTFS or ReFS volume and refuses DrvFS,
+network-backed and unrecognized providers at the door, because those cannot promise the identity
+and no-replace guarantees the commit runs on. Each commit pins its destination directory with an
+open handle that denies the directory's deletion and rename through the whole publication, creates
+the temporary exclusively in that directory so it inherits its ACL, and seals the temporary's
+identity and SHA-256 as it writes. The publication reopens the temporary, re-checks its identity
+and its sealed digest, re-reads the pinned name's identity, and renames relative to the pinned
+directory handle with no replace flag; an entry that appears at the name in any gap fails the
+publication and is never overwritten. There is no pathname rename or delete fallback: cleanup
+removes only the identity the export created. One shared commit gate (handle close, cancellation,
+and the permission lease the call was admitted under) runs before directory creation and again
+immediately before each publication, with no I/O under it. A stop that wins the gate leaves the
+files already committed in place; the result names how many were published before it and that
+they remain, and never claims a whole-tree publish or a clean slate when part of one landed.
+Export names are fresh by construction: an `overwrite` argument is a migration error, not a
+behavior.
+
+The wire's limits are one table, enforced on both ends of the same values, and each is refused
+where the bytes would be rather than after them. Declared oversize is refused at the manifest,
+before an allocation or a copy; counts are enforced while a walk enumerates, not after it
+collects; and hashing and copying check their budget and the stop state between chunks.
+
+| Limit | Value | Checked |
+| --- | --- | --- |
+| Request frame | 128 KiB | guest, before parse |
+| Script | 64 KiB | guest, before parse |
+| Control and output frame | 64 KiB | both ends, per frame |
+| Manifest | 32 MiB | host reader, before parse |
+| Roots | 32 | request validation and manifest |
+| Entries per manifest | 100,000 | manifest and walk |
+| Path depth | 64 components | request and manifest |
+| Path length | 4,096 bytes | request and manifest |
+| File size | 2 GiB | manifest and payload |
+| Aggregate transfer | 8 GiB | manifest total and payload |
+| Command timeout | 1 hour | request and deadline |
+| Scratch quota | request's `quota_bytes` | guest admission, not a runtime write cap |
+
+The 8 GiB scratch maximum is a workspace quota, not an export limit; the export budgets are the
+table's own. The one deadline runs from launch through publication, with a bounded teardown grace
+on stop before the local launcher is killed. Blocking filesystem work stays off the async
+supervisor, and a stop, revoke or close is observed before the manifest and between disk writes.
+
+The runner requires a non-root user, a root-owned Bubblewrap with fd binds, user namespaces,
+Landlock ABI 6 or newer, and seccomp on x86-64 or little-endian ARM64. It opens the guest roots
+without crossing symlinks or mount points, admits ext filesystems only, and refuses overlapping
+roots and Meka's private directories. The sandbox mounts them at `/workspace`, `/workspaces/N`
+and `/references/N`; reference mounts are always read-only. It binds a read-only system runtime
+and masks WSL's host-backed subtrees under `/usr`. `subshell-exec` checks the mounts before it
+applies Landlock and a syscall filter that denies opening sockets, creating socket pairs and using
+`io_uring`. The command starts in private PID and network namespaces, with a clean environment and
+a private 256 MiB `/tmp`. That `/tmp` is per-command space, not a persistent scratch workspace.
+`subshell-exec` is that namespace's PID 1 and stays so: the shell is its child, it reaps the shell
+and then kills every other process left in the namespace before it exits, so a command that starts
+a new session or execs from a non-leader thread cannot escape the teardown.
+
+A scratch workspace is the request's `scratch` field made real: a directory under
+`/var/tmp/meka-scratch` whose name is the 16 hex characters the host generated for the handle.
+The runner creates it at `0700` before the host requests the snapshot's transfer,
+opens the root and the workspace relative to `/var/tmp` without following a symlink, requires both
+to be this user's own directory, then keeps the mode and a per-call heartbeat on it, and refuses a
+call whose quota the allocated blocks have crossed. A guest stage walks the source itself
+and records the length, modification time and SHA-256 digest of every staged file, refusing a
+symlink, a hard link or a mount crossing on the way. A Windows source is walked by the host under
+the same refusals and uploaded into the workspace, its announced totals judged against the quota
+before any byte is read and each digest re-checked as the bytes land. `create` is set on the one prepare call at
+open; later calls require the directory to still be there, so a reaped workspace fails loudly
+instead of coming back empty. A call claims the workspace as its own before it uses it, and a
+remove or reap needs exclusive ownership and identity validation before anything is removed: an
+unknown identity or a failed inspection is deferred, never read as absence, and a proven
+already-absent workspace answers with the valid empty completion sequence the host requires. The
+command quota is admission-time; recovery, export and bounded removal run even on an over-quota
+tree, so one does not strand the other. Each run reaps its siblings a day past their last use: a
+host that died without closing loses the workspace rather than leaving it forever, and what was
+never exported is lost with it. A scratch request runs at workspace access over its own directory and no
+additional mounts, and `workspace` is refused alongside `scratch` for the same reason.
+
+The boundary trusts the distro's system runtime, the runner selected by the caller, and the guest
+administrator. The mounts grant access to the files already present in admitted roots, including
+hard links or special files deliberately placed there. A writable root can contain files or hooks
+that an outside process will later use; confinement does not validate those contents. The guest
+PID namespace is torn down when its PID 1 exits, including children that start new process
+sessions. The runner also stops it on deadline, loss of the host lease or runner death.
+
+To exercise the guest integration in a compatible distro, set `TMPDIR` to a writable directory
+on the distro's root ext4 mount.
+
+```sh
+cargo test --locked --test cli guest_ -- --ignored
+```
+
+On Windows, set both `MEKA_WSL_RUNNER` and `MEKA_WSL_LOADER` to the Linux payloads before
+building, or neither; the build refuses a half-set pair. Set
+`MEKA_TEST_WSL_DISTRO` to a test distro name and `MEKA_TEST_WSL_TMPDIR` to a writable directory
+on its root ext filesystem. The tests create and remove isolated guest workspaces.
+
+```powershell
+cargo test --locked --test cli windows_wsl_ -- --ignored
+```
 
 ## What each host offers
 

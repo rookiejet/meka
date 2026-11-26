@@ -900,6 +900,14 @@ pub(crate) async fn build_session_agent(
         crate::provider::PublishedProfile::new(&resolved, context_window),
         frontend,
     );
+    #[cfg(windows)]
+    {
+        let wsl = shared.config.managed_wsl()?;
+        // What a target's grants are made of decides whether `read` can open it at all, so it is
+        // recorded with the target rather than re-derived from the configuration later.
+        let needs_workspace = wsl.is_some() && shared.config.managed_wsl_needs_workspace();
+        cells.set_managed_wsl(wsl.map(Arc::new), needs_workspace);
+    }
     cells.context_tokens = context_tokens;
     cells.context_overhead = context_overhead;
     cells.project = crate::session::SharedProject::new(project);

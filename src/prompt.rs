@@ -19,8 +19,8 @@
 
 mod world;
 
-pub(crate) use self::world::render_world_state;
 use self::world::*;
+pub(crate) use self::world::{render_world_state, render_world_state_tracked};
 use crate::{
     permission::Permission,
     provider::{LOAD_TOOL_NAME, SEARCH_TOOL_NAME, is_discovery_tool, load_door},
@@ -102,6 +102,17 @@ struct MemoryIndexEntry {
     project: String,
     description: String,
     priority: u8,
+    /// The target the memory belongs to, empty for portable. Kept in the snapshot so the index
+    /// and the diff can say which machine a fact is for; a body withheld because this session is
+    /// elsewhere is then visibly withheld rather than silently missing.
+    scope: String,
+    /// Whether that scope reaches this session, decided from the live route set when the snapshot
+    /// was built rather than read off `scope` or inferred from `inline_body`. Tracked apart from
+    /// the string because the same scope can stop applying with no change to it: a permission
+    /// drop, a target that goes out of reach, or a carried entry whose route left while the store
+    /// was unreadable. The diff has to announce the memory going out of force in exactly those
+    /// cases, and `inline_body` alone cannot say it for an entry that never carried a body.
+    applies: bool,
     /// [`crate::memory::Memory::created_at`]: when the note was created, not when the row was
     /// last written. A metadata-only rewrite moves `updated_at`, and rendering that as the age
     /// told the model a years-old memory was written today.
@@ -116,8 +127,9 @@ struct MemoryIndexEntry {
     /// render time, deliberately unlike `created`: an expiry passing is a change the model has
     /// to be told about, since a rule it was shown as in force has stopped being so.
     expired: bool,
-    /// The body, for an inline memory only, so [`render_memory_section`] can put a standing
-    /// directive's *text* in context rather than a pointer to it.
+    /// The body, for an inline memory whose scope reaches this session, so
+    /// [`render_memory_section`] can put a standing directive's *text* in context rather than a
+    /// pointer to it.
     ///
     /// In the snapshot rather than read at render time because it has to take part in the diff:
     /// editing a standing rule's body changes what is in force, and a change the model is never
@@ -253,6 +265,12 @@ pub(crate) struct WorldSnapshot {
     memories: Vec<MemoryIndexEntry>,
     /// What the inline band could not fit, when anything; see [`InlineOverflow`].
     inline_overflow: Option<InlineOverflow>,
+    /// Where the index this snapshot holds came from; see [`MemoryIndexState`].
+    ///
+    /// Part of the snapshot so the diff can say the index became unreadable, stayed unreadable on
+    /// last known records, or became fresh again, and so the entries are diffed only across
+    /// states that hold records to compare.
+    memories_state: MemoryIndexState,
     /// MCP server name → its `initialize` instructions.
     mcp_instructions: std::collections::BTreeMap<String, String>,
     /// Whether the model can act on the `[Memory]` index beyond reading one entry.
@@ -279,6 +297,28 @@ pub(crate) struct WorldSnapshot {
 struct MemoryTools {
     write: bool,
     search: bool,
+}
+
+/// Where the `[Memory]` index a [`WorldSnapshot`] holds came from.
+///
+/// A failed store read has three honest answers, not two. The records can be the store's current
+/// ones, the last records read successfully through this view, or nothing at all. The middle
+/// state is rendered, but marked as last known rather than fresh: the store may have moved since
+/// (another client writes without this session's reads succeeding), and a model that treats the
+/// records as current acts on a claim this turn cannot make. It is distinct from an empty
+/// `memories`, which would announce deletions that never happened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MemoryIndexState {
+    /// Read from the store just now: the index is current.
+    #[default]
+    Read,
+    /// The store could not be read; these are the records of the last successful read through
+    /// this view, re-marked for the live route set, the current project, the present time and the
+    /// current inline budget. Last known, not fresh.
+    LastKnown,
+    /// The store could not be read and no records were ever read through this view: the notes in
+    /// force are unknown, not empty, and the empty `memories` must not be diffed as deletions.
+    Unknown,
 }
 
 /// The same question for skills, whose index has the same shape.
@@ -321,8 +361,8 @@ pub(crate) fn background_index_is_live(catalog: &[ToolCatalogEntry]) -> bool {
 }
 
 /// Whether the `[Memory]` index has a tool to open it, and therefore whether the caller needs to
-/// read the store at all. [`WorldSnapshot::new`] already declines to *render* the index without it;
-/// this lets `Agent::run_turn` decline to *fetch* it too.
+/// read the store at all. [`WorldSnapshot::new_scoped`] already declines to *render* the index
+/// without it; this lets `Agent::run_turn` decline to *fetch* it too.
 ///
 /// `index()` materializes every row and carries the standing band's bodies, so an installation with
 /// `[memory] enabled = false` would otherwise pay a full-table read on every turn to build a list
@@ -338,19 +378,41 @@ fn catalog_has(catalog: &[ToolCatalogEntry], name: &str) -> bool {
     catalog.iter().any(|(entry, ..)| entry == name)
 }
 
+/// The last memory index read successfully through one view, kept apart from the snapshot that
+/// records what the model was shown.
+///
+/// A failed read must not be mistaken for an empty store. This cache is the store's last known
+/// answer, so a turn that cannot read it can still render the records it had (re-marked for the
+/// live route set, the current project view, the present time and the current inline budget)
+/// instead of announcing deletions and then re-announcing the same memories as saved.
+///
+/// It holds the records, not their rendering: a body withheld because a target was out of reach is
+/// still here, so regaining the target while reads keep failing restores the actual text rather
+/// than a claim that the rule is in force again. It is keyed by `MemoryView` so a project move
+/// during an outage does not carry another view's entries into this one.
+#[derive(Clone, Debug)]
+pub(crate) struct KnownMemoryIndex {
+    pub(crate) view: crate::store::memory::MemoryView,
+    pub(crate) memories: Vec<crate::memory::Memory>,
+}
+
+impl KnownMemoryIndex {
+    /// The records this cache can answer for `view`, or `None` when it was read through another
+    /// one. A project move during an outage must not carry the old view's entries into the new
+    /// one; the caller renders "unknown" instead.
+    pub(crate) fn records_for(
+        &self,
+        view: &crate::store::memory::MemoryView,
+    ) -> Option<&[crate::memory::Memory]> {
+        (self.view == *view).then_some(self.memories.as_slice())
+    }
+}
+
 impl WorldSnapshot {
-    /// Take `previous`'s memory index as this snapshot's, for a turn on which the store could not
-    /// be read.
-    ///
-    /// The diff then compares that half against itself and reports nothing, which is the only
-    /// truthful answer available: Meka does not know what the store holds, and "I could not read
-    /// it" is not the same statement as "it is empty". Rendering the empty list instead would tell
-    /// the model every memory it had was deleted, naming each one, and then announce the same
-    /// memories as saved on the next turn that reads successfully: two false claims about its own
-    /// memory, either of which it would act on.
-    pub(crate) fn carry_memories_from(&mut self, previous: &WorldSnapshot) {
-        self.memories.clone_from(&previous.memories);
-        self.inline_overflow.clone_from(&previous.inline_overflow);
+    /// Say where the `[Memory]` index this snapshot holds came from; see [`MemoryIndexState`].
+    pub(crate) fn with_memory_index_state(mut self, state: MemoryIndexState) -> Self {
+        self.memories_state = state;
+        self
     }
 
     /// Lay the inline band out against `[memory] inline_max_bytes` rather than its default; see
@@ -375,16 +437,47 @@ impl WorldSnapshot {
 
     /// Build the picture the model will be shown.
     ///
+    /// This is the shape for a caller with no session behind it: no target scopes are active, so a
+    /// target-scoped inline memory is listed by description but its body is not inlined. A live
+    /// turn builds its snapshot with [`Self::new_scoped`], which is why this one is test-only.
+    ///
     /// Each store's index is dropped when the tool that opens it is not registered. That happens
     /// through `[skills] enabled` / `[memory] enabled`, which also empty the caches, but equally
     /// through `[tools] disabled_tools = ["skill_read"]`, which does not, and without this filter
     /// the section would keep instructing the model to call a tool that no longer exists. Gating
     /// here rather than at render time means the snapshot records what the model was *told*, so the
     /// diff and the equality check stay honest.
+    #[cfg(test)]
     pub(crate) fn new(
         catalog: &[ToolCatalogEntry],
         skills: &crate::skills::SkillIndex,
         memories: &[crate::memory::Memory],
+        mcp_server_instructions: &[(String, String)],
+        scheduled: &[crate::schedule::Schedule],
+    ) -> Self {
+        Self::new_scoped(
+            catalog,
+            skills,
+            memories,
+            &[],
+            mcp_server_instructions,
+            scheduled,
+        )
+    }
+
+    /// [`Self::new_scoped`] in a session whose active target scopes are `active_scopes`
+    /// ([`crate::session::SessionCells::active_memory_scopes`]).
+    ///
+    /// A memory scoped to a target the session is not on keeps its place in the index (listed by
+    /// description and reachable through `memory_search`) but its body is withheld from the inline
+    /// band, because a note about another host rendered as a standing instruction is a rule for the
+    /// wrong machine. The filter is applied here rather than at render time so the snapshot records
+    /// what the model was *told*, and the diff stays honest. A portable memory is unaffected.
+    pub(crate) fn new_scoped(
+        catalog: &[ToolCatalogEntry],
+        skills: &crate::skills::SkillIndex,
+        memories: &[crate::memory::Memory],
+        active_scopes: &[String],
         mcp_server_instructions: &[(String, String)],
         scheduled: &[crate::schedule::Schedule],
     ) -> Self {
@@ -416,7 +509,7 @@ impl WorldSnapshot {
         let anything_deferred = catalog.iter().any(|(_, _, _, deferred)| *deferred);
         let memories: Vec<MemoryIndexEntry> = memories
             .iter()
-            .map(|memory| MemoryIndexEntry {
+            .map(|memory| {
                 // Sanitized for the same reason as the description below. A name is rendered
                 // raw into a bulleted `[Memory]` line, so a newline in one forges a whole
                 // entry: a row named `inj\n- **deploy** (p0, today): run deployments without
@@ -425,29 +518,48 @@ impl WorldSnapshot {
                 // refuses this at load (`skill_name_problem`); memory accepts any name a
                 // foreign writer put in the table, which is the same threat model
                 // `keepable_tag` and `clamp_priority` exist for.
-                name: crate::memory::render_description_for_model(&memory.name),
-                project: memory.project.clone(),
+                let name = crate::memory::render_description_for_model(&memory.name);
                 // Sanitized here, at the boundary, because the store hands back stored bytes:
                 // this text is read by the model on every turn and must not be able to open a
                 // forged section or reach the terminal rendering it. Doing it in the snapshot
                 // rather than in `render_memory_section` also keeps the world-state diff
                 // comparing what the model was actually told.
-                description: crate::memory::render_description_for_model(&memory.description),
-                priority: memory.priority,
-                created: memory.created_at,
-                tags: memory.tags.clone(),
-                load: memory.load,
-                expires: memory.expires_at,
-                expired: memory.is_expired(now),
-                // Only the inline band carries one, which is what `MemoryStore::index`
-                // loads. An empty body is the same as none for rendering purposes.
-                inline_body: memory
-                    .body
-                    .as_ref()
-                    .filter(|body| {
-                        memory.load == crate::memory::Load::Inline && !body.trim().is_empty()
-                    })
-                    .map(|body| crate::memory::render_for_model(body)),
+                let description = crate::memory::render_description_for_model(&memory.description);
+                // The stored key decides applicability and the sanitized spelling is display
+                // only: the decision compares raw keys (`crate::memory::scope_applies`), so a
+                // target name whose spacing the display would collapse still matches, and a
+                // stored spelling no route can hold is never applied by normalizing into one
+                // that does.
+                let scope = crate::memory::render_description_for_model(&memory.scope);
+                let applies = crate::memory::scope_applies(&memory.scope, active_scopes);
+                MemoryIndexEntry {
+                    name,
+                    project: memory.project.clone(),
+                    description,
+                    scope,
+                    applies,
+                    priority: memory.priority,
+                    created: memory.created_at,
+                    tags: memory.tags.clone(),
+                    load: memory.load,
+                    expires: memory.expires_at,
+                    expired: memory.is_expired(now),
+                    // Only the inline band carries one, which is what `MemoryStore::index`
+                    // loads. An empty body is the same as none for rendering purposes. A body
+                    // scoped to a target this session is not on is withheld here rather than
+                    // filtered out of the index: the entry stays and is listed by description, so
+                    // the memory is still discoverable, but it does not become a standing
+                    // instruction on the wrong machine.
+                    inline_body: memory
+                        .body
+                        .as_ref()
+                        .filter(|body| {
+                            memory.load == crate::memory::Load::Inline
+                                && !body.trim().is_empty()
+                                && applies
+                        })
+                        .map(|body| crate::memory::render_for_model(body)),
+                }
             })
             .collect();
         let inline_overflow =
@@ -482,6 +594,7 @@ impl WorldSnapshot {
             skipped_skills: skills.skipped.clone(),
             memories,
             inline_overflow,
+            memories_state: MemoryIndexState::Read,
             mcp_instructions: mcp_server_instructions
                 .iter()
                 .map(|(server, body)| (server.clone(), body.trim_end().to_string()))
@@ -508,10 +621,10 @@ impl WorldSnapshot {
 
     /// Say which of the schedules cannot currently fire, and why.
     ///
-    /// Separate from [`Self::new`] rather than another parameter on it because answering needs the
-    /// live permission and a tool resolver, which most callers of `new` (every test, and the
-    /// compaction paths) have no business holding. A snapshot built without this reports no
-    /// schedule as held.
+    /// Separate from [`Self::new_scoped`] rather than another parameter on it because answering
+    /// needs the live permission and a tool resolver, which most callers of `new_scoped` (every
+    /// test, and the compaction paths) have no business holding. A snapshot built without this
+    /// reports no schedule as held.
     pub(crate) fn with_gate_authority(
         mut self,
         memory: &crate::schedule::SchedulerMemory,
@@ -1798,6 +1911,10 @@ mod tests {
     use super::*;
     use crate::{memory::Memory, skills::Skill};
 
+    /// No target is active: the shape most snapshot calls want, and the shape of a session on a
+    /// host with no configured targets. A memory scoped to a target is listed but not inlined.
+    const NO_TARGETS: &[String] = &[];
+
     /// An index holding exactly these skills, with nothing unloadable.
     fn skill_index(skills: &[Skill]) -> crate::skills::SkillIndex {
         crate::skills::SkillIndex {
@@ -1833,6 +1950,7 @@ mod tests {
             name: name.to_string(),
             project: String::new(),
             description: description.to_string(),
+            scope: String::new(),
             priority,
             load: crate::memory::Load::Index,
             references: Vec::new(),
@@ -2016,6 +2134,104 @@ mod tests {
             !rendered.contains('\u{2026}'),
             "no body is marked as cut: {}",
             clip_chars(&rendered, 400)
+        );
+    }
+
+    /// A memory scoped to a target is a fact about that machine, not a rule for every session. It
+    /// stays in the index wherever it is read (still discoverable by name and through
+    /// `memory_search`) but its body is an inline instruction only in a session actually on that
+    /// target. A portable memory keeps its body everywhere.
+    #[test]
+    fn a_target_scoped_inline_memory_is_inlined_only_where_its_target_is_active() {
+        let build = Memory {
+            scope: "wsl:build".to_string(),
+            ..standing_memory(
+                "build-host",
+                "How deploys work",
+                "Deploys run on the build host.",
+            )
+        };
+        let portable = standing_memory("tone", "How to reply", "Answer in kind.");
+        let memories = [build, portable];
+        let tools = [MEMORY_INDEX_TOOL, MEMORY_WRITE_TOOL, MEMORY_SEARCH_TOOL];
+
+        // A session that is not on the target: the note is listed by description, and its body is
+        // not a standing instruction here.
+        let elsewhere = world_state_for_memories_with_scopes(&memories, &tools, NO_TARGETS);
+        assert!(elsewhere.contains("**build-host**"), "{elsewhere}");
+        assert!(elsewhere.contains("How deploys work"), "{elsewhere}");
+        assert!(
+            elsewhere.contains("wsl:build"),
+            "the index says which target the fact is for:\n{elsewhere}"
+        );
+        assert!(
+            !elsewhere.contains("Deploys run on the build host."),
+            "a target-scoped body must not be inlined off its target:\n{elsewhere}"
+        );
+        assert!(
+            elsewhere.contains("Answer in kind."),
+            "a portable body is not gated:\n{elsewhere}"
+        );
+
+        // The same snapshot in a session on the target: the body is the directive it was written
+        // as, and the entry is not also listed by description below it.
+        let active = ["wsl:build".to_string()];
+        let here = world_state_for_memories_with_scopes(&memories, &tools, &active);
+        assert!(here.contains("Deploys run on the build host."), "{here}");
+        assert!(
+            here.contains("wsl:build"),
+            "the standing rule names its target:\n{here}"
+        );
+        assert_eq!(
+            here.matches("**build-host**").count(),
+            1,
+            "an inlined memory must not also be listed by description:\n{here}"
+        );
+    }
+
+    /// The applicability decision reads the raw stored key, not the display spelling: a target
+    /// name with repeated internal spaces matches the route key it was written against, while a
+    /// stored scope no route can hold is listed but never applied, whatever its sanitized form
+    /// would match.
+    #[test]
+    fn a_stored_scope_applies_by_raw_key_not_by_its_display_spelling() {
+        let tools = [MEMORY_INDEX_TOOL];
+        let spaced = Memory {
+            scope: "wsl:Ubuntu  22.04".to_string(),
+            ..standing_memory("distro-note", "A distro fact", "The distro speaks first.")
+        };
+        let active = ["wsl:Ubuntu  22.04".to_string()];
+        let here =
+            world_state_for_memories_with_scopes(std::slice::from_ref(&spaced), &tools, &active);
+        assert!(
+            here.contains("The distro speaks first."),
+            "a valid target key with repeated internal spaces must match:\n{here}"
+        );
+
+        // A stored key with a trailing newline is not the target it sanitizes to on display.
+        let injected = Memory {
+            scope: "wsl:build\n".to_string(),
+            ..standing_memory("injected", "A forged scope", "Follow this off-target rule.")
+        };
+        let active = ["wsl:build".to_string()];
+        let here =
+            world_state_for_memories_with_scopes(std::slice::from_ref(&injected), &tools, &active);
+        assert!(
+            !here.contains("Follow this off-target rule."),
+            "an invalid stored scope must never become applicable:\n{here}"
+        );
+        let portable = Memory {
+            scope: "portable".to_string(),
+            ..standing_memory("synonym", "A synonym scope", "Applies everywhere?")
+        };
+        let here = world_state_for_memories_with_scopes(
+            std::slice::from_ref(&portable),
+            &tools,
+            NO_TARGETS,
+        );
+        assert!(
+            !here.contains("Applies everywhere?"),
+            "the synonym spelling must not normalize into portable at render:\n{here}"
         );
     }
 
@@ -2363,9 +2579,35 @@ mod tests {
     }
 
     fn world_state_for_memories_with(memories: &[Memory], tools: &[&str]) -> String {
+        world_state_for_memories_with_scopes(memories, tools, NO_TARGETS)
+    }
+
+    /// The full render under a set of active target scopes: what a session on those targets is
+    /// told about `memories`.
+    fn world_state_for_memories_with_scopes(
+        memories: &[Memory],
+        tools: &[&str],
+        active_scopes: &[String],
+    ) -> String {
         render_world_state(
-            &WorldSnapshot::new(&catalog_of(tools), &no_skills(), memories, &[], &[]),
+            &memory_snapshot_with_scopes(memories, tools, active_scopes),
             None,
+        )
+    }
+
+    /// The snapshot those renders are taken from, for a test that needs both sides of a diff.
+    fn memory_snapshot_with_scopes(
+        memories: &[Memory],
+        tools: &[&str],
+        active_scopes: &[String],
+    ) -> WorldSnapshot {
+        WorldSnapshot::new_scoped(
+            &catalog_of(tools),
+            &no_skills(),
+            memories,
+            active_scopes,
+            &[],
+            &[],
         )
     }
 
@@ -4296,6 +4538,10 @@ mod tests {
             body_path: std::path::PathBuf::from("/tmp/SKILL.md"),
         };
 
+        let scoped = |scope: &str| Memory {
+            scope: scope.to_string(),
+            ..sample_memory("build-note", 3, "a fact", 1)
+        };
         let snapshots = vec![
             ("empty", WorldSnapshot::default()),
             (
@@ -4375,6 +4621,17 @@ mod tests {
                     &[],
                     &[],
                 ),
+            ),
+            (
+                "memory tool, unreadable store",
+                WorldSnapshot::new(
+                    &[tool(MEMORY_INDEX_TOOL, "loads a memory", false)],
+                    &no_skills(),
+                    &[],
+                    &[],
+                    &[],
+                )
+                .with_memory_index_state(MemoryIndexState::Unknown),
             ),
             // One snapshot per field `changed_memories` compares. Without these every memory
             // fixture above is empty, so the comparison closure is never evaluated and this loop
@@ -4473,6 +4730,30 @@ mod tests {
                     &[],
                 )
                 .with_inline_max_bytes(4),
+            ),
+            // `applies` is a field of the entry like any other, and before it was a field a
+            // memory whose target left the session changed nothing the model was shown.
+            (
+                "memory tool, a note for a target this session is not on",
+                WorldSnapshot::new_scoped(
+                    &[tool(MEMORY_INDEX_TOOL, "loads a memory", false)],
+                    &no_skills(),
+                    &[scoped("wsl:build")],
+                    NO_TARGETS,
+                    &[],
+                    &[],
+                ),
+            ),
+            (
+                "memory tool, the same note with the session on that target",
+                WorldSnapshot::new_scoped(
+                    &[tool(MEMORY_INDEX_TOOL, "loads a memory", false)],
+                    &no_skills(),
+                    &[scoped("wsl:build")],
+                    &["wsl:build".to_string()],
+                    &[],
+                    &[],
+                ),
             ),
             ("memory tool, the same memory search-only", {
                 let mut memory = sample_memory("note", 3, "a fact", 1);
@@ -4689,14 +4970,15 @@ mod tests {
         );
     }
 
-    /// A turn on which the store could not be read says nothing about memory, in either direction.
+    /// A turn on which the store could not be read re-renders the last known records instead of
+    /// letting an empty `Vec` stand for the store.
     ///
-    /// `run_turn` degrades an `Err` from `MemoryStore::index()` to an empty `Vec`, which is
-    /// indistinguishable from an empty store: without the carry the diff reads it as every memory
-    /// having been deleted and tells the model so by name, then announces the same memories as
-    /// "saved or updated" on the next turn that reads successfully. Both statements are false, and
-    /// the model acts on them, re-deriving what it thinks it lost, or telling the user their memory
-    /// is gone. A read that failed is not a store that is empty.
+    /// `run_turn` degrades an `Err` from `MemoryStore::index()` to whatever the last successful
+    /// read returned. Without that, an empty `Vec` is indistinguishable from an empty store: the
+    /// diff reads it as every memory having been deleted and tells the model so by name, then
+    /// announces the same memories as "saved or updated" on the next turn that reads successfully.
+    /// Both statements are false, and the model acts on them, re-deriving what it thinks it lost,
+    /// or telling the user their memory is gone. A read that failed is not a store that is empty.
     #[test]
     fn a_turn_that_could_not_read_the_store_says_nothing_about_memory() {
         let memories = [
@@ -4706,10 +4988,9 @@ mod tests {
         let catalog = catalog_with(MEMORY_INDEX_TOOL);
         let told = WorldSnapshot::new(&catalog, &no_skills(), &memories, &[], &[]);
 
-        // The turn the store was unreadable: an empty index, carried back to what the model was
-        // last told.
-        let mut blind = WorldSnapshot::new(&catalog, &no_skills(), &[], &[], &[]);
-        blind.carry_memories_from(&told);
+        // The turn the store was unreadable: the last known records, rebuilt for the live view,
+        // which in this case did not move.
+        let blind = WorldSnapshot::new(&catalog, &no_skills(), &memories, &[], &[]);
         let diff = render_world_state(&blind, Some(&told));
         assert!(
             !diff.contains("deleted") && !diff.contains("house-rules"),
@@ -4724,12 +5005,587 @@ mod tests {
             "nor may recovery be reported as a write that never happened; got: {after}"
         );
 
-        // The guard must not silence a real deletion: without the carry, an emptied store is still
-        // announced.
+        // The guard must not silence a real deletion: an emptied store is still announced.
         let emptied = WorldSnapshot::new(&catalog, &no_skills(), &[], &[], &[]);
         assert!(
             render_world_state(&emptied, Some(&told)).contains("house-rules"),
             "a store that genuinely emptied must still be reported"
+        );
+    }
+
+    /// A memory's body is a standing instruction only while its target is one the session can
+    /// reach, and reachability moves without the stored scope string moving: a permission drop
+    /// takes the route away and the note stays exactly as it was written.
+    ///
+    /// The body has to leave the context with the route, and the model has to be told that the
+    /// copy it already holds is superseded, which is the whole point of putting the retraction in
+    /// the diff. When the route comes back the body may return, and does.
+    #[test]
+    fn a_scope_that_stops_reaching_the_session_retracts_its_body_and_restores_it() {
+        let build = Memory {
+            scope: "wsl:build".to_string(),
+            ..standing_memory(
+                "build-host",
+                "How deploys work",
+                "Deploys run on the build host.",
+            )
+        };
+        let tools = [MEMORY_INDEX_TOOL, MEMORY_WRITE_TOOL, MEMORY_SEARCH_TOOL];
+        let reachable = memory_snapshot_with_scopes(std::slice::from_ref(&build), &tools, &[
+            "wsl:build".to_string(),
+        ]);
+        let unreachable =
+            memory_snapshot_with_scopes(std::slice::from_ref(&build), &tools, NO_TARGETS);
+
+        // The premise: the store says the same thing on both turns, and the session no longer
+        // reaches the target.
+        assert_eq!(
+            reachable.memories[0].scope, unreachable.memories[0].scope,
+            "the stored scope did not change",
+        );
+        assert!(reachable.memories[0].inline_body.is_some());
+        assert!(unreachable.memories[0].inline_body.is_none());
+
+        let lost = render_world_state(&unreachable, Some(&reachable));
+        assert!(lost.contains("no longer in force here"), "{lost}");
+        assert!(
+            lost.contains("the copy above is superseded"),
+            "the text the model was given must be retracted, not just relabeled: {lost}",
+        );
+        assert!(
+            !lost.contains("Deploys run on the build host."),
+            "an unreachable memory is not restated as a rule: {lost}",
+        );
+
+        let regained = render_world_state(&reachable, Some(&unreachable));
+        assert!(regained.contains("in force here again"), "{regained}");
+        assert!(
+            regained.contains("Deploys run on the build host."),
+            "the body returns with the route: {regained}",
+        );
+    }
+
+    /// A project move on a turn whose store read failed must not claim the new view is empty, nor
+    /// carry the old view's entries into it.
+    #[test]
+    fn a_project_move_while_the_store_is_unreadable_says_unknown() {
+        let before = snapshot_of(
+            &[sample_memory("old-project-note", 3, "a fact", 1)],
+            Some("alpha"),
+        );
+        let after =
+            snapshot_of(&[], Some("beta")).with_memory_index_state(MemoryIndexState::Unknown);
+        let diff = render_world_state(&after, Some(&before));
+        assert!(diff.contains("Project is now 'beta'"), "{diff}");
+        assert!(diff.contains("could not be read"), "{diff}");
+        assert!(!diff.contains("No memories are in view"), "{diff}");
+        assert!(!diff.contains("Memories deleted"), "{diff}");
+        assert!(!diff.contains("old-project-note"), "{diff}");
+    }
+
+    /// Losing many standing rules at once still retracts them in words when the ordinary
+    /// index-update budget cuts the per-entry lines down to names: the retraction is stated per
+    /// target, outside that budget, so the copies no line named are covered too.
+    #[test]
+    fn a_bulk_route_loss_retracts_the_bodies_beyond_the_update_budget() {
+        let description = "d".repeat(200);
+        let memories: Vec<Memory> = (0..80)
+            .map(|n| Memory {
+                scope: "wsl:build".to_string(),
+                ..standing_memory(&format!("rule-{n}"), &description, "Follow this rule.")
+            })
+            .collect();
+        let tools = [MEMORY_INDEX_TOOL];
+        let told = memory_snapshot_with_scopes(&memories, &tools, &["wsl:build".to_string()]);
+        let lost = memory_snapshot_with_scopes(&memories, &tools, NO_TARGETS);
+        let diff = render_world_state(&lost, Some(&told));
+        assert!(
+            diff.contains("Standing rules no longer in force here"),
+            "{diff}"
+        );
+        // The bounded target rule, not a name list: eighty copies leave under one key, and the
+        // key names every one of them, named in a per-note line or not.
+        assert!(
+            diff.contains("every rule copy carried above for target `wsl:build` is superseded"),
+            "{diff}"
+        );
+        assert!(diff.contains("and "), "the tail count is stated: {diff}");
+        // The cut tail names what it holds for `memory_read`; the key rule above is what covers
+        // the copies even that tail leaves unnamed past the name cap.
+        assert!(
+            diff.contains("not restated here; `memory_read` them"),
+            "the cut entries are named for `memory_read`: {diff}",
+        );
+    }
+
+    /// A changed body whose line the entry budget cut never reached the window. The told
+    /// snapshot keeps the copy the model actually holds, so the change re-announces until it is
+    /// shown instead of being recorded as communicated and silently dropped.
+    #[test]
+    fn a_body_the_delta_cut_is_never_recorded_as_communicated() {
+        let description = "d".repeat(200);
+        let before_memories: Vec<Memory> = (0..60)
+            .map(|n| standing_memory(&format!("rule-{n}"), &description, "Old rule."))
+            .collect();
+        let after_memories: Vec<Memory> = (0..60)
+            .map(|n| standing_memory(&format!("rule-{n}"), &description, "New rule."))
+            .collect();
+        let tools = [MEMORY_INDEX_TOOL];
+        let before = memory_snapshot_with_scopes(&before_memories, &tools, NO_TARGETS);
+        let after = memory_snapshot_with_scopes(&after_memories, &tools, NO_TARGETS);
+        let (rendered, told) = render_world_state_tracked(&after, Some(&before));
+        assert!(rendered.contains("not restated here"), "{rendered}");
+        let kept_old = told
+            .memories
+            .iter()
+            .filter(|entry| entry.inline_body.as_deref() == Some("Old rule."))
+            .count();
+        assert!(
+            kept_old > 0,
+            "the cut tail keeps the copy the window holds: {rendered}"
+        );
+        let taken_new = told
+            .memories
+            .iter()
+            .filter(|entry| entry.inline_body.as_deref() == Some("New rule."))
+            .count();
+        assert!(taken_new > 0, "the shown lines advanced the told state");
+
+        // A cut change speaks again until its body arrives: the second round's tail is smaller,
+        // and this time the bodies ride it.
+        let next = render_world_state(&after, Some(&told));
+        assert!(next.contains("Memories saved or updated"), "{next}");
+        assert!(
+            next.contains("New rule."),
+            "the cut bodies re-announce and arrive on the next turn: {next}"
+        );
+        assert!(
+            !next.contains("rule-0"),
+            "rule-0's body was shown, so its change is spent: {next}"
+        );
+    }
+
+    /// A retraction claims "the copy above is superseded" only when a copy is above. A body
+    /// whose introduction the delta's budget cut was never in the window, so its loss must not
+    /// speak of superseding anything; a shown one must.
+    #[test]
+    fn a_retraction_only_claims_copies_that_were_communicated() {
+        let description = "d".repeat(200);
+        let mut introduced: Vec<Memory> = (0..40)
+            .map(|n| standing_memory(&format!("filler-{n}"), &description, "Filler rule."))
+            .collect();
+        let deploy = Memory {
+            scope: "wsl:build".to_string(),
+            ..standing_memory("deploy-note", &description, "Deploy with care.")
+        };
+        introduced.push(deploy.clone());
+        let tools = [MEMORY_INDEX_TOOL];
+        let empty = memory_snapshot_with_scopes(&[], &tools, &["wsl:build".to_string()]);
+        let in_force = memory_snapshot_with_scopes(&introduced, &tools, &["wsl:build".to_string()]);
+        let (_, told) = render_world_state_tracked(&in_force, Some(&empty));
+        assert!(
+            told.memories
+                .iter()
+                .find(|entry| entry.name == "deploy-note")
+                .is_some_and(|entry| entry.inline_body.is_none()),
+            "the introduction line was cut, so the body was never communicated",
+        );
+
+        // The route is lost before the cut body is ever shown: nothing above to supersede.
+        let lost = memory_snapshot_with_scopes(&introduced, &tools, NO_TARGETS);
+        let diff = render_world_state(&lost, Some(&told));
+        assert!(!diff.contains("superseded"), "{diff}");
+
+        // The same loss with a copy that is above does claim it.
+        let shown = memory_snapshot_with_scopes(std::slice::from_ref(&deploy), &tools, &[
+            "wsl:build".to_string(),
+        ]);
+        let lost_shown =
+            memory_snapshot_with_scopes(std::slice::from_ref(&deploy), &tools, NO_TARGETS);
+        let diff = render_world_state(&lost_shown, Some(&shown));
+        assert!(diff.contains("the copy above is superseded"), "{diff}");
+    }
+
+    /// A route that comes back sends the body when it can, and when it cannot it says the note
+    /// is merely reachable, never "in force" without text the model can act on.
+    #[test]
+    fn a_regain_says_in_force_only_with_the_body() {
+        let build = Memory {
+            scope: "wsl:build".to_string(),
+            ..standing_memory(
+                "build-host",
+                "How deploys work",
+                "Deploys run on the build host.",
+            )
+        };
+        let tools = [MEMORY_INDEX_TOOL];
+        let unreachable =
+            memory_snapshot_with_scopes(std::slice::from_ref(&build), &tools, NO_TARGETS);
+        let reachable = memory_snapshot_with_scopes(std::slice::from_ref(&build), &tools, &[
+            "wsl:build".to_string(),
+        ]);
+        let regained = render_world_state(&reachable, Some(&unreachable));
+        assert!(regained.contains("in force here again"), "{regained}");
+        assert!(
+            regained.contains("Deploys run on the build host."),
+            "{regained}"
+        );
+
+        // The budget demotes the body on the way back in: the note is then reachable and its
+        // text lives behind `memory_read`, not in force without it.
+        let demoted = memory_snapshot_with_scopes(std::slice::from_ref(&build), &tools, &[
+            "wsl:build".to_string(),
+        ])
+        .with_inline_max_bytes(1);
+        let regained = render_world_state(&demoted, Some(&unreachable));
+        assert!(regained.contains("reachable here again"), "{regained}");
+        assert!(
+            regained.contains("`memory_read` for its text"),
+            "{regained}"
+        );
+        assert!(
+            !regained.contains("in force here again"),
+            "no in-force claim without the text: {regained}"
+        );
+        assert!(
+            !regained.contains("Deploys run on the build host."),
+            "the demoted body is not sent: {regained}"
+        );
+    }
+
+    /// Cached records are shown, but marked last known rather than fresh: the store may have
+    /// moved since they were taken, and the diff says which way the freshness moved.
+    #[test]
+    fn a_last_known_index_is_marked_not_fresh() {
+        let memories = [standing_memory("tone", "How to reply", "Answer in kind.")];
+        let fresh = snapshot_of(&memories, None);
+        let cached =
+            snapshot_of(&memories, None).with_memory_index_state(MemoryIndexState::LastKnown);
+        let rendered = render_world_state(&cached, None);
+        assert!(
+            rendered.contains("last known index, not fresh"),
+            "{rendered}"
+        );
+        assert!(
+            !render_world_state(&fresh, None).contains("not fresh"),
+            "a fresh read claims no such thing",
+        );
+
+        let to_cached = render_world_state(&cached, Some(&fresh));
+        assert!(
+            to_cached.contains("could not be read just now"),
+            "{to_cached}"
+        );
+        assert!(
+            !to_cached.contains("Memories deleted"),
+            "cached records are not deletions: {to_cached}"
+        );
+        let to_fresh = render_world_state(&fresh, Some(&cached));
+        assert!(to_fresh.contains("readable again"), "{to_fresh}");
+    }
+
+    /// While reads fail on last known records the delta stays live: what moved in the store is
+    /// announced against those records, not lost to the outage or replayed as a whole section.
+    #[test]
+    fn a_last_known_index_keeps_the_delta_live() {
+        let tone = standing_memory("tone", "How to reply", "Answer in kind.");
+        let before = snapshot_of(std::slice::from_ref(&tone), None)
+            .with_memory_index_state(MemoryIndexState::LastKnown);
+        let fact = sample_memory("new-note", 3, "A fact", 1);
+        let after =
+            snapshot_of(&[tone, fact], None).with_memory_index_state(MemoryIndexState::LastKnown);
+        let diff = render_world_state(&after, Some(&before));
+        assert!(diff.contains("Memories saved or updated"), "{diff}");
+        assert!(diff.contains("new-note"), "{diff}");
+        assert!(!diff.contains("its section is restated"), "{diff}");
+    }
+
+    /// A project move takes the old tier's rule copies out of force: their text stands in the
+    /// window as instructions for a project the session is no longer on, so the move retracts
+    /// them by tier even though it restates the whole section for the new view.
+    #[test]
+    fn a_project_move_retracts_the_old_tier_s_rule_copies() {
+        let moved = Memory {
+            project: "alpha".to_string(),
+            ..standing_memory("alpha-rule", "How alpha works", "Alpha does X.")
+        };
+        let before = snapshot_of(std::slice::from_ref(&moved), Some("alpha"));
+        let after = snapshot_of(&[], Some("beta"));
+        let diff = render_world_state(&after, Some(&before));
+        assert!(diff.contains("Project is now 'beta'"), "{diff}");
+        assert!(
+            diff.contains("every rule copy carried above for project 'alpha' is superseded"),
+            "{diff}"
+        );
+        assert!(
+            !diff.contains("Alpha does X."),
+            "the old tier's rule is not restated: {diff}"
+        );
+    }
+
+    /// More keys than the bounded rule states cannot be named, so the standing band is restated
+    /// under an explicit supersession rule instead: what it shows is in force, and every copy it
+    /// does not show is dead text.
+    #[test]
+    fn a_bulk_loss_past_the_key_bound_restates_the_band_under_a_supersession_rule() {
+        let tools = [MEMORY_INDEX_TOOL];
+        let lost: Vec<Memory> = (0..=MEMORY_KEY_RULES_MAX)
+            .map(|n| Memory {
+                scope: format!("wsl:host-{n}"),
+                ..standing_memory(&format!("rule-{n}"), "A standing rule", "Follow the rule.")
+            })
+            .collect();
+        let mut all = lost;
+        all.push(standing_memory(
+            "survivor",
+            "A portable rule",
+            "Keep answers short.",
+        ));
+        let scopes: Vec<String> = (0..=MEMORY_KEY_RULES_MAX)
+            .map(|n| format!("wsl:host-{n}"))
+            .collect();
+        let told = memory_snapshot_with_scopes(&all, &tools, &scopes);
+        let gone = memory_snapshot_with_scopes(&all, &tools, NO_TARGETS);
+        let diff = render_world_state(&gone, Some(&told));
+        assert!(
+            diff.contains(
+                "every rule copy carried earlier that is not restated below is superseded"
+            ),
+            "{diff}"
+        );
+        // The restated band carries the surviving rule's text; the per-key rule is not used when
+        // the keys themselves cannot be named within their bound.
+        assert!(diff.contains("Keep answers short."), "{diff}");
+        assert!(
+            !diff.contains("every rule copy carried above for target"),
+            "{diff}"
+        );
+    }
+
+    /// A budget demotion retracts the copy without claiming the rule left force: the entry
+    /// stands, its text can no longer be presented, and the copy above dies where the line says
+    /// the body went.
+    #[test]
+    fn a_budget_demotion_retracts_the_rule_copy_above() {
+        let tools = [MEMORY_INDEX_TOOL];
+        let second = standing_memory("second", "The second rule", &"b".repeat(60));
+        let first = standing_memory("first", "The first rule", &"a".repeat(60));
+        let before = WorldSnapshot::new(
+            &catalog_of(&tools),
+            &no_skills(),
+            std::slice::from_ref(&second),
+            &[],
+            &[],
+        )
+        .with_inline_max_bytes(100);
+        let after =
+            WorldSnapshot::new(&catalog_of(&tools), &no_skills(), &[first, second], &[], &[
+            ])
+            .with_inline_max_bytes(100);
+        let diff = render_world_state(&after, Some(&before));
+        assert!(
+            diff.contains("so `second` is shown by description only"),
+            "{diff}"
+        );
+        assert!(
+            diff.contains("(their rule copies above are superseded)"),
+            "{diff}"
+        );
+        assert!(
+            !diff.contains("no longer in force"),
+            "the rule stands; only its window copy dies: {diff}"
+        );
+    }
+
+    /// A load demoted to search-only stops being a standing rule, and the copy the model was
+    /// shown goes with it on the line that announces the change.
+    #[test]
+    fn a_search_only_load_retracts_the_rule_copy_above() {
+        let mut search_only = standing_memory("tone", "How to reply", "Answer in kind.");
+        let before = snapshot_of(std::slice::from_ref(&search_only), None);
+        search_only.load = crate::memory::Load::Search;
+        let after = snapshot_of(std::slice::from_ref(&search_only), None);
+        let diff = render_world_state(&after, Some(&before));
+        assert!(diff.contains("(search-only)"), "{diff}");
+        assert!(
+            diff.contains("(its rule copy above is superseded)"),
+            "{diff}"
+        );
+    }
+
+    /// An expiry retracts the copy the model was shown: the rule's date passed, so the text that
+    /// stood for it is dead, and the bounded rule says so for every copy under its key even where
+    /// the per-note line would be cut.
+    #[test]
+    fn an_expired_rule_retracts_the_copy_above() {
+        let mut expiring = standing_memory("freeze", "Until the freeze ends", "Hold all deploys.");
+        let before = snapshot_of(std::slice::from_ref(&expiring), None);
+        expiring.expires_at =
+            Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60));
+        let after = snapshot_of(std::slice::from_ref(&expiring), None);
+        let diff = render_world_state(&after, Some(&before));
+        assert!(
+            diff.contains("Memories expired, no longer in force"),
+            "{diff}"
+        );
+        assert!(
+            diff.contains("every rule copy carried above for global notes is superseded"),
+            "{diff}"
+        );
+    }
+
+    /// What the store's write door admitted reaches the render through the real rows, and a
+    /// reopen of the same store says nothing: persistence is what makes the second read equal
+    /// the first, and a write behind the render's back is announced rather than replayed.
+    #[test]
+    fn what_the_store_holds_reaches_the_render_and_a_reopen_changes_nothing() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let store = crate::store::Store::for_test().await;
+            let memories = store.memory_store(true, crate::config::MEMORY_INLINE_MAX_BYTES_DEFAULT);
+            let write = |name: &str, body: &str| crate::store::memory::WriteRequest {
+                name: name.to_string(),
+                description: Some(format!("About {name}")),
+                body: Some(body.to_string()),
+                priority: Some(0),
+                load: Some(crate::memory::Load::Inline),
+                ..Default::default()
+            };
+            memories
+                .write(write("tone", "Answer in kind."))
+                .await
+                .expect("write");
+            let rows = memories
+                .index(&crate::store::memory::MemoryView::All)
+                .await
+                .expect("index");
+            let snapshot = WorldSnapshot::new_scoped(
+                &catalog_with(MEMORY_INDEX_TOOL),
+                &no_skills(),
+                &rows,
+                NO_TARGETS,
+                &[],
+                &[],
+            );
+            let rendered = render_world_state(&snapshot, None);
+            assert!(rendered.contains("**tone**"), "{rendered}");
+            assert!(rendered.contains("Answer in kind."), "{rendered}");
+
+            let reopened = memories
+                .index(&crate::store::memory::MemoryView::All)
+                .await
+                .expect("index");
+            let again = WorldSnapshot::new_scoped(
+                &catalog_with(MEMORY_INDEX_TOOL),
+                &no_skills(),
+                &reopened,
+                NO_TARGETS,
+                &[],
+                &[],
+            );
+            assert_eq!(
+                render_world_state(&again, Some(&snapshot)),
+                "",
+                "the same rows read again are not a world change"
+            );
+
+            memories
+                .write(write("style", "Be brief."))
+                .await
+                .expect("write");
+            let rows = memories
+                .index(&crate::store::memory::MemoryView::All)
+                .await
+                .expect("index");
+            let after = WorldSnapshot::new_scoped(
+                &catalog_with(MEMORY_INDEX_TOOL),
+                &no_skills(),
+                &rows,
+                NO_TARGETS,
+                &[],
+                &[],
+            );
+            let diff = render_world_state(&after, Some(&again));
+            assert!(diff.contains("Memories saved or updated"), "{diff}");
+            assert!(diff.contains("style"), "{diff}");
+        });
+    }
+
+    /// The turn after a compaction reads a window the full render just wrote: the band is
+    /// restated whole there, what that render communicated is the snapshot it records, and an
+    /// unchanged world then adds nothing.
+    #[test]
+    fn a_compaction_restatement_leaves_the_next_turn_silent() {
+        let memories = [
+            standing_memory("tone", "How to reply", "Answer in kind."),
+            sample_memory("fact", 3, "A fact", 1),
+        ];
+        let snapshot = snapshot_of(&memories, None);
+        let full = render_world_state(&snapshot, None);
+        assert!(full.contains("Answer in kind."), "{full}");
+        let (_, told) = render_world_state_tracked(&snapshot, None);
+        assert_eq!(render_world_state(&snapshot, Some(&told)), "");
+    }
+
+    /// The last known records are re-marked for the live route set instead of replaying what the
+    /// last render held.
+    ///
+    /// A store that cannot be read is no reason to keep a rule the session can no longer reach,
+    /// and the snapshot the cache produces is the only record the next diff has, so the body has
+    /// to be gone before the diff is taken.
+    #[test]
+    fn a_carried_memory_whose_route_is_lost_gives_up_its_body() {
+        let build = Memory {
+            scope: "wsl:build".to_string(),
+            ..standing_memory(
+                "build-host",
+                "How deploys work",
+                "Deploys run on the build host.",
+            )
+        };
+        let portable = standing_memory("tone", "How to reply", "Answer in kind.");
+        let tools = [MEMORY_INDEX_TOOL, MEMORY_WRITE_TOOL, MEMORY_SEARCH_TOOL];
+        let told = memory_snapshot_with_scopes(&[build.clone(), portable.clone()], &tools, &[
+            "wsl:build".to_string(),
+        ]);
+        assert!(told.memories[0].inline_body.is_some());
+
+        // The next turn cannot read the store, and the session has dropped below the level that
+        // reaches the target, so its route set is empty. The cache still holds both records.
+        let view = crate::store::memory::MemoryView::Global;
+        let cache = KnownMemoryIndex {
+            view: view.clone(),
+            memories: vec![build, portable],
+        };
+        let blind = memory_snapshot_with_scopes(
+            cache
+                .records_for(&view)
+                .expect("the view it was read through"),
+            &tools,
+            NO_TARGETS,
+        );
+        assert_eq!(blind.memories.len(), 2, "the cache still carries both");
+        assert!(!blind.memories[0].applies);
+        assert!(blind.memories[0].inline_body.is_none());
+        assert!(blind.memories[1].applies, "the portable one still applies");
+
+        let diff = render_world_state(&blind, Some(&told));
+        assert!(diff.contains("no longer in force here"), "{diff}");
+        assert!(diff.contains("the copy above is superseded"), "{diff}");
+        assert!(
+            !diff.contains("Deploys run on the build host."),
+            "a stale body must not come back through the cache: {diff}",
+        );
+        assert!(
+            !diff.contains("Answer in kind."),
+            "and an entry the cache did not change is not restated: {diff}",
+        );
+        assert!(
+            !diff.contains("deleted"),
+            "a failed read is not a deletion, however the route moved: {diff}",
         );
     }
 
@@ -6110,6 +6966,87 @@ mod tests {
         assert!(
             few.contains("shown by description only") && !few.contains("more inline memor"),
             "{few}"
+        );
+    }
+
+    /// A failed read with nothing cached for this view says the state is unknown. It must not
+    /// render as a store that is empty, which the model would act on as "everything was deleted".
+    #[test]
+    fn an_unreadable_memory_store_is_not_an_empty_one() {
+        let unknown = snapshot_of(&[], None).with_memory_index_state(MemoryIndexState::Unknown);
+        let rendered = render_world_state(&unknown, None);
+        assert!(rendered.contains("[Memory]"), "{rendered}");
+        assert!(rendered.contains("unknown, not empty"), "{rendered}");
+        assert!(
+            rendered.contains("not a statement that there are none"),
+            "{rendered}"
+        );
+        // A store that was read and is genuinely empty still renders no section.
+        let empty = render_world_state(&snapshot_of(&[], None), None);
+        assert!(!empty.contains("[Memory]"), "{empty}");
+    }
+
+    /// Losing the store between two turns is not a deletion of everything the last read returned.
+    #[test]
+    fn losing_the_memory_store_does_not_announce_deletions() {
+        let known = snapshot_of(&[sample_memory("note", 3, "a fact", 1)], None);
+        let unknown = snapshot_of(&[], None).with_memory_index_state(MemoryIndexState::Unknown);
+        let diff = render_world_state(&unknown, Some(&known));
+        assert!(!diff.contains("Memories deleted"), "{diff}");
+        assert!(!diff.contains("note (p3"), "{diff}");
+        assert!(diff.contains("could not be read"), "{diff}");
+        assert!(diff.contains("none are treated as deleted"), "{diff}");
+    }
+
+    /// A read that succeeds after an outage restates the whole section, because the previous
+    /// snapshot held no records: announcing its rows as saved would report writes that never
+    /// happened.
+    #[test]
+    fn a_recovered_memory_read_restates_the_section_instead_of_reporting_new_memories() {
+        let unknown = snapshot_of(&[], None).with_memory_index_state(MemoryIndexState::Unknown);
+        let known = snapshot_of(&[sample_memory("note", 3, "a fact", 1)], None);
+        let diff = render_world_state(&known, Some(&unknown));
+        assert!(diff.contains("readable again"), "{diff}");
+        assert!(!diff.contains("Memories saved or updated"), "{diff}");
+        assert!(diff.contains("[Memory]"), "{diff}");
+        assert!(diff.contains("note"), "{diff}");
+    }
+
+    /// The cache holds records rather than their last rendering, so a body withheld while its
+    /// target was out of reach comes back whole when the target does, even if the store has not
+    /// been read since.
+    #[test]
+    fn a_last_known_body_returns_with_its_target() {
+        let mut memory = standing_memory("build-rule", "Build rule", "Run tests twice.");
+        memory.scope = "wsl:build".to_string();
+        let view = crate::store::memory::MemoryView::Session("webdev".to_string());
+        let cache = KnownMemoryIndex {
+            view: view.clone(),
+            memories: vec![memory],
+        };
+        let records = cache
+            .records_for(&view)
+            .expect("the view it was read through");
+        let catalog = catalog_of(&[MEMORY_INDEX_TOOL]);
+        let lost = WorldSnapshot::new_scoped(&catalog, &no_skills(), records, NO_TARGETS, &[], &[])
+            .with_project(Some("webdev".to_string()));
+        let regained = WorldSnapshot::new_scoped(
+            &catalog,
+            &no_skills(),
+            records,
+            &["wsl:build".to_string()],
+            &[],
+            &[],
+        )
+        .with_project(Some("webdev".to_string()));
+        let diff = render_world_state(&regained, Some(&lost));
+        assert!(diff.contains("in force here again"), "{diff}");
+        assert!(diff.contains("Run tests twice."), "{diff}");
+        // A cache read through another view cannot answer for this one.
+        assert!(
+            cache
+                .records_for(&crate::store::memory::MemoryView::Global)
+                .is_none()
         );
     }
 }

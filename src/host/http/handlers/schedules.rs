@@ -16,6 +16,7 @@ use axum::{
     body::Bytes,
     extract::{Path, Query, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
+    background::StopReport,
     host::http::{
         errors::{ErrorKind, ProblemDetail},
         scope,
@@ -30,7 +32,7 @@ use crate::{
     },
     permission::Permission,
     schedule::{Gate, GatePredicate, GateProbe, Schedule, Timing},
-    store::background::TaskStatus,
+    store::background::{StopReason, TaskStatus},
     view::{BackgroundTaskView, ScheduleView},
 };
 
@@ -702,7 +704,8 @@ pub(crate) async fn list_all_tasks(
     tag = "tasks",
     params(("task_id" = String, Path, description = "Background task id")),
     responses(
-        (status = 204, description = "Task canceled, or already terminal"),
+        (status = 204, description = "The stop reached the work's owner in this process, or the task had already ended"),
+        (status = 202, description = "The stop is recorded but nothing here signaled the work; its row stays open", body = TaskStopAccepted),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No task has that id", body = ProblemDetail),
@@ -714,7 +717,7 @@ pub(crate) async fn cancel_task(
     State(state): State<ServerState>,
     _scoped: scope::Scoped<scope::SessionsWrite>,
     Path(task_id): Path<String>,
-) -> Result<StatusCode, ProblemDetail> {
+) -> Result<Response, ProblemDetail> {
     let Some(task) = state
         .shared
         .store
@@ -733,56 +736,99 @@ pub(crate) async fn cancel_task(
         )
         .with("task_id", task_id.clone()));
     };
-    let id = task.session_id;
     if task.status.is_terminal() {
-        return Ok(StatusCode::NO_CONTENT);
+        return Ok(StatusCode::NO_CONTENT.into_response());
     }
 
-    // Recorded before signaling, exactly as `task_cancel` does: the record writes only over a
-    // `running` row, so a task finishing in the same instant keeps its outcome, is not signaled,
-    // and answers as a finished one does.
-    let stopped = state
-        .shared
-        .store
-        .background_store()
-        .stop_background_tasks(vec![task.id.clone()], TaskStatus::Canceled)
+    // The one stop path, shared with the model's `task_cancel` and the screens: the live owner is
+    // claimed and signaled under the task's gate before the request is recorded, and a retry
+    // re-signals a row still `stopping`. The answer swears only to what happened here: 204 when a
+    // signal reached the work's owner in this process, 202 when the stop is recorded but never
+    // signaled. The old answer returned 204 for the second case, and a request dropped between
+    // the record and the signal made every retry after it report success for work still running.
+    //
+    // Read off the entry, not through `runtime.agent`: the registry is hoisted onto `SessionEntry`
+    // precisely so this path does not wait on the mutex an in-flight turn holds, which is the
+    // state a session is in whenever anyone actually wants to stop a detached task. An evicted
+    // session has no entry but may still have work settling here; an empty registry reaches that
+    // work all the same.
+    let entry = state.sessions.read().await.get(&task.session_id).cloned();
+    let tasks = entry
+        .map(|entry| entry.cells().background_tasks.clone())
+        .unwrap_or_default();
+    let report = tasks
+        .request_stop(
+            &state.shared.store.background_store(),
+            task.session_id,
+            &task.id,
+            StopReason::UserRequest,
+        )
         .await
         .map_err(|error| {
             ProblemDetail::internal_sanitized("failed to record task cancellation", error)
                 .with("task_id", task.id.clone())
         })?;
-    if stopped.is_empty() {
-        return Ok(StatusCode::NO_CONTENT);
-    }
-
-    // Read off the entry, not through `runtime.agent`: the registry is hoisted onto `SessionEntry`
-    // precisely so this path does not wait on the mutex an in-flight turn holds, which is the
-    // state a session is in whenever anyone actually wants to stop a detached task.
-    //
-    // A task belonging to an evicted session has a row here but no live handle. Recording the
-    // cancellation is still right, and is what stops a resumed session waiting on an outcome that
-    // will never arrive.
-    let entry = state.sessions.read().await.get(&id).cloned();
-    let signaled = match entry {
-        Some(entry) => entry.cells().background_tasks.cancel(&task.id).await,
-        None => false,
-    };
-    if !signaled {
-        // `warn`, not `debug`: this is the one outcome that differs from what the 204 claims. The
-        // row now says `canceled` and `GET /tasks` will agree, but nothing in this process could
-        // reach the task, so if it is still running it will run to completion unnoticed -- and a
-        // second cancel short-circuits on the now-terminal status. Worth seeing by default.
-        tracing::warn!(
-            "background task {task_id} had no live handle in this process; recorded as \
-             canceled, but anything still running was not signaled",
-            task_id = task.id
-        );
-    }
     tracing::info!(
-        "canceled background task {task_id} via HTTP",
+        "requested stop of background task {task_id} via HTTP",
         task_id = task.id
     );
-    Ok(StatusCode::NO_CONTENT)
+    Ok(stop_answer(report, task.id))
+}
+
+/// What [`cancel_task`] answers for one [`StopReport`], split from the handler so the contract is
+/// asserted against the one stop path's honest reports: `204` swears only that a signal reached
+/// the work's owner in this process (or the task had already ended), and `202` says the request
+/// is recorded with nothing here able to signal it. The old answer returned `204` for the second
+/// case, and a request dropped between the record and the signal made every retry after it report
+/// success for work still running.
+fn stop_answer(report: StopReport, task_id: String) -> Response {
+    match report {
+        StopReport::Signaled { .. } | StopReport::AlreadyEnded => {
+            StatusCode::NO_CONTENT.into_response()
+        }
+        StopReport::NotSignaled { recorded, .. } => {
+            // `warn`, not `debug`: nothing here could reach the work, so the row stays open until
+            // its owner reports or the owner-loss sweep retires it. That is the honest answer,
+            // and worth seeing by default.
+            tracing::warn!(
+                "background task {task_id} had no live handle in this process; its stop is \
+                 recorded and awaits its owner or the session sweep",
+                task_id = task_id
+            );
+            let detail = if recorded {
+                "the stop is recorded, but no live runner in this process was signaled; the row \
+                 stays open until its work reports or the session sweep retires it"
+            } else {
+                "no live runner in this process was signaled and the stop could not be recorded; \
+                 the row will be reconciled when the session is reopened"
+            };
+            (
+                StatusCode::ACCEPTED,
+                Json(TaskStopAccepted {
+                    task_id,
+                    recorded,
+                    signaled: false,
+                    detail: detail.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// What `DELETE /v1/tasks/{task_id}` answers when the stop did not reach a live owner in this
+/// process: a recorded request is pending intent, not an outcome, and the row's own work or the
+/// owner-loss sweep is what will say how it ended.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct TaskStopAccepted {
+    /// The task the stop was requested for.
+    pub(crate) task_id: String,
+    /// Whether a durable stop request is recorded for its row.
+    pub(crate) recorded: bool,
+    /// Whether a live owner was signaled. Always false here: a signaled stop is answered `204`.
+    pub(crate) signaled: bool,
+    /// What the caller should expect next.
+    pub(crate) detail: String,
 }
 
 #[cfg(test)]
@@ -877,6 +923,81 @@ mod tests {
             withheld_for_scope(None, false),
             None,
             "a schedule that can fire is not reported as held to anyone"
+        );
+    }
+
+    /// The DELETE's answer swears only to what this process did about one stop, end to end: a task
+    /// this process runs is actually signaled and answered `204`, and a task it does not hold is
+    /// recorded and answered `202` with what is known, never a success that implies a signal
+    /// that was never sent.
+    #[tokio::test]
+    async fn a_task_stop_answer_carries_only_what_this_process_did() {
+        let store = crate::store::Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("session");
+        let background = store.background_store();
+        let tasks = crate::background::BackgroundTasks::default();
+        let fixture = |id: String| crate::store::background::BackgroundTask {
+            id,
+            session_id,
+            tool: "shell_execute".to_string(),
+            label: "make".to_string(),
+            status: crate::store::background::TaskStatus::Running,
+            outcome: None,
+            scratchpad_entry: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            announced_at: None,
+            delivered_at: None,
+            subagent_id: None,
+        };
+
+        // A task this process runs: the stop is delivered to its owner, and the answer says so.
+        let token = tokio_util::sync::CancellationToken::new();
+        let row = fixture(uuid::Uuid::new_v4().to_string());
+        background.start_background_task(&row).await.expect("start");
+        assert!(
+            tasks
+                .try_reserve(row.id.clone(), session_id, token.clone(), 4)
+                .await
+        );
+        let report = tasks
+            .request_stop(&background, session_id, &row.id, StopReason::UserRequest)
+            .await
+            .expect("stop");
+        assert_eq!(
+            stop_answer(report, row.id.clone()).status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(
+            token.is_cancelled(),
+            "the signal actually reached the owner"
+        );
+
+        // A task this process does not hold: recorded, and the answer says nothing signaled it.
+        let row = fixture(uuid::Uuid::new_v4().to_string());
+        background.start_background_task(&row).await.expect("start");
+        let report = tasks
+            .request_stop(&background, session_id, &row.id, StopReason::UserRequest)
+            .await
+            .expect("stop");
+        let response = stop_answer(report, row.id.clone());
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let accepted: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(accepted["recorded"], serde_json::json!(true), "{accepted}");
+        assert_eq!(accepted["signaled"], serde_json::json!(false), "{accepted}");
+        assert_eq!(accepted["task_id"], serde_json::json!(row.id), "{accepted}");
+        assert!(
+            accepted["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no live runner"),
+            "{accepted}"
         );
     }
 }

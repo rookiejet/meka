@@ -419,35 +419,40 @@ pub(crate) fn run_confined(
     scratch: &[PathBuf],
     command: &[std::ffi::OsString],
 ) -> std::io::Error {
-    let Some(abi_version) = layer_landlock_abi() else {
-        return std::io::Error::other(format!(
-            "Landlock ABI v{MIN_LAYER_LANDLOCK_ABI} (Linux 6.12+) is needed inside Bubblewrap"
-        ));
-    };
     let Some((program, arguments)) = command.split_first() else {
         return std::io::Error::other("no command to run");
     };
-    let grants = landlock_grants(abi_version, writable, readable, scratch, &[]);
-    // The host's network: Bubblewrap unshared the namespace already when the session's setting is
-    // `none`, so the layer has nothing to add.
-    // SAFETY: called from the top of `main`, before tracing or the runtime has started a thread,
-    // so the process is single-threaded; the no-allocation half of the contract exists for the
-    // `pre_exec` caller and is not what this call site relies on.
-    if let Err(errno) =
-        unsafe { apply_landlock(abi_version, &grants, crate::config::Network::Host) }
-    {
-        return std::io::Error::from_raw_os_error(errno);
+    if let Err(error) = confine_command(writable, readable, scratch) {
+        return error;
     }
-    // Everything above stdio was inherited, the descriptor this image was exec'd from included,
-    // and none of it is the command's: a descriptor reaches past every rule, since Landlock judges
-    // opens rather than what a process already holds.
-    //
+    // Landlock judges opens, not descriptors the process already holds.
     // SAFETY: `close_range(2)` takes plain integers and touches nothing else.
     if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) } == -1 {
         return std::io::Error::last_os_error();
     }
     std::os::unix::process::CommandExt::exec(std::process::Command::new(program).args(arguments))
 }
+
+/// Apply the inner layer before a sandbox command is allowed to start.
+///
+/// Only called in the single-threaded entry point, before any tracing or runtime.
+pub(crate) fn confine_command(
+    writable: &[PathBuf],
+    readable: Option<&[PathBuf]>,
+    scratch: &[PathBuf],
+) -> std::io::Result<()> {
+    let abi_version = layer_landlock_abi().ok_or_else(|| {
+        std::io::Error::other(format!(
+            "Landlock ABI v{MIN_LAYER_LANDLOCK_ABI} (Linux 6.12+) is needed inside Bubblewrap"
+        ))
+    })?;
+    let grants = landlock_grants(abi_version, writable, readable, scratch, &[]);
+    // Bubblewrap already enforces the network policy. This entry point runs before any thread
+    // starts, as `apply_landlock` requires.
+    unsafe { apply_landlock(abi_version, &grants, crate::config::Network::Host) }
+        .map_err(std::io::Error::from_raw_os_error)
+}
+
 /// The network rights the ruleset handles on anything but `host`, granted to no port, which is
 /// what refuses them all: every TCP bind and connect from ABI v4, the first with network rights,
 /// and every UDP bind and send from ABI v10 (kernel 7.2), the first with a UDP right, so UDP stays

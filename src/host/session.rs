@@ -103,6 +103,34 @@ pub(crate) async fn fork_and_lock(
         }),
     }
 }
+/// Open a session's row for a host making it resident: locked first, then read, exactly as
+/// [`crate::store::Store::open_session_row`] orders it, except that a lock this process already
+/// holds is adopted instead of taken again. A release whose work outlived its grace keeps the
+/// session's flock over in the released-work registry, and a `flock` is per open file description,
+/// so the ordinary take refuses a lock this process itself holds. The work left behind stays where
+/// it is; whoever opens the row must still signal, wait for and sweep around it
+/// ([`claim_session`]).
+pub(crate) async fn open_session_row_or_adopt(
+    store: &Store,
+    session_id: uuid::Uuid,
+) -> crate::error::Result<(crate::fs::FileLock, crate::store::SessionSummary)> {
+    let Some(lock) = crate::background::take_released_lock(session_id) else {
+        return store.open_session_row(session_id).await;
+    };
+    match store.session_info(session_id).await {
+        Ok(Some(summary)) => Ok((lock, summary)),
+        // The row went while the lock was retained. Let the claim go with it, as the ordinary
+        // door does, rather than hold a lock on a session that no longer exists.
+        Ok(None) => {
+            drop(lock);
+            Err(crate::error::MekaError::SessionNotFound(session_id))
+        }
+        Err(error) => {
+            drop(lock);
+            Err(error)
+        }
+    }
+}
 /// Retire whatever the previous owner left running, for a process that has just taken this session.
 ///
 /// Every path that hydrates a conversation has to call this: the CLI resume, `meka serve`
@@ -115,9 +143,13 @@ pub(crate) async fn fork_and_lock(
 ///
 /// Non-fatal: a session that cannot sweep must still open.
 pub(crate) async fn claim_session(store: &Store, session_id: uuid::Uuid) {
+    // Rows whose owners are live in this process are spared: a release that outlived its grace
+    // keeps working here, and ending its rows would race the outcomes it is still writing. The
+    // lock this caller holds is what proves every *other* row's owner is gone.
+    let still_live = crate::background::released_live_ids(session_id).await;
     match store
         .background_store()
-        .sweep_interrupted_background_tasks(session_id)
+        .sweep_interrupted_background_tasks_except(session_id, &still_live)
         .await
     {
         Ok(0) => {}
@@ -268,6 +300,172 @@ mod tests {
                 .lock_session(id)
                 .unwrap_or_else(|error| panic!("with {} server(s): {error}", servers.len()));
         }
+    }
+
+    /// Releasing a session for the last time waits for the work it stopped, so the lock that tells
+    /// the next opener which rows belong to a dead process does not move while this process's
+    /// tasks still run.
+    #[tokio::test]
+    async fn releasing_a_session_waits_for_its_detached_work() {
+        let store = Store::for_test().await;
+        let id = uuid::Uuid::new_v4();
+        let (session, _manager) = session_for_test(&store, id, &[]).await;
+        let tasks = session.agent.background_tasks();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        assert!(
+            tasks
+                .try_reserve("work".to_string(), id, cancellation.clone(), 4)
+                .await
+        );
+        let (observed, saw_stop) = tokio::sync::oneshot::channel();
+        let finish = std::sync::Arc::new(tokio::sync::Notify::new());
+        let finish_in_work = std::sync::Arc::clone(&finish);
+        let join = tokio::spawn(async move {
+            cancellation.cancelled().await;
+            let _ = observed.send(());
+            finish_in_work.notified().await;
+        });
+        tasks.attach("work", join).await;
+
+        let released = tokio::spawn({
+            let session = session.clone();
+            async move { session.release_and_wait(None).await }
+        });
+        saw_stop.await.expect("the work observed the stop");
+        assert!(
+            !released.is_finished(),
+            "a release that returns before its work finishes lets the next opener sweep a live row"
+        );
+        finish.notify_one();
+        released.await.expect("the release finishes");
+
+        drop(session);
+        store
+            .lock_session(id)
+            .expect("the lock is free once the work has settled");
+    }
+
+    /// A task that outlives the release grace is the case a wait alone cannot settle: the release
+    /// returns, but ownership does not end with it: the lock moves to the released-work registry
+    /// beside the live work, so a reopen adopts it rather than sweeping a row its owner is still
+    /// writing to. Only when the work settles does the ownership end and the lock go.
+    #[tokio::test]
+    async fn a_task_beyond_the_release_grace_keeps_its_ownership_until_it_settles() {
+        let store = Store::for_test().await;
+        let id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("the session's row");
+        let (session, _manager) = session_for_test(&store, id, &[]).await;
+        let tasks = session.agent.background_tasks().clone();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        assert!(
+            tasks
+                .try_reserve("work".to_string(), id, cancellation.clone(), 4)
+                .await
+        );
+        let row = crate::store::background::BackgroundTask {
+            id: "work".to_string(),
+            session_id: id,
+            tool: "shell_execute".to_string(),
+            label: "make".to_string(),
+            status: crate::store::background::TaskStatus::Running,
+            outcome: None,
+            scratchpad_entry: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            announced_at: None,
+            delivered_at: None,
+            subagent_id: None,
+        };
+        let background = store.background_store();
+        background.start_background_task(&row).await.expect("start");
+        let (observed, saw_stop) = tokio::sync::oneshot::channel();
+        let finish = std::sync::Arc::new(tokio::sync::Notify::new());
+        let finish_in_work = std::sync::Arc::clone(&finish);
+        let join = tokio::spawn({
+            let background = background.clone();
+            async move {
+                cancellation.cancelled().await;
+                let _ = observed.send(());
+                // The work keeps going past the grace before it reports.
+                finish_in_work.notified().await;
+                background
+                    .finish_background_task(
+                        "work",
+                        crate::store::background::TaskStatus::Canceled,
+                        Some("done".to_string()),
+                        None,
+                    )
+                    .await
+                    .expect("the work's report lands");
+            }
+        });
+        tasks.attach("work", join).await;
+
+        let released = tokio::spawn({
+            let session = session.clone();
+            async move { session.release_and_wait(None).await }
+        });
+        saw_stop.await.expect("the work observed the stop");
+        released
+            .await
+            .expect("the release returns once the grace runs out");
+
+        // Ownership outlives the release: the work is still counted here, the lock is not free,
+        // and a sweep that a reopen would run leaves the row its owner is still writing to alone.
+        assert!(
+            crate::background::released_live_ids(id)
+                .await
+                .iter()
+                .any(|live| live == "work"),
+            "the settling work stays owned"
+        );
+        assert!(store.lock_session(id).is_err(), "the lock is retained");
+        assert_eq!(
+            background
+                .sweep_interrupted_background_tasks_except(
+                    id,
+                    &crate::background::released_live_ids(id).await,
+                )
+                .await
+                .expect("sweep"),
+            0,
+            "a live row is not the sweep's to retire"
+        );
+        assert_eq!(
+            background
+                .background_task_by_id("work")
+                .await
+                .expect("load")
+                .expect("row")
+                .status,
+            crate::store::background::TaskStatus::Stopping,
+            "the release asked it to stop and the row records the ask"
+        );
+
+        // When the work settles, the ownership ends: its report lands and the lock goes.
+        finish.notify_one();
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if store.lock_session(id).is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "the cleanup lets the lock go once the work settles"
+        );
+        let row = background
+            .background_task_by_id("work")
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(row.status, crate::store::background::TaskStatus::Canceled);
+        assert!(row.outcome.as_deref().unwrap_or_default().contains("done"));
     }
 
     /// A session is busy while a turn is admitted on it, and while one holds its conversation
@@ -518,6 +716,58 @@ impl ResidentSession {
         release_agent(&self.agent, &self.cancel, mcp_manager).await
     }
 
+    /// [`Self::release`], then wait (bounded) for this session's detached tasks to observe the
+    /// stop and write their outcomes.
+    ///
+    /// A host that is about to drop the entry's session lock uses this instead: the lock is the
+    /// lease that tells the next opener every row still `running` belongs to a dead process. Drop
+    /// it while this process's tasks are still winding down and a reopen sweeps their rows to
+    /// `interrupted` while they are still writing to the workspace. The wait is bounded because a
+    /// task that ignores cancellation must not hold a user-facing path forever, and the seconds it
+    /// gets are not proof the work ended: when they run out, ownership moves instead of ending:
+    /// the lock leaves the entry's slot for the released-work registry, where a cleanup waits off
+    /// the user's path for the work to settle before letting it go.
+    pub(crate) async fn release_and_wait(
+        &self,
+        mcp_manager: Option<&Arc<crate::mcp::McpClientManager>>,
+    ) -> usize {
+        let stopped = self.release(mcp_manager).await;
+        // Waited even when nothing was just signaled: a previous release of this session may have
+        // left work settling here, and the lock cannot go before that is over either.
+        if tokio::time::timeout(
+            crate::host::terminal::BACKGROUND_EXIT_GRACE,
+            self.agent.background_tasks().wait_for_session(self.id),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                "session {id} left background task(s) running after {}s; holding its lock until \
+                 they settle",
+                crate::host::terminal::BACKGROUND_EXIT_GRACE.as_secs(),
+                id = self.id,
+            );
+            self.retain_ownership_of_released_work();
+        }
+        stopped
+    }
+
+    /// Keep owning a session whose work outlived its release: the lock moves out of the entry's
+    /// slot (so nothing drops it with the entry) and into the released-work registry beside the
+    /// live tasks, where a cleanup waits for them before letting it go. A reopen in this process
+    /// adopts the lock from there ([`crate::background::take_released_lock`]) rather than locking
+    /// anew, which the flock this process still holds would refuse.
+    fn retain_ownership_of_released_work(&self) {
+        let lock = crate::sync::lock(&self.agent.session_lock_slot()).take();
+        let tasks = self.agent.background_tasks();
+        crate::background::retire_released_work(self.id, lock, tasks.clone());
+        let session_id = self.id;
+        tokio::spawn(async move {
+            tasks.wait_for_session(session_id).await;
+            crate::background::settle_released_work(session_id, &tasks);
+        });
+    }
+
     /// Record activity, so the idle sweep leaves the session alone for another `timeout`.
     pub(crate) fn touch(&self) {
         let now = std::time::Instant::now();
@@ -630,7 +880,8 @@ where
     /// Let every resident session go, for a host on its way out, once its turns have unwound: each
     /// is released as [`ResidentSession::release`] releases one, so the background work it started
     /// is recorded as interrupted and stopped rather than left reading `running`, and its lock and
-    /// registry go with it. How many sessions were released.
+    /// registry go with it. Each release also waits, bounded, for that session's tasks to settle;
+    /// the entries, and their locks, are dropped only afterwards. How many sessions were released.
     ///
     /// Nothing here waits on a conversation: a turn that outlived the drain still holds one, and
     /// blocking would trade a stale row for a hung shutdown.
@@ -640,7 +891,7 @@ where
     ) -> usize {
         let resident = std::mem::take(&mut *self.0.write().await);
         for entry in resident.values() {
-            entry.release(mcp_manager).await;
+            entry.release_and_wait(mcp_manager).await;
         }
         resident.len()
     }

@@ -6,6 +6,8 @@
 //! `CreateProcessAsUserW` rather than `tokio::process` because the standard library offers no hook
 //! for injecting one.
 
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -249,6 +251,11 @@ thread_local! {
 
 #[derive(Clone)]
 pub(crate) struct ExecuteCommandTool {
+    /// The managed WSL target this shell may route a literal invocation through, when one is
+    /// configured. The channel is call-bound: created and destroyed within one `shell_execute`
+    /// call, never a general-purpose endpoint. `None` keeps the native shell only.
+    #[cfg(windows)]
+    pub(crate) wsl_target: Option<Arc<crate::subshell::Target>>,
     /// The process's workspace-ACE ledger on Windows.
     ///
     /// A handle on the one `process_grants()` singleton, not a per-tool ledger. It reads as a
@@ -336,41 +343,78 @@ impl Tool for ExecuteCommandTool {
     }
 
     fn definition(&self) -> ToolDefinition {
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "command".to_string(),
+            serde_json::json!({
+                "type": "string",
+                "description": "The shell command to execute."
+            }),
+        );
+        properties.insert(
+            "timeout_ms".to_string(),
+            serde_json::json!({
+                "type": "integer",
+                "default": DEFAULT_TIMEOUT.as_millis(),
+                "description": format!(
+                    "Timeout in milliseconds. Default: {} ({} seconds).",
+                    DEFAULT_TIMEOUT.as_millis(),
+                    DEFAULT_TIMEOUT.as_secs(),
+                )
+            }),
+        );
+        properties.insert(
+            "scratchpad".to_string(),
+            serde_json::json!({
+                "type": "string",
+                "description": "If provided, save the output to the scratchpad under this name instead of returning it inline."
+            }),
+        );
+        #[cfg(windows)]
+        if self.wsl_target.is_some() {
+            properties.insert(
+                "wsl".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Route this command through the managed WSL target as a one-shot confined call instead of the native shell. The channel is call-bound: it is created and destroyed within this call, never a persistent endpoint.",
+                    "properties": {
+                        "working_directory": {"type": "string", "description": "A granted WSL directory to mount at /workspace."},
+                        "workspace": {"type": "array", "items": {"type": "string"}, "description": "Additional workspace grants, mounted at /workspaces/0, /workspaces/1, etc."},
+                        "readable": {"type": "array", "items": {"type": "string"}, "description": "Additional read-only grants, mounted at /references/0, /references/1, etc."},
+                        "read_only": {"type": "boolean", "default": false, "description": "Mount everything read-only."}
+                    },
+                    "required": ["working_directory"]
+                }),
+            );
+        }
         ToolDefinition {
             name: "shell_execute".to_string(),
-            description: format!(
-                "{} Each call starts in the session's working directory; shell state does not \
-                 persist between calls. At restricted levels a suitable sandbox is required. \
-                 Background execution keeps `timeout_ms` unchanged. A command that prints more \
-                 than {} is stopped.",
-                if cfg!(windows) {
-                    "Run PowerShell syntax via `powershell.exe -Command`. Do not nest another `powershell -Command`."
+            description: {
+                #[cfg(windows)]
+                let wsl_note = if self.wsl_target.is_some() {
+                    " With `wsl`, the command runs in the managed WSL target instead of the native shell."
                 } else {
-                    "Run a POSIX shell command via `sh -c`. Use POSIX quoting."
-                },
-                crate::text::format_size(MAX_OUTPUT_BYTES),
-            ),
+                    ""
+                };
+                #[cfg(not(windows))]
+                let wsl_note = "";
+                format!(
+                    "{} Each call starts in the session's working directory; shell state does not \
+                     persist between calls. At restricted levels a suitable sandbox is required. \
+                     Background execution keeps `timeout_ms` unchanged. A command that prints more \
+                     than {} is stopped.{}",
+                    if cfg!(windows) {
+                        "Run PowerShell syntax via `powershell.exe -Command`. Do not nest another `powershell -Command`."
+                    } else {
+                        "Run a POSIX shell command via `sh -c`. Use POSIX quoting."
+                    },
+                    crate::text::format_size(MAX_OUTPUT_BYTES),
+                    wsl_note,
+                )
+            },
             parameters: serde_json::json!({
                 "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The shell command to execute."
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "default": DEFAULT_TIMEOUT.as_millis(),
-                        "description": format!(
-                            "Timeout in milliseconds. Default: {} ({} seconds).",
-                            DEFAULT_TIMEOUT.as_millis(),
-                            DEFAULT_TIMEOUT.as_secs(),
-                        )
-                    },
-                    "scratchpad": {
-                        "type": "string",
-                        "description": "If provided, save the output to the scratchpad under this name instead of returning it inline."
-                    }
-                },
+                "properties": properties,
                 "required": ["command"]
             }),
             ..Default::default()
@@ -378,12 +422,19 @@ impl Tool for ExecuteCommandTool {
     }
 
     fn required_permission(&self) -> Permission {
-        if self.sandbox_enabled
+        let native = self.sandbox_enabled
             && !matches!(
                 self.sandbox_capability,
                 crate::sandbox::SandboxCapability::Unavailable
-            )
-        {
+            );
+        // A route confines itself, so a session with one is a `read` session even when no native
+        // backend can run: the dispatcher's gate must let the call reach `refusal_at_level`, which
+        // judges the route it names and refuses a native command that has nothing to confine it.
+        #[cfg(windows)]
+        let routed = self.wsl_target.is_some();
+        #[cfg(not(windows))]
+        let routed = false;
+        if native || routed {
             Permission::Read
         } else {
             Permission::Unrestricted
@@ -391,12 +442,19 @@ impl Tool for ExecuteCommandTool {
     }
 
     /// The level and the configuration decide whether anything can confine a command; the command
-    /// itself and the user's answer do not.
+    /// itself and the user's answer do not. A routed call is judged by its route: a WSL target
+    /// confines itself, and it does not depend on a native sandbox backend the route does not
+    /// use.
     async fn refusal_at_level(
         &self,
         level: Permission,
-        _input: &serde_json::Value,
+        input: &serde_json::Value,
     ) -> Option<ToolOutput> {
+        match Self::selected_route(input) {
+            Err(error) => return Some(ToolOutput::from_error(&error)),
+            Ok(Some(route)) => return self.route_refusal(level, route),
+            Ok(None) => {}
+        }
         let confinement = crate::sandbox::Confinement::resolve(
             self.sandbox_enabled,
             level,
@@ -436,6 +494,23 @@ impl crate::tools::Detachable for ExecuteCommandTool {
         let timeout = super::util::optional_u64(&input, "timeout_ms", "shell_execute")?
             .map(std::time::Duration::from_millis)
             .unwrap_or(DEFAULT_TIMEOUT);
+        match Self::selected_route(&input)? {
+            Some(SubshellRoute::Wsl) => {
+                #[cfg(windows)]
+                {
+                    let wsl = super::util::optional_object(&input, "wsl", "shell_execute")?
+                        .cloned()
+                        .unwrap_or_default();
+                    return self.start_wsl(command, timeout, &serde_json::Value::Object(wsl));
+                }
+                #[cfg(not(windows))]
+                return Err(subshell_error(
+                    "shell_execute",
+                    "the managed WSL route is available on Windows only",
+                ));
+            }
+            None => {}
+        }
         let permission = self.site.permission.get();
         // Three states, resolved once: the run asks the `Confinement` rather than re-deriving "is
         // it sandboxed" from the level, which is how the read-only and workspace-writable cases
@@ -457,7 +532,171 @@ impl crate::tools::Detachable for ExecuteCommandTool {
     }
 }
 
+/// The route a `shell_execute` call selected. `Wsl` exists only where a WSL target can run, but it
+/// is a distinct route on every platform so the refusal for naming it elsewhere has one home.
+enum SubshellRoute {
+    #[allow(dead_code, reason = "the route only runs on Windows")]
+    Wsl,
+}
+
 impl ExecuteCommandTool {
+    /// The route a `shell_execute` input selects. A selector that cannot run here is refused
+    /// rather than silently ignored: a command must not fall through to the native shell because
+    /// its route is unsupported here.
+    fn selected_route(input: &serde_json::Value) -> Result<Option<SubshellRoute>> {
+        let wsl = super::util::optional_object(input, "wsl", "shell_execute")?;
+        match wsl {
+            Some(_) => {
+                #[cfg(windows)]
+                {
+                    Ok(Some(SubshellRoute::Wsl))
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(subshell_error(
+                        "shell_execute",
+                        "the `wsl` route is only available on Windows",
+                    ))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The refusal a routed call meets from its own target, before anything is launched. A route
+    /// answers to what it runs, not to the native backend the call does not use.
+    fn route_refusal(&self, level: Permission, route: SubshellRoute) -> Option<ToolOutput> {
+        match route {
+            SubshellRoute::Wsl => {
+                #[cfg(windows)]
+                {
+                    if self.wsl_target.is_none() {
+                        return Some(ToolOutput::from_error(&subshell_error(
+                            "shell_execute",
+                            "no managed WSL target is configured",
+                        )));
+                    }
+                    if !Permission::Read.is_within(level) {
+                        return Some(ToolOutput::from_error(&subshell_error(
+                            "shell_execute",
+                            format!(
+                                "managed WSL requires at least `read` permission; the session is \
+                                 at `{level}`"
+                            ),
+                        )));
+                    }
+                    None
+                }
+                #[cfg(not(windows))]
+                Some(ToolOutput::from_error(&subshell_error(
+                    "shell_execute",
+                    "the `wsl` route is only available on Windows",
+                )))
+            }
+        }
+    }
+
+    /// Route a literal invocation through the managed WSL broker as a one-shot call-bound
+    /// channel. The channel lives and dies within this call: no persistent handle, no endpoint
+    /// the Windows user could reach after the call ends.
+    #[cfg(windows)]
+    fn start_wsl(
+        &self,
+        command: String,
+        timeout: std::time::Duration,
+        wsl: &serde_json::Value,
+    ) -> Result<crate::tools::Started> {
+        use super::util::{optional_bool, string_or_list};
+
+        let target = self.wsl_target.as_ref().ok_or_else(|| {
+            subshell_error("shell_execute", "no managed WSL target is configured")
+        })?;
+        let lease = self.site.permission.lease();
+        let working_directory = require_str(wsl, "working_directory", "shell_execute")?;
+        let workspace = string_or_list(wsl, "workspace", "shell_execute")?.unwrap_or_default();
+        let readable = string_or_list(wsl, "readable", "shell_execute")?.unwrap_or_default();
+        let read_only = optional_bool(wsl, "read_only", "shell_execute")?.unwrap_or(false);
+        let timeout_ms = timeout.as_millis() as u64;
+        let (request, proofs) = target
+            .request(
+                crate::subshell::Selection {
+                    working_directory,
+                    workspace,
+                    readable,
+                    read_only,
+                    timeout_ms,
+                    command,
+                    scratch: None,
+                    transfer: None,
+                },
+                lease.level,
+            )
+            .map_err(|error| subshell_error("shell_execute", error))?;
+        let request_timeout = request.timeout();
+        let frame = request
+            .encode()
+            .map_err(|error| subshell_error("shell_execute", error))?;
+        let target = Arc::clone(target);
+        Ok(crate::tools::Started::running(
+            None,
+            move |context| async move {
+                // The proofs live as long as the request they mounted: until this call is done.
+                let _proofs = proofs;
+                let started = tokio::time::Instant::now();
+                // Bound delivery as well as execution, and let a stop interrupt the delivery.
+                // A request stopped here may already have reached the guest, so whether a command
+                // started is unconfirmed; once the launcher is owned, `run_wsl_command_tree`
+                // observes the stop itself.
+                let launching = tokio::time::timeout(
+                    request_timeout,
+                    crate::sandbox::wsl_host::launch(&target, &frame),
+                );
+                tokio::pin!(launching);
+                let delivered = tokio::select! {
+                    biased;
+                    () = lease.revoked() => {
+                        if let Some(observation) = &context.teardown {
+                            observation.note(false);
+                        }
+                        return Err(subshell_error("shell_execute", "permission was lowered during setup; whether the managed WSL command started is unconfirmed"));
+                    }
+                    () = context.cancellation.cancelled() => {
+                        if let Some(observation) = &context.teardown {
+                            observation.note(false);
+                        }
+                        return Err(MekaError::Interrupted);
+                    }
+                    delivered = &mut launching => delivered,
+                };
+                let child = delivered
+                    .map_err(|_| {
+                        subshell_error(
+                            "shell_execute",
+                            "timed out delivering the managed WSL request",
+                        )
+                    })?
+                    .map_err(|error| subshell_error("shell_execute", format!("{error:#}")))?;
+                run_wsl_command_tree(
+                    child,
+                    &request.op,
+                    lease.level,
+                    request_timeout.saturating_sub(started.elapsed()),
+                    &context,
+                    &lease,
+                    None,
+                )
+                .await
+                .map_err(|failure| match failure {
+                    CommandTreeError::Interrupted => MekaError::Interrupted,
+                    CommandTreeError::Wait(error) => subshell_error(
+                        "shell_execute",
+                        format!("failed to wait for the WSL launcher: {error}"),
+                    ),
+                })
+            },
+        ))
+    }
+
     /// Spawn `command` under `confinement`, as admitted, and collect what it printed.
     async fn run(
         &self,
@@ -466,6 +705,7 @@ impl ExecuteCommandTool {
         confinement: crate::sandbox::Confinement,
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
+        #[cfg(any(windows, target_os = "freebsd"))]
         let cancellation = context.cancellation.clone();
         let sandboxed = confinement.is_sandboxed();
 
@@ -810,27 +1050,3815 @@ impl ExecuteCommandTool {
             message: format!("failed to spawn command: {error}"),
         })?;
 
-        let budget = Arc::new(crate::process::OutputBudget::new(MAX_OUTPUT_BYTES));
-        let finished = crate::process::run(
-            child,
-            command_capture(&budget, OutputRelay::for_call(&context)),
-            Some(timeout),
-            Some(crate::process::Stop::Graceful(&cancellation)),
-            DRAIN_TIMEOUT,
-        )
-        .await
-        .map_err(wait_failed)?;
-        let drained = DrainedOutput::from(finished.drained);
-        match finished.ended {
-            crate::process::Ended::Stopped => Err(MekaError::Interrupted),
-            crate::process::Ended::OutputBound => {
-                Ok(killed_command_output(&drained, &output_bound_reason()))
+        run_command_tree(child, timeout, &context)
+            .await
+            .map_err(|failure| match failure {
+                CommandTreeError::Interrupted => MekaError::Interrupted,
+                CommandTreeError::Wait(error) => wait_failed(error),
+            })
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct SubshellOpenTool {
+    pub(crate) handles: Arc<crate::subshell::Handles>,
+    pub(crate) target: Arc<crate::subshell::Target>,
+    pub(crate) permission: crate::permission::SharedPermission,
+    pub(crate) required: Permission,
+    pub(crate) site: crate::session::ToolSite,
+}
+
+#[cfg(windows)]
+pub(crate) struct SubshellExecuteTool {
+    pub(crate) handles: Arc<crate::subshell::Handles>,
+    pub(crate) target: Arc<crate::subshell::Target>,
+    pub(crate) permission: crate::permission::SharedPermission,
+    pub(crate) required: Permission,
+}
+
+#[cfg(windows)]
+pub(crate) struct SubshellExportTool {
+    pub(crate) handles: Arc<crate::subshell::Handles>,
+    pub(crate) target: Arc<crate::subshell::Target>,
+    pub(crate) permission: crate::permission::SharedPermission,
+    pub(crate) required: Permission,
+    pub(crate) scope: crate::workspace::WriteScope,
+    pub(crate) site: crate::session::ToolSite,
+}
+
+#[cfg(windows)]
+pub(crate) struct SubshellCloseTool {
+    pub(crate) handles: Arc<crate::subshell::Handles>,
+    pub(crate) permission: crate::permission::SharedPermission,
+    pub(crate) required: Permission,
+}
+
+#[cfg(windows)]
+const SUBSHELL_OPEN: &str = "subshell_open";
+#[cfg(windows)]
+const SUBSHELL_EXECUTE: &str = "subshell_execute";
+#[cfg(windows)]
+const SUBSHELL_EXPORT: &str = "subshell_export";
+#[cfg(windows)]
+const SUBSHELL_CLOSE: &str = "subshell_close";
+
+fn subshell_error(tool_name: &str, message: impl std::fmt::Display) -> MekaError {
+    MekaError::ToolExecution {
+        tool_name: tool_name.to_string(),
+        message: message.to_string(),
+    }
+}
+
+/// The permission refusal every subshell call meets before its arguments are read: the call needs
+/// `required`, and `subshell_export` states `Permission::Workspace` there because a read-level
+/// session cannot export to disk however the operator configured the family.
+#[cfg(windows)]
+fn admit_subshell(tool_name: &str, level: Permission, required: Permission) -> Result<()> {
+    if required.is_within(level) {
+        Ok(())
+    } else {
+        Err(subshell_error(
+            tool_name,
+            format!("managed WSL requires `{required}` permission; the session is at `{level}`"),
+        ))
+    }
+}
+
+/// The handle one call is addressed to, re-checked against the session that owns it.
+#[cfg(windows)]
+fn addressed_handle(
+    handles: &crate::subshell::Handles,
+    session: Option<uuid::Uuid>,
+    input: &serde_json::Value,
+    tool_name: &str,
+) -> Result<Arc<crate::subshell::Handle>> {
+    let name = require_str(input, "handle", tool_name)?;
+    handles
+        .get(session, &name)
+        .map_err(|error| subshell_error(tool_name, error))
+}
+
+#[cfg(windows)]
+#[async_trait]
+impl Tool for SubshellOpenTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: SUBSHELL_OPEN.to_string(),
+            description: format!(
+                "Open a session-owned subshell handle over the granted WSL directories. {} \
+                 The handle pins this scope for later `subshell_execute`, `subshell_export` and \
+                 `subshell_close` calls; every call starts a fresh shell, so nothing carries \
+                 between them. With `scratch` the handle runs in a private Linux-native workspace \
+                 holding a snapshot of an admitted source instead of the live tree, at `workspace` \
+                 permission only. At `read`, only private temporary storage is writable.",
+                self.target.scope_description(),
+            ),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "string", "description": "The name to open the handle under, unique within the session. Later subshell calls address the handle by this name."},
+                    "working_directory": {"type": "string", "description": "An exact CLI grant's Linux or Windows path, mounted at /workspace. Required unless `scratch` is given."},
+                    "scratch": {"type": "object", "description": "Open the handle over a private scratch workspace instead of a live directory: a snapshot of `source` (a Windows path beneath one of the session's workspace roots, or a granted WSL directory) is staged into a private /var/tmp/meka-scratch/<id> directory in the guest and deleted when the handle closes, so anything worth keeping must be exported first. Exporting back over the staged source refuses conflicts: a file changed, deleted or created there since the snapshot is never overwritten. Runs only at `workspace` permission or above.", "properties": {"source": {"type": "string", "description": "The directory to snapshot."}, "quota_mb": {"type": "integer", "description": "Snapshot quota in MiB, 1 to 8192. Default 1024."}}, "required": ["source"]},
+                    "workspace": {"type": "array", "items": {"type": "string"}, "description": "Additional workspace grants, mounted at /workspaces/0, /workspaces/1, etc. Omit to mount none."},
+                    "readable": {"type": "array", "items": {"type": "string"}, "description": "Additional grants to mount read-only at /references/0, /references/1, etc. Omit to mount none."},
+                    "read_only": {"type": "boolean", "default": false, "description": "Make all mounts read-only even at workspace or unrestricted."}
+                },
+                "required": ["handle"]
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn required_permission(&self) -> Permission {
+        Permission::Read
+    }
+
+    async fn refusal_at_level(
+        &self,
+        level: Permission,
+        _: &serde_json::Value,
+    ) -> Option<ToolOutput> {
+        admit_subshell(SUBSHELL_OPEN, level, self.required)
+            .err()
+            .map(|error| ToolOutput::from_error(&error))
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        context: crate::tools::ToolContext,
+    ) -> Result<ToolOutput> {
+        use super::util::{optional_bool, optional_object, optional_str, string_or_list};
+
+        let lease = self.permission.lease();
+        admit_subshell(SUBSHELL_OPEN, lease.level, self.required)?;
+        let name = require_str(&input, "handle", SUBSHELL_OPEN)?;
+        let working_directory = optional_str(&input, "working_directory", SUBSHELL_OPEN)?;
+        let scratch_input = optional_object(&input, "scratch", SUBSHELL_OPEN)?;
+        if working_directory.is_some() == scratch_input.is_some() {
+            return Err(subshell_error(
+                SUBSHELL_OPEN,
+                "open exactly one of `working_directory` or `scratch`",
+            ));
+        }
+        let workspace = string_or_list(&input, "workspace", SUBSHELL_OPEN)?.unwrap_or_default();
+        let readable = string_or_list(&input, "readable", SUBSHELL_OPEN)?.unwrap_or_default();
+        let read_only = optional_bool(&input, "read_only", SUBSHELL_OPEN)?.unwrap_or(false);
+        if let Some(scratch) = scratch_input {
+            if !workspace.is_empty() {
+                return Err(subshell_error(
+                    SUBSHELL_OPEN,
+                    "scratch mode mounts only its own workspace; additional `workspace` grants \
+                     cannot be combined with it",
+                ));
             }
-            crate::process::Ended::TimedOut => Ok(killed_command_output(
-                &drained,
-                &timed_out_reason(timeout, &budget),
+            let scratch = serde_json::Value::Object(scratch.clone());
+            return self
+                .open_scratch(context, &name, &scratch, &readable, read_only)
+                .await;
+        }
+        let working_directory = working_directory.unwrap_or_default();
+        // Re-checked here and again at every later use: authority is admitted when it is used,
+        // never trusted from when the handle was opened.
+        let writable = self
+            .target
+            .admit(working_directory, &workspace, &readable)
+            .map_err(|error| subshell_error(SUBSHELL_OPEN, error))?;
+        let access = if read_only || !writable {
+            Permission::Read
+        } else {
+            lease.level.greatest_within_both(Permission::Workspace)
+        };
+        let handle = crate::subshell::Handle::new(
+            Arc::clone(&self.target),
+            context.session_id,
+            working_directory.to_owned(),
+            workspace,
+            readable,
+            read_only,
+            lease.level,
+        );
+        let handle = self
+            .handles
+            .open(context.session_id, &name, handle)
+            .map_err(|error| subshell_error(SUBSHELL_OPEN, error))?;
+        Ok(ToolOutput::text(
+            format!(
+                "opened subshell handle {name:?}\n{}\naccess: {access}",
+                handle.scope_description()
+            ),
+            false,
+        ))
+    }
+}
+
+#[cfg(windows)]
+impl SubshellOpenTool {
+    /// Open a handle over a scratch workspace: one typed transfer creates the private guest
+    /// directory and installs the admitted snapshot in it. A guest source is walked by the runner
+    /// itself; a Windows source is walked by the host under its native read fence and uploaded,
+    /// and the runner refuses any file whose received bytes are not the digest announced for it.
+    ///
+    /// The order is the isolation argument. The runner creates the directory at the `0700` mode it
+    /// enforces again on every launch, so no other guest user can read it; the snapshot lands
+    /// second. A Windows source is read under the host's read fence before the request is sent,
+    /// and a guest source was admitted by the target's grants. A failure at either step asks
+    /// the runner to remove the workspace before the refusal comes back.
+    async fn open_scratch(
+        &self,
+        context: crate::tools::ToolContext,
+        name: &str,
+        scratch: &serde_json::Value,
+        readable: &[String],
+        read_only: bool,
+    ) -> Result<ToolOutput> {
+        use super::util::optional_u64;
+
+        let lease = self.permission.lease();
+        if read_only {
+            return Err(subshell_error(
+                SUBSHELL_OPEN,
+                "scratch mode is a writable workspace; `read_only` cannot apply to it",
+            ));
+        }
+        if !Permission::Workspace.is_within(lease.level) {
+            return Err(subshell_error(
+                SUBSHELL_OPEN,
+                format!(
+                    "scratch mode needs `workspace` permission; the session is at {}",
+                    lease.level
+                ),
+            ));
+        }
+        let source = require_str(scratch, "source", SUBSHELL_OPEN)?;
+        let quota_bytes = match optional_u64(scratch, "quota_mb", SUBSHELL_OPEN)? {
+            Some(mebibytes) => mebibytes.saturating_mul(crate::text::MIB as u64),
+            None => crate::subshell::DEFAULT_SCRATCH_BYTES,
+        };
+        if !(1..=crate::subshell::MAX_SCRATCH_BYTES).contains(&quota_bytes) {
+            return Err(subshell_error(
+                SUBSHELL_OPEN,
+                format!(
+                    "the scratch quota must be between 1 and {} MiB",
+                    crate::subshell::MAX_SCRATCH_BYTES / crate::text::MIB as u64
+                ),
+            ));
+        }
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let id = &unique[..crate::subshell::SCRATCH_ID_BYTES * 2];
+        let guest_path = format!("{}/{id}", crate::subshell::SCRATCH_ROOT);
+        let timeout_ms =
+            u64::try_from(crate::subshell::TRANSFER_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+        // The source is named by the spelling its kind uses: a guest path the runner opens and
+        // walks itself, or a Windows path the host snapshots under its native read fence and
+        // uploads, since a Windows-backed tree walked through DrvFS cannot bind every object the
+        // walk would copy.
+        enum StagePlan {
+            /// The runner copies this guest source into the workspace itself.
+            Guest(crate::subshell::MountRoot),
+            /// The host sends the snapshot it read; the manifest and bytes follow the request.
+            Upload(StageSnapshot),
+        }
+        let (plan, source_root, guest_source) = if source.starts_with('/') {
+            if !crate::subshell::is_normalized_guest_path(&source)
+                || source.contains('\\')
+                || !self.target.admits_source(&source)
+            {
+                return Err(subshell_error(
+                    SUBSHELL_OPEN,
+                    format!(
+                        "the source must be a normalized directory beneath a granted WSL \
+                         directory, and may not spell a Windows separator: {source:?}"
+                    ),
+                ));
+            }
+            (
+                StagePlan::Guest(crate::subshell::MountRoot::Guest(std::path::PathBuf::from(
+                    &source,
+                ))),
+                std::path::PathBuf::from(&source),
+                true,
+            )
+        } else {
+            let spelled = crate::workspace::resolve_against_cwd(&self.site.cwd, &source);
+            let resolved = crate::workspace::strip_verbatim(
+                crate::workspace::resolve_existing_prefix(&spelled),
+            );
+            let roots = crate::workspace::writable_roots(&self.site.cwd, &self.site.roots);
+            if !roots.iter().any(|root| resolved.starts_with(root)) {
+                return Err(subshell_error(
+                    SUBSHELL_OPEN,
+                    format!(
+                        "the source {source:?} must be a directory beneath one of the session's \
+                         workspace roots"
+                    ),
+                ));
+            }
+            if !resolved.is_dir() {
+                return Err(subshell_error(
+                    SUBSHELL_OPEN,
+                    format!("the source {source:?} is not a directory"),
+                ));
+            }
+            verify_native_ancestors(&resolved).map_err(|refusal| {
+                subshell_error(
+                    SUBSHELL_OPEN,
+                    format!("the source is not a real directory: {refusal}"),
+                )
+            })?;
+            let fence = self.site.read_scope().fence(&self.site.cwd);
+            if let Some(refusal) = fence.refusal(&resolved) {
+                return Err(subshell_error(
+                    SUBSHELL_OPEN,
+                    format!("the source was not staged: {refusal}"),
+                ));
+            }
+            let resolved_text = resolved.to_string_lossy().into_owned();
+            if crate::subshell::windows_components(&resolved_text).is_none()
+                || !self.target.admits_source(&resolved_text)
+            {
+                return Err(subshell_error(
+                    SUBSHELL_OPEN,
+                    format!(
+                        "the source must be a normalized drive-absolute directory beneath a \
+                         granted WSL directory; a guest directory is named by its Linux path: \
+                         {source:?}"
+                    ),
+                ));
+            }
+            let snapshot = snapshot_stage_tree(&resolved, quota_bytes).map_err(|refusal| {
+                subshell_error(
+                    SUBSHELL_OPEN,
+                    format!("the source was not staged: {refusal}"),
+                )
+            })?;
+            (StagePlan::Upload(snapshot), resolved, false)
+        };
+        // One typed transfer creates the workspace and installs the snapshot in it: the runner
+        // copies a guest source itself, and writes the host's fence-read bytes digest-checked for
+        // a Windows one. The request's reference-mount proofs are held until the transfer is done.
+        let selection = crate::subshell::Selection {
+            working_directory: guest_path.clone(),
+            workspace: Vec::new(),
+            readable: readable.to_vec(),
+            read_only: false,
+            timeout_ms,
+            command: String::new(),
+            scratch: Some(crate::subshell::ScratchSelection {
+                path: guest_path.clone(),
+                quota_bytes,
+                create: true,
+            }),
+            transfer: Some(match &plan {
+                StagePlan::Guest(source) => crate::subshell::Transfer::Stage {
+                    source: source.clone(),
+                },
+                StagePlan::Upload(_) => crate::subshell::Transfer::Upload,
+            }),
+        };
+        let mut manifest = crate::subshell::ManifestOnly::default();
+        let staged = async {
+            let (request, _request_proofs) = self
+                .target
+                .request(selection, lease.level)
+                .map_err(|error| format!("{error:#}"))?;
+            let mut frame = request.encode().map_err(|error| format!("{error:#}"))?;
+            if let StagePlan::Upload(snapshot) = &plan {
+                let upload =
+                    upload_stream(&request.op, snapshot).map_err(|error| format!("{error:#}"))?;
+                frame.extend_from_slice(&upload);
+            }
+            drive_transfer(
+                &self.target,
+                &request.op,
+                &frame,
+                &lease,
+                &context,
+                &mut manifest,
+            )
+            .await
+        }
+        .await;
+        // A manifest entry is the only evidence that the runner created and wrote this workspace.
+        // A request that never got that far is left to the guest reaper: removing an id this open
+        // cannot prove it owns is worse than a workspace that expires on its own.
+        let staged_workspace = !manifest.entries.is_empty();
+        let scratch_path = guest_path.clone();
+        let discard = async {
+            if staged_workspace {
+                self.discard_scratch(&scratch_path, quota_bytes, readable, lease.level)
+                    .await;
+            }
+        };
+        let run = match staged {
+            Ok(run) => run,
+            Err(detail) => {
+                discard.await;
+                return Err(subshell_error(
+                    SUBSHELL_OPEN,
+                    format!(
+                        "the source was not staged: {detail}{}",
+                        if staged_workspace {
+                            "; the partial workspace was removed"
+                        } else {
+                            "; any workspace the runner created is left to its reaper"
+                        }
+                    ),
+                ));
+            }
+        };
+        match run {
+            TransferRun::Done => {}
+            TransferRun::Lowered => {
+                discard.await;
+                return Err(subshell_error(
+                    SUBSHELL_OPEN,
+                    "permission was lowered; the scratch workspace was not staged",
+                ));
+            }
+            TransferRun::Cancelled | TransferRun::Stopped => {
+                discard.await;
+                return Err(MekaError::Interrupted);
+            }
+        }
+        let baseline = match stage_baseline(&manifest) {
+            Ok(baseline) => baseline,
+            Err(detail) => {
+                discard.await;
+                return Err(subshell_error(
+                    SUBSHELL_OPEN,
+                    format!("the source was not staged: {detail}"),
+                ));
+            }
+        };
+        let staged_files = baseline.len();
+        let staged_bytes: u64 = baseline.values().map(|entry| entry.len).sum();
+        let scratch_path = guest_path.clone();
+        let handle = crate::subshell::Handle::new(
+            Arc::clone(&self.target),
+            context.session_id,
+            guest_path.clone(),
+            Vec::new(),
+            readable.to_vec(),
+            false,
+            lease.level,
+        )
+        .with_scratch(crate::subshell::ScratchState {
+            path: guest_path,
+            source: source.to_owned(),
+            source_root,
+            quota_bytes,
+            guest_source,
+            baseline,
+        });
+        let handle = match self.handles.open(context.session_id, name, handle) {
+            Ok(handle) => handle,
+            Err(error) => {
+                // The workspace was staged before the handle could claim it; a name already open
+                // must not leave that copy behind for the guest reaper to find a day later.
+                self.discard_scratch(&scratch_path, quota_bytes, readable, lease.level)
+                    .await;
+                return Err(subshell_error(SUBSHELL_OPEN, error));
+            }
+        };
+        Ok(ToolOutput::text(
+            format!(
+                "opened subshell handle {name:?}\n{}\naccess: workspace\nstaged {staged_files} \
+                 file(s), {staged_bytes} bytes from {source:?}",
+                handle.scope_description()
+            ),
+            false,
+        ))
+    }
+
+    /// Ask the runner to remove a scratch workspace this open created but will not keep. The
+    /// caller reports its own refusal; a removal that fails is left to the runner's lease sweep,
+    /// which reaps workspaces no live handle holds.
+    async fn discard_scratch(
+        &self,
+        guest_path: &str,
+        quota_bytes: u64,
+        readable: &[String],
+        level: Permission,
+    ) {
+        let timeout_ms =
+            u64::try_from(crate::subshell::TRANSFER_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+        let selection = crate::subshell::Selection {
+            working_directory: guest_path.to_owned(),
+            workspace: Vec::new(),
+            readable: readable.to_vec(),
+            read_only: false,
+            timeout_ms,
+            command: String::new(),
+            scratch: Some(crate::subshell::ScratchSelection {
+                path: guest_path.to_owned(),
+                quota_bytes,
+                create: false,
+            }),
+            transfer: Some(crate::subshell::Transfer::RemoveScratch),
+        };
+        let removal = async {
+            let (request, _request_proofs) = self
+                .target
+                .request(selection, level)
+                .map_err(|error| format!("{error:#}"))?;
+            let frame = request.encode().map_err(|error| format!("{error:#}"))?;
+            let timeout = crate::subshell::TRANSFER_TIMEOUT;
+            let tree = tokio::time::timeout(
+                timeout,
+                crate::sandbox::wsl_host::launch(&self.target, &frame),
+            )
+            .await
+            .map_err(|_| "timed out starting the removal".to_string())?
+            .map_err(|error| format!("{error:#}"))?;
+            let mut visitor = crate::subshell::ManifestOnly::default();
+            crate::sandbox::wsl_host::collect_transfer(
+                tree,
+                &request.op,
+                timeout,
+                None,
+                &mut visitor,
+            )
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(error) = removal {
+            tracing::debug!(
+                "the refused open left scratch workspace {guest_path} for the reaper: {error}"
+            );
+        }
+    }
+}
+
+/// Read a stage response's manifest into the snapshot baseline: every file the runner copied,
+/// keyed by its `/`-separated path below the source root. Directory entries describe the tree the
+/// runner created and carry no file baseline; a stage names no root and numbers its only source
+/// zero.
+#[cfg(windows)]
+fn stage_baseline(
+    manifest: &crate::subshell::ManifestOnly,
+) -> std::result::Result<std::collections::HashMap<String, crate::subshell::BaselineEntry>, String>
+{
+    let mut baseline = std::collections::HashMap::new();
+    if !manifest.roots.is_empty() {
+        return Err("the stage response names a source root".to_string());
+    }
+    for entry in &manifest.entries {
+        if entry.directory {
+            // The runner records the directories it created so a host can rebuild the tree, but a
+            // snapshot baseline holds only the files a later export back over the source compares.
+            continue;
+        }
+        if entry.root != 0 {
+            return Err(format!(
+                "the stage response names the unknown source {}",
+                entry.root
+            ));
+        }
+        let digest = entry.parsed_digest().ok_or_else(|| {
+            format!(
+                "the stage response holds an invalid digest for {:?}",
+                entry.path
+            )
+        })?;
+        let previous = baseline.insert(entry.path.clone(), crate::subshell::BaselineEntry {
+            len: entry.len,
+            modified: entry.modified(),
+            digest,
+        });
+        if previous.is_some() {
+            return Err(format!("the stage response names {:?} twice", entry.path));
+        }
+    }
+    Ok(baseline)
+}
+
+/// The identity of one volume object: the volume serial and the 128-bit file id Windows reports
+/// for it. Two names that resolve to one identity are one object; a name that resolves to another
+/// is a swap, and nothing the export publishes writes through one.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    volume: u64,
+    id: [u8; 16],
+}
+
+/// The identity behind one open handle.
+#[cfg(windows)]
+fn file_identity(handle: std::os::windows::io::RawHandle) -> std::io::Result<FileIdentity> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open and the output buffer is a whole FILE_ID_INFO, the size passed.
+    let reported = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            std::ptr::from_mut(&mut info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if reported == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(FileIdentity {
+        volume: info.VolumeSerialNumber,
+        id: info.FileId.Identifier,
+    })
+}
+
+/// How many names an open object has. A file another name can change is refused by the walks,
+/// since a fence on one name cannot bind a write that arrives through the other.
+#[cfg(windows)]
+fn file_link_count(file: &std::fs::File) -> std::io::Result<u32> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open and the output buffer is one FILE_STANDARD_INFO, the size passed.
+    let reported = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStandardInfo,
+            std::ptr::from_mut(&mut info).cast(),
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if reported == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(info.NumberOfLinks)
+}
+
+/// The Windows providers an export may publish through: a local fixed NTFS or ReFS volume, and
+/// nothing else. Those are the providers where an identity is stable, a no-replace rename fails
+/// on a name that exists, and a held open handle denies the deletion and rename of what it holds.
+/// A DrvFS or network-backed name, a FAT volume and anything unrecognized cannot promise those,
+/// so they are refused at the door rather than trusted to behave.
+#[cfg(windows)]
+fn publication_provider_allows(fs_name: &str, drive_type: u32) -> bool {
+    /// `GetDriveTypeW`'s fixed local volume.
+    const DRIVE_FIXED: u32 = 3;
+    drive_type == DRIVE_FIXED && matches!(fs_name, "NTFS" | "ReFS")
+}
+
+/// Refuse a destination that is not on a supported publication provider.
+#[cfg(windows)]
+fn publication_provider(target: &std::path::Path) -> std::result::Result<(), String> {
+    use std::{os::windows::ffi::OsStrExt as _, path::Component};
+
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW};
+    // The volume root is the prefix and root components, like `C:\`; the API classifies a root,
+    // not a deep path, so the target's own depth plays no part in the judgement.
+    let root: std::path::PathBuf = target
+        .components()
+        .take_while(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+        .collect();
+    if root.as_os_str().is_empty() {
+        return Err(format!("{} has no volume root to judge", target.display()));
+    }
+    let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
+    if !root.to_string_lossy().ends_with(['\\', '/']) {
+        wide.push(u16::from(b'\\'));
+    }
+    wide.push(0);
+    let mut fs_name = [0u16; 64];
+    let mut flags = 0u32;
+    // SAFETY: the buffers are writable for the lengths passed and the root is NUL-terminated.
+    let ok = unsafe {
+        GetVolumeInformationW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::from_mut(&mut flags),
+            std::ptr::null_mut(),
+            fs_name.as_mut_ptr(),
+            fs_name.len() as u32,
+        )
+    };
+    let fs_name = if ok == 0 {
+        "unknown".to_string()
+    } else {
+        let length = fs_name
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(fs_name.len());
+        String::from_utf16_lossy(fs_name.get(..length).unwrap_or_default())
+    };
+    // SAFETY: the root is NUL-terminated; the call only classifies it.
+    let drive_type = unsafe { GetDriveTypeW(wide.as_ptr()) };
+    if !publication_provider_allows(&fs_name, drive_type) {
+        return Err(format!(
+            "{} is not on a local fixed NTFS or ReFS volume ({}); the export's identity checks \
+             and no-replace publication cannot be established there",
+            target.display(),
+            fs_name
+        ));
+    }
+    Ok(())
+}
+
+/// A destination directory pinned by an open handle that denies its deletion and rename for as
+/// long as it is held. Everything the commit does to the directory's names is relative to this
+/// handle, so a path that changes under the export cannot redirect the publication.
+#[cfg(windows)]
+struct PinnedDirectory {
+    handle: std::os::windows::io::OwnedHandle,
+    path: std::path::PathBuf,
+    /// The identity the directory had when it was pinned.
+    identity: FileIdentity,
+}
+
+#[cfg(windows)]
+impl PinnedDirectory {
+    /// Pin the directory `path` names, refusing one that is not the object `expected` saw when
+    /// that identity is given. The handle is opened without delete sharing, so nothing can delete
+    /// or rename the pinned directory until the commit is done with it.
+    fn pin(
+        path: &std::path::Path,
+        expected: Option<FileIdentity>,
+    ) -> std::result::Result<Self, String> {
+        use std::os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _};
+
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_READ, GENERIC_WRITE},
+            Storage::FileSystem::{
+                CreateFileW, DELETE, FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ,
+                FILE_SHARE_WRITE, OPEN_EXISTING,
+            },
+        };
+
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+        // SAFETY: the name is NUL-terminated and the handle is closed by the OwnedHandle below.
+        // The delete and add rights are what a handle-relative rename publishes through this
+        // handle; without them the rename is refused at the API door.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE | FILE_ADD_FILE | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if raw == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            let error = std::io::Error::last_os_error();
+            return Err(format!(
+                "cannot pin the destination directory {}: {error}",
+                path.display()
+            ));
+        }
+        // SAFETY: the handle was just opened by this call and nothing else owns it.
+        let handle = unsafe {
+            use std::os::windows::io::FromRawHandle as _;
+
+            std::os::windows::io::OwnedHandle::from_raw_handle(raw.cast())
+        };
+        let identity = file_identity(handle.as_raw_handle())
+            .map_err(|error| format!("cannot identify {}: {error}", path.display()))?;
+        if expected.is_some_and(|expected| expected != identity) {
+            return Err(format!(
+                "{} is no longer the directory the export admitted; it changed under the export",
+                path.display()
+            ));
+        }
+        Ok(Self {
+            handle,
+            path: path.to_path_buf(),
+            identity,
+        })
+    }
+
+    /// Refuse when the name the pin was taken on no longer resolves to the pinned directory. The
+    /// publication runs against the handle either way; this is what says the tree around it did
+    /// not change under the export. The check reads the name without the delete access a rename
+    /// would need, so it never weakens the pin's own protection.
+    fn still_pins_its_name(&self) -> std::result::Result<(), String> {
+        use std::os::windows::{
+            ffi::OsStrExt as _,
+            io::{AsRawHandle as _, FromRawHandle as _},
+        };
+
+        use windows_sys::Win32::{
+            Foundation::GENERIC_READ,
+            Storage::FileSystem::{
+                CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE, OPEN_EXISTING,
+            },
+        };
+
+        let wide = self
+            .path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+        // SAFETY: the name is NUL-terminated and the handle is closed by the OwnedHandle below.
+        // The share includes delete only because the pin itself holds delete access; the pin
+        // stays what denies everyone else.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if raw == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "{} cannot be read back to verify the pinned directory; the export refuses to \
+                 publish under a name it cannot verify",
+                self.path.display()
+            ));
+        }
+        // SAFETY: the handle was just opened by this call and nothing else owns it.
+        let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw.cast()) };
+        match file_identity(handle.as_raw_handle()) {
+            Ok(identity) if identity == self.identity => Ok(()),
+            Ok(_) => Err(format!(
+                "{} is no longer the directory the export admitted; it changed under the export",
+                self.path.display()
             )),
-            crate::process::Ended::Exited(status) => Ok(finish_command(&status, &drained, &budget)),
+            Err(error) => Err(format!(
+                "{} cannot be identified to verify the pinned directory: {error}",
+                self.path.display()
+            )),
+        }
+    }
+
+    fn raw(&self) -> std::os::windows::io::RawHandle {
+        use std::os::windows::io::AsRawHandle as _;
+
+        self.handle.as_raw_handle()
+    }
+}
+
+/// A temporary sibling the export owns until it is published or dropped. It is created
+/// exclusively in the destination that will hold it, so it takes that directory's ACL; it is
+/// bound by identity to the bytes the export wrote; and it is published by a no-replace rename
+/// relative to the pinned parent directory, never by a path that could have been swapped. What
+/// cleanup removes is the identity it holds, never a name that could meanwhile name something
+/// else.
+#[cfg(windows)]
+struct ExportTemp {
+    path: std::path::PathBuf,
+    identity: FileIdentity,
+    /// The digest of the bytes this temporary holds, checked again before it is published.
+    digest: [u8; 32],
+    written: u64,
+    published: bool,
+}
+
+#[cfg(windows)]
+impl ExportTemp {
+    /// Create the empty temporary sibling a writer fills, in the parent directory of `target`.
+    /// The caller keeps both halves: the guard removes the file unless it is published, and the
+    /// writer is where the bytes go. The staged identity and digest bind the publication to these
+    /// bytes.
+    fn create_writer(
+        target: &std::path::Path,
+    ) -> std::result::Result<(Self, std::fs::File), String> {
+        use std::os::windows::io::AsRawHandle as _;
+
+        let parent = target
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", target.display()))?;
+        let path = parent.join(format!(".meka-export-{}", uuid::Uuid::new_v4().simple()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let writer = options
+            .open(&path)
+            .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+        let identity = file_identity(writer.as_raw_handle())
+            .map_err(|error| format!("cannot identify {}: {error}", path.display()))?;
+        Ok((
+            Self {
+                path,
+                identity,
+                digest: [0; 32],
+                written: 0,
+                published: false,
+            },
+            writer,
+        ))
+    }
+
+    /// Record what the writer held, after its last byte: the length and digest the publication
+    /// must still find when it opens the file again.
+    fn sealed(&mut self, written: u64, digest: [u8; 32]) {
+        self.written = written;
+        self.digest = digest;
+    }
+
+    fn published(mut self) {
+        self.published = true;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ExportTemp {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        // The identity-bound cleanup: what is removed is the object the export created, checked
+        // on the same handle the deletion runs through, never a name that meanwhile came to name
+        // something else.
+        remove_staged(&self.path, self.identity);
+    }
+}
+
+/// Publish one sealed temporary into `target`, only when `target` does not exist.
+///
+/// The temporary is reopened by name and must still be the object the export wrote: the identity
+/// it was created with, and the length and digest its writer sealed. The destination is the
+/// pinned parent handle the rename is relative to, so a path swapped under the export cannot
+/// redirect the publication. The rename is `FILE_RENAME_INFORMATION` through the kernel with that
+/// root handle and no replace flag: an entry created in any gap is a failure, never something the
+/// export replaces. There is no replacement path: the export contract is a fresh name, and
+/// "replace the file that was here" is refused when the plan is made rather than attempted here.
+#[cfg(windows)]
+fn publish_export_temp(
+    temporary: ExportTemp,
+    target: &std::path::Path,
+    parent: PinnedDirectory,
+) -> std::result::Result<u64, String> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    let name = target
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name to publish it under", target.display()))?;
+    let staged = open_staged(&temporary.path)
+        .map_err(|error| format!("cannot reopen {}: {error}", temporary.path.display()))?;
+    if file_identity(staged.as_raw_handle())
+        .map_err(|error| format!("cannot identify {}: {error}", temporary.path.display()))?
+        != temporary.identity
+    {
+        return Err(format!(
+            "{} is no longer the file the export wrote; nothing is published through a name that \
+             changed",
+            temporary.path.display()
+        ));
+    }
+    let (len, digest) = digest_staged(&staged)
+        .map_err(|error| format!("cannot read {}: {error}", temporary.path.display()))?;
+    if len != temporary.written || digest != temporary.digest {
+        return Err(format!(
+            "{} no longer holds the bytes the export wrote to it; nothing is published from it",
+            temporary.path.display()
+        ));
+    }
+    parent.still_pins_its_name()?;
+    rename_relative_no_replace(staged.as_raw_handle(), parent.raw(), name).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "{} appeared at the destination while the export was staging it; nothing was \
+                 replaced",
+                target.display()
+            )
+        } else {
+            format!(
+                "cannot create {}: {error}; nothing was replaced",
+                target.display()
+            )
+        }
+    })?;
+    drop(parent);
+    let written = temporary.written;
+    temporary.published();
+    Ok(written)
+}
+
+/// Reopen a staged temporary for the commit: the handle the identity is checked on and the rename
+/// runs through, opened without write or delete sharing so nothing changes the file between the
+/// check and the publish.
+#[cfg(windows)]
+fn open_staged(path: &std::path::Path) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::{ffi::OsStrExt as _, io::FromRawHandle as _};
+
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            CreateFileW, DELETE, FILE_SHARE_READ, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
+        },
+    };
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+    // SAFETY: the name is NUL-terminated; a successful call returns an unowned handle this
+    // function takes at once.
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | DELETE | FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the handle was just opened by this call and nothing else owns it.
+    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw.cast()) })
+}
+
+/// The length and SHA-256 of one staged file, read whole from its open handle.
+#[cfg(windows)]
+fn digest_staged(staged: &std::os::windows::io::OwnedHandle) -> std::io::Result<(u64, [u8; 32])> {
+    use std::io::Read as _;
+
+    use sha2::Digest as _;
+
+    let mut file = std::fs::File::from(staged.try_clone()?);
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0u8; 64 * crate::text::KIB];
+    let mut len = 0u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(buffer.get(..read).unwrap_or_default());
+        len = len.saturating_add(read as u64);
+    }
+    Ok((len, hasher.finalize().into()))
+}
+
+/// Rename the open file to `name` beneath the pinned `parent`, only when that name does not
+/// exist. `NtSetInformationFile` with `FILE_RENAME_INFORMATION` is the interface that takes a
+/// root directory handle: the rename is relative to the pinned directory and cannot be redirected
+/// by a path that changed under the export. `ReplaceIfExists` stays false, so a name that exists
+/// fails the call rather than being taken. The commit is where this was checked on real NTFS:
+/// `SetFileInformationByHandle` refuses the root-handle form outright (`ERROR_INVALID_PARAMETER`
+/// for both `FileRenameInfo` and `FileRenameInfoEx`), so the commit speaks the kernel interface
+/// that carries the root, and there is no pathname rename to fall back to.
+#[cfg(windows)]
+fn rename_relative_no_replace(
+    file: std::os::windows::io::RawHandle,
+    parent: std::os::windows::io::RawHandle,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    /// The kernel's `FILE_RENAME_INFORMATION` class number.
+    const FILE_RENAME_INFORMATION: u32 = 10;
+    /// `STATUS_OBJECT_NAME_COLLISION`: the name is taken and nothing replaces it.
+    const NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSetInformationFile(
+            file: *mut core::ffi::c_void,
+            status: *mut [u8; 16],
+            info: *const core::ffi::c_void,
+            length: u32,
+            class: u32,
+        ) -> i32;
+    }
+
+    let units = name.encode_wide().collect::<Vec<u16>>();
+    let name_bytes = u32::try_from(units.len() * 2).unwrap_or(u32::MAX);
+    // FILE_RENAME_INFORMATION: the flags union (zero: never replace), the root handle, the
+    // name's byte length, then the name itself. The name is not NUL-terminated; its length
+    // travels with it.
+    let mut buffer = Vec::with_capacity(24 + name_bytes as usize);
+    buffer.extend_from_slice(&0u32.to_ne_bytes());
+    buffer.extend_from_slice(&[0u8; 4]);
+    buffer.extend_from_slice(&(parent as usize as u64).to_ne_bytes());
+    buffer.extend_from_slice(&name_bytes.to_ne_bytes());
+    for unit in name.encode_wide() {
+        buffer.extend_from_slice(&unit.to_ne_bytes());
+    }
+    let mut status = [0u8; 16];
+    // SAFETY: the buffer is one FILE_RENAME_INFORMATION carrying its name, sized and filled
+    // above; both handles are open and the status block is writable.
+    let code = unsafe {
+        NtSetInformationFile(
+            file.cast(),
+            &mut status,
+            buffer.as_ptr().cast(),
+            buffer.len() as u32,
+            FILE_RENAME_INFORMATION,
+        )
+    };
+    match code {
+        0 => Ok(()),
+        NAME_COLLISION => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "the export name is already taken",
+        )),
+        other => Err(std::io::Error::other(format!(
+            "the handle-relative rename was refused (NTSTATUS {other:#x})"
+        ))),
+    }
+}
+
+/// What can stop a publication at the shared commit gate.
+#[cfg(windows)]
+#[derive(Debug)]
+enum CommitStop {
+    Closed,
+    Canceled,
+    LeaseLowered,
+}
+
+/// The one commit gate every publication passes: a close, a cancellation, or a permission that
+/// was lowered after the call was admitted stops the commit, whatever the live level reads now.
+/// A stop that wins here leaves what already committed in place; the gate is not a rollback.
+#[cfg(windows)]
+fn commit_gate(
+    closed: &tokio_util::sync::CancellationToken,
+    cancellation: &tokio_util::sync::CancellationToken,
+    lease: &crate::permission::PermissionLease,
+) -> std::result::Result<(), CommitStop> {
+    if closed.is_cancelled() {
+        return Err(CommitStop::Closed);
+    }
+    if cancellation.is_cancelled() {
+        return Err(CommitStop::Canceled);
+    }
+    if lease.is_revoked() {
+        return Err(CommitStop::LeaseLowered);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+impl CommitStop {
+    /// The honest partial report: what stopped the export and what was published before it,
+    /// which remains on disk.
+    fn report(&self, committed: usize) -> String {
+        match self {
+            Self::Closed => format!(
+                "the handle was closed during the export; {committed} file(s) were published \
+                 before the close and remain"
+            ),
+            Self::Canceled => format!(
+                "the export was cancelled; {committed} file(s) were published before the stop \
+                 and remain"
+            ),
+            Self::LeaseLowered => format!(
+                "permission was lowered during the export; {committed} file(s) were published \
+                 before the lease ended and remain"
+            ),
+        }
+    }
+}
+
+/// Stage one native exported file into a temporary sibling of its destination. The source is
+/// read to exactly the length it announced and refused if it changes while it is copied: what the
+/// export later publishes is what the plan admitted, or nothing. The publication itself is a
+/// separate step, so the gate can run again between the copy and the rename.
+#[cfg(windows)]
+fn stage_export_file(
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> std::result::Result<ExportTemp, String> {
+    use std::{io::Read as _, os::windows::io::AsRawHandle as _};
+
+    use sha2::Digest as _;
+
+    let (temporary, mut writer) = ExportTemp::create_writer(target)?;
+    let sealed = (|| {
+        let mut reader = std::fs::File::open(source)
+            .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+        let before = reader
+            .metadata()
+            .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+        let before_identity = file_identity(reader.as_raw_handle())
+            .map_err(|error| format!("cannot identify {}: {error}", source.display()))?;
+        let expected = before.len();
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = [0u8; 64 * crate::text::KIB];
+        let mut copied = 0u64;
+        while copied < expected {
+            let room = usize::try_from(expected - copied).unwrap_or(buffer.len());
+            let take = room.min(buffer.len());
+            let read = reader
+                .read(buffer.get_mut(..take).unwrap_or_default())
+                .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(buffer.get(..read).unwrap_or_default());
+            std::io::Write::write_all(&mut writer, buffer.get(..read).unwrap_or_default())
+                .map_err(|error| format!("cannot write {}: {error}", target.display()))?;
+            copied = copied.saturating_add(read as u64);
+        }
+        let mut extra = [0u8];
+        let grew = reader
+            .read(&mut extra)
+            .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+        let after = reader
+            .metadata()
+            .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+        let after_identity = file_identity(reader.as_raw_handle())
+            .map_err(|error| format!("cannot identify {}: {error}", source.display()))?;
+        if copied != expected
+            || grew != 0
+            || after.len() != before.len()
+            || after_identity != before_identity
+        {
+            return Err(format!(
+                "{} changed while it was copied; nothing is published from it",
+                source.display()
+            ));
+        }
+        Ok((copied, hasher.finalize().into()))
+    })();
+    let (copied, digest) = sealed?;
+    drop(writer);
+    let mut temporary = temporary;
+    temporary.sealed(copied, digest);
+    Ok(temporary)
+}
+
+/// The digest an entry with no bytes carries: the hash of nothing.
+#[cfg(windows)]
+fn empty_digest() -> [u8; 32] {
+    use sha2::Digest as _;
+
+    sha2::Sha256::new().finalize().into()
+}
+
+/// The snapshot of one Windows-backed stage source: every entry as the fence read it, and the
+/// announced bytes, read once through the handles that bound them. The manifest travels before
+/// the bytes and the runner re-checks every digest as it writes, so what lands in the guest-owned
+/// workspace is exactly what this walk read.
+#[cfg(windows)]
+struct StageSnapshot {
+    entries: Vec<crate::subshell::TransferEntry>,
+    payload: Vec<u8>,
+}
+
+/// Walk one Windows-backed stage source under the native read fence and return its snapshot: the
+/// same refusal set the runner's own walk applies (a reparse point, a hard link, a name outside
+/// the transfer grammar), with every file read to exactly the length it announced and refused if
+/// it changed while it was read. The announced bytes are bounded by the workspace quota before
+/// any of them are held, so an upload can never carry more than the workspace may hold.
+#[cfg(windows)]
+fn snapshot_stage_tree(
+    root: &std::path::Path,
+    quota_bytes: u64,
+) -> std::result::Result<StageSnapshot, String> {
+    verify_native_ancestors(root)?;
+    check_real_directory(root)?;
+    let mut snapshot = StageSnapshot {
+        entries: Vec::new(),
+        payload: Vec::new(),
+    };
+    snapshot_directory(root, &mut Vec::new(), quota_bytes, &mut snapshot)?;
+    Ok(snapshot)
+}
+
+/// The walk itself: one directory's names in a stable order, each entry judged on the metadata of
+/// the object its name resolved to, never on the name alone.
+#[cfg(windows)]
+fn snapshot_directory(
+    directory: &std::path::Path,
+    relative: &mut Vec<String>,
+    quota_bytes: u64,
+    snapshot: &mut StageSnapshot,
+) -> std::result::Result<(), String> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(directory)
+        .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
+    names.sort();
+    for name in names {
+        let Some(text) = name.to_str() else {
+            return Err(format!(
+                "{} is not Unicode; nothing is staged from a name the wire cannot carry",
+                name.to_string_lossy()
+            ));
+        };
+        // A name in the proof artifact namespace is internal bookkeeping, never transfer data.
+        if crate::subshell::is_proof_name(text) {
+            continue;
+        }
+        if !crate::subshell::is_transfer_component(text) {
+            return Err(format!("invalid source name: {text:?}"));
+        }
+        relative.push(text.to_owned());
+        let path = relative.join("/");
+        if !crate::subshell::is_transfer_entry_path(&path) {
+            return Err(format!("a source path is too long or too deep: {path:?}"));
+        }
+        let child = directory.join(&name);
+        let metadata = std::fs::symlink_metadata(&child)
+            .map_err(|error| format!("cannot inspect {}: {error}", child.display()))?;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(format!(
+                "{} is a symlink or reparse point; nothing is read through one",
+                child.display()
+            ));
+        }
+        if snapshot.entries.len() >= crate::subshell::MAX_TRANSFER_ENTRIES {
+            return Err(format!(
+                "the source has more than {} entries",
+                crate::subshell::MAX_TRANSFER_ENTRIES
+            ));
+        }
+        let modified = metadata.modified().map_err(|error| {
+            format!(
+                "cannot read {}'s modification time: {error}",
+                child.display()
+            )
+        })?;
+        let (modified_secs, modified_nanos) = crate::subshell::system_time_parts(modified);
+        if metadata.is_dir() {
+            check_real_directory(&child)?;
+            snapshot.entries.push(crate::subshell::TransferEntry {
+                root: 0,
+                path,
+                len: 0,
+                modified_secs,
+                modified_nanos,
+                digest: crate::subshell::digest_hex(&empty_digest()),
+                directory: true,
+            });
+            snapshot_directory(&child, relative, quota_bytes, snapshot)?;
+        } else if metadata.is_file() {
+            let len = metadata.len();
+            // A declared length past any one budget is refused before the copy allocates or
+            // writes for it.
+            if len > crate::subshell::MAX_TRANSFER_FILE_BYTES {
+                return Err(format!("{path} is larger than one transferred file may be"));
+            }
+            let held = snapshot.payload.len() as u64;
+            if held.saturating_add(len) > quota_bytes
+                || held.saturating_add(len) > crate::subshell::MAX_TRANSFER_BYTES
+            {
+                return Err(format!(
+                    "the source is larger than the {quota_bytes} byte scratch quota"
+                ));
+            }
+            let (bytes, digest) = read_snapshot_file(&child, &path, len)?;
+            snapshot.payload.extend_from_slice(&bytes);
+            snapshot.entries.push(crate::subshell::TransferEntry {
+                root: 0,
+                path,
+                len,
+                modified_secs,
+                modified_nanos,
+                digest: crate::subshell::digest_hex(&digest),
+                directory: false,
+            });
+        } else {
+            return Err(format!(
+                "{} is not a regular file or a real directory; nothing else is staged",
+                child.display()
+            ));
+        }
+        relative.pop();
+    }
+    Ok(())
+}
+
+/// Read one file for a stage snapshot under the fence `stage_export_file` publishes under: the
+/// object is identified at the handle it is read from, exactly the announced length is read and
+/// hashed, and a file that grew or was replaced while it was read refuses the snapshot instead of
+/// carrying a mixture of moments into the workspace.
+#[cfg(windows)]
+fn read_snapshot_file(
+    path: &std::path::Path,
+    entry_path: &str,
+    expected_len: u64,
+) -> std::result::Result<(Vec<u8>, [u8; 32]), String> {
+    use std::{io::Read as _, os::windows::io::AsRawHandle as _};
+
+    use sha2::Digest as _;
+
+    let mut reader = std::fs::File::open(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let before = reader
+        .metadata()
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let before_identity = file_identity(reader.as_raw_handle())
+        .map_err(|error| format!("cannot identify {}: {error}", path.display()))?;
+    if file_link_count(&reader)
+        .map_err(|error| format!("cannot identify {}: {error}", path.display()))?
+        != 1
+    {
+        return Err(format!(
+            "{entry_path} has another name; a stage refuses a file another name can change"
+        ));
+    }
+    let capacity = usize::try_from(expected_len).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(capacity.min(64 * crate::text::KIB));
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0u8; 64 * crate::text::KIB];
+    let mut copied = 0u64;
+    while copied < expected_len {
+        let room = usize::try_from(expected_len - copied).unwrap_or(buffer.len());
+        let take = room.min(buffer.len());
+        let read = reader
+            .read(buffer.get_mut(..take).unwrap_or_default())
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        let chunk = buffer.get(..read).unwrap_or_default();
+        hasher.update(chunk);
+        bytes.extend_from_slice(chunk);
+        copied = copied.saturating_add(read as u64);
+    }
+    let mut extra = [0u8];
+    let grew = reader
+        .read(&mut extra)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let after = reader
+        .metadata()
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let after_identity = file_identity(reader.as_raw_handle())
+        .map_err(|error| format!("cannot identify {}: {error}", path.display()))?;
+    let after_links = file_link_count(&reader)
+        .map_err(|error| format!("cannot identify {}: {error}", path.display()))?;
+    if copied != expected_len
+        || grew != 0
+        || after.len() != before.len()
+        || after_identity != before_identity
+        || after_links != 1
+    {
+        return Err(format!(
+            "{entry_path} changed while it was staged; nothing is staged from it"
+        ));
+    }
+    Ok((bytes, hasher.finalize().into()))
+}
+
+/// The bytes an upload follows its request with: one manifest line carrying the snapshot's
+/// entries in the frame shape a transfer answers with, then every file's announced bytes in
+/// manifest order.
+#[cfg(windows)]
+fn upload_stream(op: &str, snapshot: &StageSnapshot) -> anyhow::Result<Vec<u8>> {
+    let mut stream = crate::subshell::Frame::Manifest {
+        op: op.to_owned(),
+        roots: Vec::new(),
+        entries: snapshot.entries.clone(),
+    }
+    .encode()?;
+    stream.extend_from_slice(&snapshot.payload);
+    Ok(stream)
+}
+
+/// Remove one staged temporary through the handle that names it, so what is removed is the
+/// object the export created and never a name that meanwhile came to name something else.
+#[cfg(windows)]
+fn remove_staged(path: &std::path::Path, expected: FileIdentity) {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    let Ok(staged) = open_staged(path) else {
+        return;
+    };
+    let identity = match file_identity(staged.as_raw_handle()) {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(
+                "cannot identify the staged file {}: {error}",
+                path.display()
+            );
+            return;
+        }
+    };
+    if identity != expected {
+        tracing::warn!(
+            "the staged file {} now names another object; the export leaves it alone",
+            path.display()
+        );
+        return;
+    }
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: the handle is open on the verified file and the buffer is one disposition record.
+    let deleted = unsafe {
+        SetFileInformationByHandle(
+            staged.as_raw_handle(),
+            FileDispositionInfo,
+            std::ptr::from_ref(&disposition).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if deleted == 0 {
+        tracing::warn!(
+            "cannot remove the staged file {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Create every directory between the admitted `root` and `target`, one component at a time,
+/// refusing an existing entry that is not a real directory. Creating a level by name cannot pass
+/// through a link, and the metadata check on an existing level refuses one planted there.
+#[cfg(windows)]
+fn create_verified_directories(
+    root: &std::path::Path,
+    target: &std::path::Path,
+) -> std::result::Result<(), String> {
+    use std::path::Component;
+
+    let relative = target.strip_prefix(root).map_err(|_| {
+        format!(
+            "{} is outside the export destination {}",
+            target.display(),
+            root.display()
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    check_real_directory(&current)?;
+    for component in relative.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(format!("invalid export path: {}", target.display()));
+        }
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(_) => check_real_directory(&current)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)
+                    .map_err(|error| format!("cannot create {}: {error}", current.display()))?;
+                check_real_directory(&current)?;
+            }
+            Err(error) => return Err(format!("cannot read {}: {error}", current.display())),
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a path that is not a real directory: a reparse point is never followed.
+#[cfg(windows)]
+fn check_real_directory(path: &std::path::Path) -> std::result::Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if metadata.file_attributes() & 0x400 != 0 {
+        return Err(format!(
+            "{} is a symlink or reparse point; nothing is read through one",
+            path.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    Ok(())
+}
+
+/// Check the ancestors of a native path, so a junction above the final object cannot lead a walk
+/// outside the grant.
+#[cfg(windows)]
+fn verify_native_ancestors(path: &std::path::Path) -> std::result::Result<(), String> {
+    let mut ancestors: Vec<&std::path::Path> = path.ancestors().skip(1).collect();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        check_real_directory(ancestor)?;
+    }
+    Ok(())
+}
+
+/// One export source spelling resolved to a scratch handle's workspace when it names one: the
+/// workspace the snapshot landed in is what the model was told to work in, so `/workspace` and the
+/// staged path are the same directory to it.
+#[cfg(windows)]
+fn scratch_workspace_alias<'path>(
+    handle: &crate::subshell::Handle,
+    path: &'path str,
+) -> std::borrow::Cow<'path, str> {
+    let Some(scratch) = handle.scratch() else {
+        return std::borrow::Cow::Borrowed(path);
+    };
+    if path == "/workspace" {
+        return std::borrow::Cow::Owned(scratch.path.clone());
+    }
+    if let Some(rest) = path.strip_prefix("/workspace/") {
+        return std::borrow::Cow::Owned(format!("{}/{}", scratch.path, rest));
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
+/// The export targets within the staged source region that no longer match the snapshot: what
+/// exporting back would silently lose.
+///
+/// The baseline is the only witness: a file that changed since the copy, one deleted since, and
+/// one that appeared where the snapshot had none each refuse the plan. They would be lost to
+/// whoever changed them, and no flag buys that back.
+#[cfg(windows)]
+fn scratch_conflicts(
+    scratch: &crate::subshell::ScratchState,
+    files: &[(PlannedSource, std::path::PathBuf)],
+) -> Vec<String> {
+    let mut conflicts = Vec::new();
+    for (_source, target) in files {
+        let Ok(relative) = target.strip_prefix(&scratch.source_root) else {
+            continue;
+        };
+        let display = target.display().to_string();
+        let Some(key) = relative.to_str() else {
+            conflicts.push(format!(
+                "{display}: the path cannot be compared with the snapshot because it is not Unicode"
+            ));
+            continue;
+        };
+        let key = key.replace('\\', "/");
+        let baseline = scratch.baseline.get(&key).or_else(|| {
+            // A Windows source is case-insensitive, so the baseline is matched the way the
+            // filesystem would. A guest source is not: two names that differ only in case are two
+            // files there, and the exact key is the only one that names the staged one.
+            (!scratch.guest_source)
+                .then(|| {
+                    scratch
+                        .baseline
+                        .iter()
+                        .find(|(staged, _)| staged.eq_ignore_ascii_case(&key))
+                        .map(|(_, entry)| entry)
+                })
+                .flatten()
+        });
+        let current = match std::fs::symlink_metadata(target) {
+            Ok(current) => Some(current),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                conflicts.push(format!("{display}: cannot be read: {error}"));
+                continue;
+            }
+        };
+        match (baseline, current) {
+            (Some(baseline), Some(current)) => {
+                let changed = current.len() != baseline.len
+                    || current
+                        .modified()
+                        .map(|stamp| stamp != baseline.modified)
+                        .unwrap_or(true)
+                    || file_digest(target)
+                        .map(|digest| digest != baseline.digest)
+                        .unwrap_or(true);
+                if changed {
+                    conflicts.push(format!("{display}: changed after it was staged"));
+                }
+            }
+            (Some(_), None) => {
+                conflicts.push(format!("{display}: deleted after it was staged"));
+            }
+            (None, Some(_)) => conflicts.push(format!("{display}: appeared after staging")),
+            (None, None) => {}
+        }
+    }
+    conflicts
+}
+
+/// The SHA-256 of one file, streamed; `None` when it cannot be read.
+#[cfg(windows)]
+fn file_digest(path: &std::path::Path) -> Option<[u8; 32]> {
+    use std::io::Read as _;
+
+    use sha2::Digest as _;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0u8; 64 * crate::text::KIB];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            return Some(hasher.finalize().into());
+        }
+        hasher.update(buffer.get(..read).unwrap_or_default());
+    }
+}
+
+#[cfg(windows)]
+#[async_trait]
+impl Tool for SubshellExecuteTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: SUBSHELL_EXECUTE.to_string(),
+            description: format!(
+                "Run one POSIX shell command in a confined WSL workspace under a handle opened by \
+                 `subshell_open`. {} Every call starts a fresh shell with the handle's mounts, so \
+                 `cd`, environment changes and background processes do not carry between calls. \
+                 No network or Windows drives. Output is capped at {}.",
+                self.target.scope_description(),
+                crate::text::format_size(MAX_OUTPUT_BYTES),
+            ),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "string", "description": "The handle name opened by `subshell_open`."},
+                    "command": {"type": "string", "description": "POSIX shell command to run."},
+                    "timeout_ms": {"type": "integer", "default": DEFAULT_TIMEOUT.as_millis(), "maximum": crate::subshell::MAX_TIMEOUT.as_millis(), "description": "Command timeout in milliseconds."},
+                    "scratchpad": {"type": "string", "description": "Save command output under this scratchpad entry name."}
+                },
+                "required": ["handle", "command"]
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn required_permission(&self) -> Permission {
+        Permission::Read
+    }
+
+    async fn refusal_at_level(
+        &self,
+        level: Permission,
+        _: &serde_json::Value,
+    ) -> Option<ToolOutput> {
+        admit_subshell(SUBSHELL_EXECUTE, level, self.required)
+            .err()
+            .map(|error| ToolOutput::from_error(&error))
+    }
+
+    fn reports_failure_as_output(&self) -> bool {
+        true
+    }
+
+    fn as_detachable(&self) -> Option<&dyn crate::tools::Detachable> {
+        Some(self)
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        context: crate::tools::ToolContext,
+    ) -> Result<ToolOutput> {
+        crate::tools::start_and_run(self, input, context).await
+    }
+}
+
+#[cfg(windows)]
+#[async_trait]
+impl crate::tools::Detachable for SubshellExecuteTool {
+    async fn start(
+        &self,
+        input: serde_json::Value,
+        context: &crate::tools::ToolContext,
+    ) -> Result<crate::tools::Started> {
+        use super::util::optional_u64;
+
+        let lease = self.permission.lease();
+        admit_subshell(SUBSHELL_EXECUTE, lease.level, self.required)?;
+        let handle = addressed_handle(&self.handles, context.session_id, &input, SUBSHELL_EXECUTE)?;
+        let effective = handle.effective_level(lease.level);
+        if handle.scratch().is_some() && !Permission::Workspace.is_within(effective) {
+            return Err(subshell_error(
+                SUBSHELL_EXECUTE,
+                format!(
+                    "a scratch handle needs `workspace` permission; this call runs at {effective}"
+                ),
+            ));
+        }
+        let timeout_ms = optional_u64(&input, "timeout_ms", SUBSHELL_EXECUTE)?
+            .unwrap_or(DEFAULT_TIMEOUT.as_millis() as u64);
+        let (request, proofs) = handle
+            .request(
+                require_str(&input, "command", SUBSHELL_EXECUTE)?,
+                timeout_ms,
+                lease.level,
+            )
+            .map_err(|error| subshell_error(SUBSHELL_EXECUTE, error))?;
+        let timeout = request.timeout();
+        let frame = request
+            .encode()
+            .map_err(|error| subshell_error(SUBSHELL_EXECUTE, error))?;
+        let target = Arc::clone(&self.target);
+        // The claim this call holds on the handle, returned when the call ends however it ends, so
+        // a close can report what it stopped. A handle already closed refuses here rather than
+        // starting a command in a scope the close has released.
+        let outstanding = handle
+            .begin()
+            .map_err(|error| subshell_error(SUBSHELL_EXECUTE, error))?;
+        let closed = handle.cancelled();
+        Ok(crate::tools::Started::running(
+            None,
+            move |context| async move {
+                // The proofs live as long as the request they mounted: until this call is done.
+                let _proofs = proofs;
+                let _outstanding = outstanding;
+                let started = tokio::time::Instant::now();
+                // Bound delivery as well as execution. The launcher may not consume its input if
+                // the distro cannot start. A stop during setup is unconfirmed: the request may
+                // already have reached the guest, and the local launcher's end says nothing about
+                // the namespace it asked for.
+                let launch = tokio::time::timeout(
+                    timeout,
+                    crate::sandbox::wsl_host::launch(&target, &frame),
+                );
+                tokio::pin!(launch);
+                let child = tokio::select! {
+                    biased;
+                    () = lease.revoked() => {
+                        if let Some(observation) = &context.teardown {
+                            observation.note(false);
+                        }
+                        return Err(subshell_error(SUBSHELL_EXECUTE, "permission was lowered during setup; whether the managed WSL command started is unconfirmed"));
+                    }
+                    () = closed.cancelled() => {
+                        if let Some(observation) = &context.teardown {
+                            observation.note(false);
+                        }
+                        return Err(subshell_error(SUBSHELL_EXECUTE, "the subshell handle was closed during setup; whether the command started is unconfirmed"));
+                    }
+                    () = context.cancellation.cancelled() => {
+                        if let Some(observation) = &context.teardown {
+                            observation.note(false);
+                        }
+                        return Err(MekaError::Interrupted);
+                    }
+                    launched = &mut launch => launched
+                        .map_err(|_| subshell_error(SUBSHELL_EXECUTE, "timed out delivering the managed WSL request"))?
+                        .map_err(|error| subshell_error(SUBSHELL_EXECUTE, format!("{error:#}")))?,
+                };
+                run_wsl_command_tree(
+                    child,
+                    &request.op,
+                    handle.effective_level(lease.level),
+                    timeout.saturating_sub(started.elapsed()),
+                    &context,
+                    &lease,
+                    Some(&closed),
+                )
+                .await
+                .map_err(|failure| match failure {
+                    CommandTreeError::Interrupted => MekaError::Interrupted,
+                    CommandTreeError::Wait(error) => subshell_error(
+                        SUBSHELL_EXECUTE,
+                        format!("failed to wait for the WSL launcher: {error}"),
+                    ),
+                })
+            },
+        ))
+    }
+}
+
+#[cfg(windows)]
+#[async_trait]
+impl Tool for SubshellExportTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: SUBSHELL_EXPORT.to_string(),
+            description: format!(
+                "Copy files or directories out of a subshell handle's admitted scope into an \
+                 authorized Windows destination. {} The destination is rechecked against the \
+                 session's current write scope at every call, and a `read` session cannot export. \
+                 Sources must be real paths within the handle's scope, never symlinks. A destination \
+                 name that already exists is refused: export to a fresh name.",
+                self.target.scope_description(),
+            ),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "string", "description": "The handle name opened by `subshell_open`."},
+                    "paths": {"type": "array", "items": {"type": "string"}, "description": "Guest Linux paths within the handle's admitted scope to copy."},
+                    "destination": {"type": "string", "description": "An existing directory within the session's write scope to copy into."}
+                },
+                "required": ["handle", "paths", "destination"]
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn required_permission(&self) -> Permission {
+        Permission::Read
+    }
+
+    async fn refusal_at_level(
+        &self,
+        level: Permission,
+        _: &serde_json::Value,
+    ) -> Option<ToolOutput> {
+        // A read-level session cannot export to disk: the floor is the operation's own, whatever
+        // the operator configured for the family.
+        admit_subshell(
+            SUBSHELL_EXPORT,
+            level,
+            self.required.max(Permission::Workspace),
+        )
+        .err()
+        .map(|error| ToolOutput::from_error(&error))
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        context: crate::tools::ToolContext,
+    ) -> Result<ToolOutput> {
+        use super::util::{optional_bool, string_or_list};
+
+        // The `overwrite` argument was removed with the behavior it named: an export never
+        // replaces an existing entry. A caller still passing the boolean it once took gets the
+        // migration, not a silent drop of the flag.
+        if optional_bool(&input, "overwrite", SUBSHELL_EXPORT)?.is_some() {
+            return Err(subshell_error(
+                SUBSHELL_EXPORT,
+                "the `overwrite` argument was removed: an export never replaces an existing \
+                 entry; export to a fresh name",
+            ));
+        }
+        let lease = self.permission.lease();
+        admit_subshell(
+            SUBSHELL_EXPORT,
+            lease.level,
+            self.required.max(Permission::Workspace),
+        )?;
+        let handle = addressed_handle(&self.handles, context.session_id, &input, SUBSHELL_EXPORT)?;
+        // Hold the handle open for the whole export and watch its close token: a close removes the
+        // handle, but a copy already under way would otherwise keep reading the scope the close
+        // released.
+        let _outstanding = handle
+            .begin()
+            .map_err(|error| subshell_error(SUBSHELL_EXPORT, error))?;
+        let closed = handle.cancelled();
+        if !Permission::Workspace.is_within(handle.effective_level(lease.level)) {
+            return Err(subshell_error(
+                SUBSHELL_EXPORT,
+                "a read-only subshell handle cannot export to disk; reopen it at `workspace`",
+            ));
+        }
+        let paths = string_or_list(&input, "paths", SUBSHELL_EXPORT)?.unwrap_or_default();
+        let destination = require_str(&input, "destination", SUBSHELL_EXPORT)?;
+        let mut copies = plan_export(
+            &handle,
+            &self.site.cwd,
+            &self.scope,
+            lease.level,
+            &paths,
+            &destination,
+        )?;
+        // Guest sources are read by the runner, not by a host walk: the request carries the exact
+        // paths the handle admitted, and the response's manifest is planned and refused before the
+        // first byte arrives.
+        if !copies.guest_sources.is_empty() {
+            let sources = copies.guest_sources.clone();
+            let transfer = crate::subshell::Transfer::Export {
+                sources: sources.clone(),
+            };
+            let timeout_ms =
+                u64::try_from(crate::subshell::TRANSFER_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+            let (request, _proofs) = handle
+                .transfer_request(timeout_ms, transfer, lease.level)
+                .map_err(|error| subshell_error(SUBSHELL_EXPORT, format!("{error:#}")))?;
+            let frame = request
+                .encode()
+                .map_err(|error| subshell_error(SUBSHELL_EXPORT, format!("{error:#}")))?;
+            let (streamed, planned) = {
+                let mut visitor = GuestExportVisitor::new(
+                    &self.site,
+                    &self.scope,
+                    &self.permission,
+                    &context.cancellation,
+                    &closed,
+                    &lease,
+                    &handle,
+                    &mut copies,
+                    &sources,
+                );
+                visitor.scratch = handle.scratch();
+                let run = drive_transfer(
+                    &self.target,
+                    &request.op,
+                    &frame,
+                    &lease,
+                    &context,
+                    &mut visitor,
+                )
+                .await
+                .map_err(|detail| subshell_error(SUBSHELL_EXPORT, detail))?;
+                match run {
+                    TransferRun::Done => {}
+                    TransferRun::Lowered => {
+                        return Err(subshell_error(
+                            SUBSHELL_EXPORT,
+                            "permission was lowered during the export; the export ended",
+                        ));
+                    }
+                    TransferRun::Cancelled | TransferRun::Stopped => {
+                        return Err(MekaError::Interrupted);
+                    }
+                }
+                (visitor.streamed(), visitor.planned())
+            };
+            if streamed != planned {
+                return Err(subshell_error(
+                    SUBSHELL_EXPORT,
+                    format!(
+                        "the runner's transfer ended after {streamed} of {planned} file(s); the \
+                         export is incomplete"
+                    ),
+                ));
+            }
+        }
+        // Every target is re-admitted against the level in force *now*, not the one the call was
+        // admitted at, and its destination chain is created one verified component at a time. A
+        // downgrade or a revocation stops the export between files.
+        let mut copied = Vec::new();
+        let mut copied_bytes = 0u64;
+        for (source, target) in &copies.files {
+            if let PlannedSource::Guest { len, .. } = source {
+                copied_bytes = copied_bytes.saturating_add(*len);
+                copied.push(target.display().to_string());
+            }
+        }
+        let admit = |target: &std::path::Path| -> Result<()> {
+            let live = self.permission.get();
+            let resolved = crate::workspace::resolve_existing_prefix(target);
+            self.scope
+                .admit_shown_at(live, &self.site.cwd, target, &resolved)
+                .map_err(|refusal| {
+                    subshell_error(
+                        SUBSHELL_EXPORT,
+                        format!("the export stopped at {}: {refusal}", target.display()),
+                    )
+                })
+        };
+        for (source, target) in &copies.files {
+            let PlannedSource::Native(source) = source else {
+                continue;
+            };
+            if let Err(stop) = commit_gate(&closed, &context.cancellation, &lease) {
+                return match stop {
+                    CommitStop::Canceled => Err(MekaError::Interrupted),
+                    other => Err(subshell_error(SUBSHELL_EXPORT, other.report(copied.len()))),
+                };
+            }
+            admit(target)?;
+            if let Some(parent) = target.parent() {
+                create_verified_directories(&copies.root, parent)
+                    .map_err(|refusal| subshell_error(SUBSHELL_EXPORT, refusal))?;
+            }
+            let staged = stage_export_file(source, target)
+                .map_err(|refusal| subshell_error(SUBSHELL_EXPORT, refusal))?;
+            // The gate again after the copy and before the rename: a stop or downgrade that won
+            // while the bytes moved must not be overtaken by the publication.
+            if let Err(stop) = commit_gate(&closed, &context.cancellation, &lease) {
+                return match stop {
+                    CommitStop::Canceled => Err(MekaError::Interrupted),
+                    other => Err(subshell_error(SUBSHELL_EXPORT, other.report(copied.len()))),
+                };
+            }
+            admit(target)?;
+            let pinned = target
+                .parent()
+                .map(|parent| PinnedDirectory::pin(parent, None))
+                .transpose()
+                .map_err(|refusal| subshell_error(SUBSHELL_EXPORT, refusal))?
+                .ok_or_else(|| {
+                    subshell_error(
+                        SUBSHELL_EXPORT,
+                        format!("{} has no parent directory", target.display()),
+                    )
+                })?;
+            copied_bytes = copied_bytes.saturating_add(
+                publish_export_temp(staged, target, pinned).map_err(|refusal| {
+                    subshell_error(
+                        SUBSHELL_EXPORT,
+                        format!(
+                            "{refusal}; {} file(s) were published before it and remain",
+                            copied.len()
+                        ),
+                    )
+                })?,
+            );
+            copied.push(target.display().to_string());
+        }
+        for directory in &copies.directories {
+            if closed.is_cancelled() {
+                return Err(subshell_error(
+                    SUBSHELL_EXPORT,
+                    "the handle was closed during the export; the export ended",
+                ));
+            }
+            if context.cancellation.is_cancelled() {
+                return Err(MekaError::Interrupted);
+            }
+            if lease.is_revoked() {
+                return Err(subshell_error(
+                    SUBSHELL_EXPORT,
+                    "permission was lowered during the export; the export ended",
+                ));
+            }
+            admit(directory)?;
+            create_verified_directories(&copies.root, directory)
+                .map_err(|refusal| subshell_error(SUBSHELL_EXPORT, refusal))?;
+        }
+        Ok(ToolOutput::text(
+            format!(
+                "exported {copied_bytes} byte(s) in {} file(s) to {}:\n{}",
+                copied.len(),
+                destination,
+                copied
+                    .iter()
+                    .map(|path| format!("  {path}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            false,
+        ))
+    }
+}
+
+#[cfg(windows)]
+#[async_trait]
+impl Tool for SubshellCloseTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: SUBSHELL_CLOSE.to_string(),
+            description: "Close a subshell handle: stop the work running under it and release its \
+                 scope. Anything worth keeping must be exported first."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "string", "description": "The handle name opened by `subshell_open`."}
+                },
+                "required": ["handle"]
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn required_permission(&self) -> Permission {
+        Permission::Read
+    }
+
+    async fn refusal_at_level(
+        &self,
+        level: Permission,
+        _: &serde_json::Value,
+    ) -> Option<ToolOutput> {
+        admit_subshell(SUBSHELL_CLOSE, level, self.required)
+            .err()
+            .map(|error| ToolOutput::from_error(&error))
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        context: crate::tools::ToolContext,
+    ) -> Result<ToolOutput> {
+        let lease = self.permission.lease();
+        admit_subshell(SUBSHELL_CLOSE, lease.level, self.required)?;
+        let name = require_str(&input, "handle", SUBSHELL_CLOSE)?;
+        let handle = self
+            .handles
+            .close(context.session_id, &name)
+            .map_err(|error| subshell_error(SUBSHELL_CLOSE, error))?;
+        // Cancellation is a request, not a result. A call whose last check already passed keeps
+        // its process tree alive until it returns, so the close waits for the calls it stopped
+        // before it claims they stopped: saying "stopped" over work that is still unwinding is
+        // the one report a caller cannot act on.
+        let stopping = handle.outstanding();
+        let idle = stopping == 0
+            || tokio::time::timeout(CLOSE_WAIT, handle.wait_idle())
+                .await
+                .is_ok();
+        let mut text = if idle {
+            format!(
+                "closed subshell handle {name:?}; stopped {stopping} running command(s). Released: {}",
+                handle.scope_description()
+            )
+        } else {
+            format!(
+                "closed subshell handle {name:?}; stop requested for {stopping} running command(s), \
+                 which had not returned within {}s. The guest teardown is unconfirmed and the \
+                 scratch workspace is left for the reaper. Released: {}",
+                CLOSE_WAIT.as_secs(),
+                handle.scope_description()
+            )
+        };
+        if idle && let Some(scratch) = handle.scratch() {
+            // The runner removes the workspace it created, by the id the handle was opened with,
+            // and never by a host path. A removal the runner does not confirm is reported as
+            // unconfirmed: the lease sweep reaps whatever remains.
+            let removal = async {
+                let timeout_ms = u64::try_from(crate::subshell::TRANSFER_TIMEOUT.as_millis())
+                    .unwrap_or(u64::MAX);
+                let (request, _proofs) = handle
+                    .transfer_request(
+                        timeout_ms,
+                        crate::subshell::Transfer::RemoveScratch,
+                        lease.level,
+                    )
+                    .map_err(|error| format!("{error:#}"))?;
+                let frame = request.encode().map_err(|error| format!("{error:#}"))?;
+                let mut visitor = crate::subshell::ManifestOnly::default();
+                drive_transfer(
+                    handle.target(),
+                    &request.op,
+                    &frame,
+                    &lease,
+                    &context,
+                    &mut visitor,
+                )
+                .await
+            }
+            .await;
+            match removal {
+                Ok(TransferRun::Done) => {}
+                Ok(_) => text.push_str(&format!(
+                    "\nthe scratch workspace {} was not confirmed removed; it will be reaped",
+                    scratch.path
+                )),
+                Err(error) => text.push_str(&format!(
+                    "\nthe scratch workspace {} was not confirmed removed: {error}; it will be \
+                     reaped",
+                    scratch.path
+                )),
+            }
+        }
+        Ok(ToolOutput::text(text, false))
+    }
+}
+
+/// Everything one export will copy, decided before the first byte moves: the file pairs, the
+/// directories to create, and the destination spelling the model named.
+///
+/// Check-then-copy rather than copy-as-you-go because every refusal has to land before anything
+/// is written: a source outside the handle's scope, a symlink anywhere in a source, a destination
+/// outside the write scope, or a name already taken at the destination must each leave the
+/// destination untouched. The destination is judged against the parent's *current* write scope at
+/// every call, so a lowered permission cannot be routed around by a handle opened earlier.
+#[cfg(windows)]
+struct ExportPlan {
+    /// The admitted destination root every target lives beneath.
+    root: std::path::PathBuf,
+    files: Vec<(PlannedSource, std::path::PathBuf)>,
+    directories: Vec<std::path::PathBuf>,
+    /// Every destination already planned, lowercased for Windows' case-insensitive names.
+    seen: std::collections::HashSet<String>,
+    /// The typed guest sources the runner reads, in the order its manifest's root indices name.
+    guest_sources: Vec<crate::subshell::ExportSource>,
+}
+
+/// Where one planned file's bytes will come from: the host reads a native source itself, while a
+/// guest source is streamed by the runner after its manifest is planned and refused or accepted.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+enum PlannedSource {
+    Native(std::path::PathBuf),
+    Guest { root: usize, path: String, len: u64 },
+}
+
+#[cfg(windows)]
+fn plan_export(
+    handle: &crate::subshell::Handle,
+    cwd: &crate::workspace::SharedCwd,
+    scope: &crate::workspace::WriteScope,
+    level: Permission,
+    paths: &[String],
+    destination: &str,
+) -> Result<ExportPlan> {
+    let spelled = crate::workspace::resolve_against_cwd(cwd, destination);
+    let resolved = crate::workspace::resolve_existing_prefix(&spelled);
+    scope
+        .admit_shown_at(level, cwd, &spelled, &resolved)
+        .map_err(|refusal| subshell_error(SUBSHELL_EXPORT, refusal))?;
+    let destination = std::fs::metadata(&resolved)
+        .map_err(|error| {
+            subshell_error(
+                SUBSHELL_EXPORT,
+                format!(
+                    "the export destination must be an existing directory: {}: {error}",
+                    spelled.display()
+                ),
+            )
+        })
+        .and_then(|metadata| {
+            if metadata.is_dir() {
+                Ok(resolved)
+            } else {
+                Err(subshell_error(
+                    SUBSHELL_EXPORT,
+                    format!(
+                        "the export destination is not a directory: {}",
+                        spelled.display()
+                    ),
+                ))
+            }
+        })?;
+    // The door for the publication's guarantees: a destination that cannot offer stable
+    // identities, a no-replace rename bound to a held directory, and a deletion that names one
+    // object is refused before the plan, never trusted to behave at the commit.
+    publication_provider(&destination)
+        .map_err(|refusal| subshell_error(SUBSHELL_EXPORT, refusal))?;
+    if paths.is_empty() {
+        return Err(subshell_error(SUBSHELL_EXPORT, "no paths to export"));
+    }
+
+    let mut plan = ExportPlan {
+        root: destination.clone(),
+        files: Vec::new(),
+        directories: Vec::new(),
+        seen: std::collections::HashSet::new(),
+        guest_sources: Vec::new(),
+    };
+    for path in paths {
+        let path = scratch_workspace_alias(handle, path);
+        let path: &str = &path;
+        if crate::subshell::windows_components(path).is_some() {
+            let source = export_source(handle, path)?;
+            let name = source.file_name().ok_or_else(|| {
+                subshell_error(SUBSHELL_EXPORT, format!("not a file name: {path:?}"))
+            })?;
+            let target = destination.join(name);
+            collect_export(&source, &target, &mut plan)?;
+        } else {
+            let source = guest_export_source(handle, path)?;
+            plan.guest_sources.push(source);
+        }
+    }
+    preflight_export(&plan).map_err(|detail| subshell_error(SUBSHELL_EXPORT, detail))?;
+    if let Some(scratch) = handle.scratch() {
+        let conflicts = scratch_conflicts(scratch, &plan.files);
+        if !conflicts.is_empty() {
+            return Err(subshell_error(
+                SUBSHELL_EXPORT,
+                format!(
+                    "exporting back over the staged source would lose changes the snapshot does \
+                     not hold:\n{}",
+                    conflicts
+                        .iter()
+                        .map(|conflict| format!("  {conflict}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            ));
+        }
+    }
+    Ok(plan)
+}
+
+/// One guest export source as the wire carries it: the request root the handle admitted the path
+/// under and the validated components beneath it. The runner resolves it beneath the root it
+/// opens itself, so no free-standing absolute path travels and no path walk decides authority.
+#[cfg(windows)]
+fn guest_export_source(
+    handle: &crate::subshell::Handle,
+    path: &str,
+) -> Result<crate::subshell::ExportSource> {
+    if !(path.starts_with('/')
+        && !path.contains('\0')
+        && !path.contains('\\')
+        && crate::subshell::is_normalized_guest_path(path))
+    {
+        return Err(subshell_error(
+            SUBSHELL_EXPORT,
+            format!(
+                "not an absolute normalized Linux path (a Windows separator is not a path \
+                 character here): {path:?}"
+            ),
+        ));
+    }
+    if !handle.admits_path(path) {
+        return Err(subshell_error(
+            SUBSHELL_EXPORT,
+            format!("{path:?} is outside the handle's admitted scope"),
+        ));
+    }
+    handle.export_source(path).ok_or_else(|| {
+        subshell_error(
+            SUBSHELL_EXPORT,
+            format!("{path:?} is outside the handle's admitted scope"),
+        )
+    })
+}
+
+/// How a transfer run ended when it was not an error.
+#[cfg(windows)]
+enum TransferRun {
+    /// The response was complete.
+    Done,
+    /// Permission was lowered while the transfer ran.
+    Lowered,
+    /// The call was cancelled while the transfer ran.
+    Cancelled,
+    /// The runner was stopped for another reason.
+    Stopped,
+}
+
+/// Launch one transfer request and read its response to the end, interrupting the run when the
+/// lease ends or the call is cancelled. A dropped run kills the runner's process tree.
+#[cfg(windows)]
+async fn drive_transfer(
+    target: &crate::subshell::Target,
+    op: &str,
+    frame: &[u8],
+    lease: &crate::permission::PermissionLease,
+    context: &crate::tools::ToolContext,
+    visitor: &mut dyn crate::subshell::TransferVisitor,
+) -> std::result::Result<TransferRun, String> {
+    let timeout = crate::subshell::TRANSFER_TIMEOUT;
+    let launched = tokio::select! {
+        biased;
+        () = lease.revoked() => return Ok(TransferRun::Lowered),
+        () = context.cancellation.cancelled() => return Ok(TransferRun::Cancelled),
+        launched = tokio::time::timeout(
+            timeout,
+            crate::sandbox::wsl_host::launch(target, frame),
+        ) => launched,
+    };
+    let tree = match launched {
+        Ok(launched) => launched.map_err(|error| format!("{error:#}"))?,
+        Err(_) => {
+            return Err(format!(
+                "timed out after {}ms starting the transfer",
+                timeout.as_millis()
+            ));
+        }
+    };
+    let collected = tokio::select! {
+        biased;
+        () = lease.revoked() => return Ok(TransferRun::Lowered),
+        () = context.cancellation.cancelled() => return Ok(TransferRun::Cancelled),
+        collected = crate::sandbox::wsl_host::collect_transfer(
+            tree,
+            op,
+            timeout,
+            Some(crate::process::Stop::Graceful(&context.cancellation)),
+            visitor,
+        ) => collected,
+    };
+    match collected {
+        Ok(crate::sandbox::wsl_host::Collected::Done) => Ok(TransferRun::Done),
+        Ok(crate::sandbox::wsl_host::Collected::Stopped) => Ok(TransferRun::Stopped),
+        Err(error) => Err(format!("{error:#}")),
+    }
+}
+
+/// Join one manifest path below the directory its root names, one validated component at a time.
+#[cfg(windows)]
+fn join_transfer_path(
+    base: &std::path::Path,
+    path: &str,
+) -> std::result::Result<std::path::PathBuf, String> {
+    let mut target = base.to_path_buf();
+    for component in path.split('/') {
+        export_component(std::ffi::OsStr::new(component))?;
+        target.push(component);
+    }
+    Ok(target)
+}
+
+/// One file the guest is streaming, from its `File` header until its last byte.
+#[cfg(windows)]
+struct OpenGuestFile {
+    entry: crate::subshell::TransferEntry,
+    target: std::path::PathBuf,
+    temporary: ExportTemp,
+    writer: std::fs::File,
+    written: u64,
+    hasher: sha2::Sha256,
+}
+
+/// One file written to a temporary sibling of the export root, waiting for the transfer's `Done`
+/// and a successful runner exit before it takes its destination name.
+#[cfg(windows)]
+struct PendingGuestFile {
+    temporary: ExportTemp,
+    target: std::path::PathBuf,
+}
+
+/// The host visitor that turns one export transfer into the same plan a native export builds: the
+/// manifest is admitted, refused, or planned before any byte arrives, then each streamed file is
+/// written to a temporary sibling and published under the existing no-replace and identity rules.
+#[cfg(windows)]
+struct GuestExportVisitor<'a> {
+    site: &'a crate::session::ToolSite,
+    scope: &'a crate::workspace::WriteScope,
+    permission: &'a crate::permission::SharedPermission,
+    cancellation: &'a tokio_util::sync::CancellationToken,
+    closed: &'a tokio_util::sync::CancellationToken,
+    /// The lease the call was admitted under, rechecked at every commit: a live level that still
+    /// reads high after a downgrade and a raise is not the authority the call was given.
+    lease: &'a crate::permission::PermissionLease,
+    handle: &'a crate::subshell::Handle,
+    plan: &'a mut ExportPlan,
+    sources: &'a [crate::subshell::ExportSource],
+    /// The staged workspace this handle runs in, when it has one.
+    scratch: Option<&'a crate::subshell::ScratchState>,
+    /// Every file the manifest announced, by source index and relative path.
+    entries: std::collections::HashMap<(usize, String), crate::subshell::TransferEntry>,
+    open: Option<OpenGuestFile>,
+    /// Files whose bytes and digest were accepted and wait for `complete`.
+    pending: Vec<PendingGuestFile>,
+    streamed: usize,
+}
+
+#[cfg(windows)]
+impl<'a> GuestExportVisitor<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        site: &'a crate::session::ToolSite,
+        scope: &'a crate::workspace::WriteScope,
+        permission: &'a crate::permission::SharedPermission,
+        cancellation: &'a tokio_util::sync::CancellationToken,
+        closed: &'a tokio_util::sync::CancellationToken,
+        lease: &'a crate::permission::PermissionLease,
+        handle: &'a crate::subshell::Handle,
+        plan: &'a mut ExportPlan,
+        sources: &'a [crate::subshell::ExportSource],
+    ) -> Self {
+        Self {
+            site,
+            scope,
+            permission,
+            cancellation,
+            closed,
+            lease,
+            handle,
+            plan,
+            sources,
+            scratch: None,
+            entries: std::collections::HashMap::new(),
+            open: None,
+            pending: Vec::new(),
+            streamed: 0,
+        }
+    }
+
+    /// How many files the guest streamed to completion.
+    fn streamed(&self) -> usize {
+        self.streamed
+    }
+
+    /// How many files the manifest announced.
+    fn planned(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn admit(&self, target: &std::path::Path) -> anyhow::Result<()> {
+        let live = self.permission.get();
+        let resolved = crate::workspace::resolve_existing_prefix(target);
+        self.scope
+            .admit_shown_at(live, &self.site.cwd, target, &resolved)
+            .map_err(|refusal| {
+                anyhow::anyhow!("the export stopped at {}: {refusal}", target.display())
+            })
+    }
+
+    fn interrupted(&self) -> Option<anyhow::Error> {
+        if self.closed.is_cancelled() {
+            return Some(anyhow::anyhow!(
+                "the handle was closed during the export; the export ended"
+            ));
+        }
+        if self.cancellation.is_cancelled() {
+            return Some(anyhow::anyhow!("the export was cancelled"));
+        }
+        None
+    }
+}
+
+#[cfg(windows)]
+#[async_trait]
+impl crate::subshell::TransferVisitor for GuestExportVisitor<'_> {
+    async fn manifest(
+        &mut self,
+        roots: &[crate::subshell::TransferRoot],
+        entries: &[crate::subshell::TransferEntry],
+    ) -> anyhow::Result<()> {
+        use anyhow::ensure;
+
+        ensure!(
+            roots.len() == self.sources.len(),
+            "the runner read {} source(s), not {}",
+            roots.len(),
+            self.sources.len()
+        );
+        let mut bases = Vec::with_capacity(roots.len());
+        for (index, (root, source)) in roots.iter().zip(self.sources).enumerate() {
+            ensure!(
+                root.source == *source,
+                "the runner read {:?}, not the source the request named",
+                root.source
+            );
+            let expected_name = self.handle.export_name(source).ok_or_else(|| {
+                anyhow::anyhow!("the export source has no name a host could publish it under")
+            })?;
+            ensure!(
+                root.name == expected_name,
+                "the runner named the source {:?}, not its own final component",
+                root.name
+            );
+            export_component(std::ffi::OsStr::new(&root.name))
+                .map_err(|detail| anyhow::anyhow!("{detail}"))?;
+            let base = self.plan.root.join(&root.name);
+            claim_export_target(self.plan, &base).map_err(|detail| anyhow::anyhow!("{detail}"))?;
+            if root.directory {
+                self.plan.directories.push(base.clone());
+            }
+            bases.push((index, base, root.directory));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut file_roots = vec![0usize; roots.len()];
+        for entry in entries {
+            ensure!(
+                entry.root < roots.len(),
+                "a manifest entry names an unknown source"
+            );
+            ensure!(
+                seen.insert((entry.root, entry.path.clone())),
+                "the manifest names {:?} twice",
+                entry.path
+            );
+            let (_, base, directory) = bases
+                .get(entry.root)
+                .ok_or_else(|| anyhow::anyhow!("a manifest entry names an unknown source"))?;
+            if entry.directory {
+                ensure!(*directory, "a file source cannot carry a directory entry");
+                let target = join_transfer_path(base, &entry.path)
+                    .map_err(|detail| anyhow::anyhow!("{detail}"))?;
+                claim_export_target(self.plan, &target)
+                    .map_err(|detail| anyhow::anyhow!("{detail}"))?;
+                self.plan.directories.push(target);
+                continue;
+            }
+            ensure!(
+                entry.parsed_digest().is_some(),
+                "invalid transfer digest: {:?}",
+                entry.digest
+            );
+            let target = if *directory {
+                let target = join_transfer_path(base, &entry.path)
+                    .map_err(|detail| anyhow::anyhow!("{detail}"))?;
+                claim_export_target(self.plan, &target)
+                    .map_err(|detail| anyhow::anyhow!("{detail}"))?;
+                planned_destination(&target).map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                target
+            } else {
+                let root = roots
+                    .get(entry.root)
+                    .ok_or_else(|| anyhow::anyhow!("a manifest entry names an unknown source"))?;
+                ensure!(
+                    entry.path == root.name,
+                    "a file source's only entry must be the file itself"
+                );
+                let count = file_roots
+                    .get_mut(entry.root)
+                    .ok_or_else(|| anyhow::anyhow!("a manifest entry names an unknown source"))?;
+                *count = count.saturating_add(1);
+                planned_destination(base).map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                base.clone()
+            };
+            self.entries
+                .insert((entry.root, entry.path.clone()), entry.clone());
+            self.plan.files.push((
+                PlannedSource::Guest {
+                    root: entry.root,
+                    path: entry.path.clone(),
+                    len: entry.len,
+                },
+                target,
+            ));
+        }
+        for (index, root) in roots.iter().enumerate() {
+            if !root.directory {
+                ensure!(
+                    file_roots.get(index) == Some(&1),
+                    "a file source must name exactly one file"
+                );
+            }
+        }
+        if let Some(scratch) = self.scratch {
+            let conflicts = scratch_conflicts(scratch, &self.plan.files);
+            if !conflicts.is_empty() {
+                anyhow::bail!(
+                    "exporting back over the staged source would lose changes the snapshot does \
+                     not hold:\n{}",
+                    conflicts
+                        .iter()
+                        .map(|conflict| format!("  {conflict}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
+        }
+        preflight_export(self.plan).map_err(|detail| anyhow::anyhow!("{detail}"))?;
+        // Directories no file lands in are created only once the transfer has ended; a file's
+        // parent directory is created when its bytes arrive. Admission still happens here, so a
+        // destination outside the live scope is refused before any byte moves.
+        let directories = self.plan.directories.clone();
+        for directory in &directories {
+            self.admit(directory)?;
+        }
+        Ok(())
+    }
+
+    async fn begin(&mut self, entry: &crate::subshell::TransferEntry) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        use sha2::Digest as _;
+
+        if let Some(error) = self.interrupted() {
+            return Err(error);
+        }
+        ensure!(self.open.is_none(), "a transfer file arrived mid-payload");
+        let planned = self
+            .entries
+            .get(&(entry.root, entry.path.clone()))
+            .ok_or_else(|| anyhow::anyhow!("a transfer file arrived that no manifest named"))?;
+        ensure!(!planned.directory, "a directory entry carried file bytes");
+        ensure!(
+            entry.len == planned.len
+                && entry.digest == planned.digest
+                && entry.modified_secs == planned.modified_secs
+                && entry.modified_nanos == planned.modified_nanos,
+            "a transfer file header does not match its manifest entry"
+        );
+        let (target, _) = self
+            .plan
+            .files
+            .iter()
+            .find_map(|(source, target)| match source {
+                PlannedSource::Guest { root, path, .. }
+                    if *root == entry.root && *path == entry.path =>
+                {
+                    Some((target.clone(), ()))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("a transfer file has no planned destination"))?;
+        self.admit(&target)?;
+        // The temporary is created beside its destination, so every directory between the
+        // admitted root and the file has to exist before its bytes arrive. The pass after the
+        // transfer still creates the directories no file landed in.
+        if let Some(parent) = target.parent() {
+            create_verified_directories(&self.plan.root, parent)
+                .map_err(|detail| anyhow::anyhow!("{detail}"))?;
+        }
+        let (temporary, writer) =
+            ExportTemp::create_writer(&target).map_err(|detail| anyhow::anyhow!("{detail}"))?;
+        self.open = Some(OpenGuestFile {
+            entry: entry.clone(),
+            target,
+            temporary,
+            writer,
+            written: 0,
+            hasher: sha2::Sha256::new(),
+        });
+        Ok(())
+    }
+
+    async fn payload(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
+        use std::io::Write as _;
+
+        use sha2::Digest as _;
+
+        if let Some(error) = self.interrupted() {
+            return Err(error);
+        }
+        let open = self
+            .open
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("transfer bytes arrived before their file header"))?;
+        open.writer
+            .write_all(chunk)
+            .map_err(|error| anyhow::anyhow!("cannot write {}: {error}", open.target.display()))?;
+        open.hasher.update(chunk);
+        open.written = open.written.saturating_add(chunk.len() as u64);
+        Ok(())
+    }
+
+    async fn end(&mut self, _entry: &crate::subshell::TransferEntry) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        use sha2::Digest as _;
+
+        let open = self
+            .open
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("a transfer file ended without its header"))?;
+        ensure!(
+            open.written == open.entry.len,
+            "the runner sent {} byte(s) for {:?}, not the {} it announced",
+            open.written,
+            open.entry.path,
+            open.entry.len
+        );
+        let digest: [u8; 32] = open.hasher.finalize().into();
+        ensure!(
+            Some(digest) == open.entry.parsed_digest(),
+            "the bytes of {:?} do not match the manifest digest",
+            open.entry.path
+        );
+        drop(open.writer);
+        let mut temporary = open.temporary;
+        // The sealed identity and digest are what the publication must still find when it opens
+        // the file again.
+        temporary.sealed(open.written, digest);
+        self.pending.push(PendingGuestFile {
+            temporary,
+            target: open.target,
+        });
+        self.streamed = self.streamed.saturating_add(1);
+        Ok(())
+    }
+
+    async fn complete(&mut self) -> anyhow::Result<()> {
+        if let Some(error) = self.interrupted() {
+            return Err(error);
+        }
+        let directories = self.plan.directories.clone();
+        for directory in &directories {
+            self.admit(directory)?;
+            create_verified_directories(&self.plan.root, directory)
+                .map_err(|detail| anyhow::anyhow!("{detail}"))?;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let mut committed = Vec::new();
+        for pending in pending {
+            // The gate again, per publication: a stop or downgrade that won while the bytes moved
+            // must not be overtaken by the commit, and the lease the call was admitted under is
+            // rechecked, not only the live level.
+            if let Err(stop) = commit_gate(self.closed, self.cancellation, self.lease) {
+                return Err(anyhow::anyhow!("{}", stop.report(committed.len())));
+            }
+            if let Some(parent) = pending.target.parent() {
+                create_verified_directories(&self.plan.root, parent)
+                    .map_err(|detail| anyhow::anyhow!("{detail}"))?;
+            }
+            self.admit(&pending.target)?;
+            let pinned = pending
+                .target
+                .parent()
+                .map(|parent| PinnedDirectory::pin(parent, None))
+                .transpose()
+                .map_err(|detail| anyhow::anyhow!("{detail}"))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{} has no parent directory", pending.target.display())
+                })?;
+            match publish_export_temp(pending.temporary, &pending.target, pinned) {
+                Ok(_) => committed.push(pending.target.display().to_string()),
+                Err(detail) => {
+                    return Err(anyhow::anyhow!(
+                        "{detail}; {} file(s) were published before it and remain",
+                        committed.len()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One native export source as the Windows path the host reads itself: the spelling is the
+/// operator's grant, resolved as written. A symlink or reparse point is refused rather than
+/// followed, and a path that resolves elsewhere is refused because it has left the admitted
+/// scope however the link was spelled. A guest source is read by the runner instead.
+#[cfg(windows)]
+fn export_source(handle: &crate::subshell::Handle, path: &str) -> Result<std::path::PathBuf> {
+    let path = scratch_workspace_alias(handle, path);
+    let path: &str = &path;
+    if crate::subshell::windows_components(path).is_some() {
+        if !handle.admits_path(path) {
+            return Err(subshell_error(
+                SUBSHELL_EXPORT,
+                format!("{path:?} is outside the handle's admitted scope"),
+            ));
+        }
+        let native = std::path::PathBuf::from(path);
+        let metadata = std::fs::symlink_metadata(&native).map_err(|error| {
+            subshell_error(
+                SUBSHELL_EXPORT,
+                format!("cannot read the export source {path:?}: {error}"),
+            )
+        })?;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(subshell_error(
+                SUBSHELL_EXPORT,
+                format!(
+                    "{path:?} is a symlink or reparse point; export sources must be real paths"
+                ),
+            ));
+        }
+        if !metadata.is_dir() && !metadata.is_file() {
+            return Err(subshell_error(
+                SUBSHELL_EXPORT,
+                format!("{path:?} is not a regular file or directory"),
+            ));
+        }
+        if metadata.is_file() {
+            let links = crate::fs::hard_link_count(&native).map_err(|error| {
+                subshell_error(SUBSHELL_EXPORT, format!("cannot read {path:?}: {error}"))
+            })?;
+            if links > 1 {
+                return Err(subshell_error(
+                    SUBSHELL_EXPORT,
+                    format!(
+                        "{path:?} has {links} hard links; exporting a file another name can \
+                         change would not be the file the scope admitted"
+                    ),
+                ));
+            }
+        }
+        verify_native_ancestors(&native)
+            .map_err(|refusal| subshell_error(SUBSHELL_EXPORT, refusal))?;
+        // The spelling admitted above is the operator's; the directory it resolves to is what the
+        // copy actually reads. A junction anywhere below an admitted grant could otherwise carry
+        // the read to a tree the grant never named.
+        let canonical = std::fs::canonicalize(&native).map_err(|error| {
+            subshell_error(
+                SUBSHELL_EXPORT,
+                format!("cannot resolve the export source {path:?}: {error}"),
+            )
+        })?;
+        if !handle.admits_canonical_windows(&canonical) {
+            return Err(subshell_error(
+                SUBSHELL_EXPORT,
+                format!(
+                    "{path:?} resolves to {}, outside the handle's admitted scope",
+                    canonical.display()
+                ),
+            ));
+        }
+        return Ok(native);
+    }
+    Err(subshell_error(
+        SUBSHELL_EXPORT,
+        format!("{path:?} is not a Windows path; a guest source is read by the runner"),
+    ))
+}
+
+/// Validate one guest name as the single Windows path component it will become. A Linux name may
+/// hold a backslash, a colon, a control character, or a device name, each of which Windows reads as
+/// structure rather than as text; joining such a name would silently build a different path.
+#[cfg(windows)]
+fn export_component(name: &std::ffi::OsStr) -> std::result::Result<&str, String> {
+    let name = name.to_str().ok_or_else(|| {
+        "a source name is not Unicode and cannot be represented as a Windows path".to_string()
+    })?;
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.ends_with(' ')
+        || name.ends_with('.')
+        || name.encode_utf16().count() > 255
+    {
+        return Err(format!(
+            "{name:?} is not a safe Windows file name: empty, relative, too long, or ending in a \
+             dot or space"
+        ));
+    }
+    if name.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+            )
+    }) {
+        return Err(format!(
+            "{name:?} is not a safe Windows file name: it contains a reserved character"
+        ));
+    }
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    let numbered = |prefix: &str| {
+        stem.len() == prefix.len() + 1
+            && stem
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            && stem.get(prefix.len()..).is_some_and(|tail| {
+                // Windows reserves the device names with a digit, and the superscript digits too:
+                // `COM¹` names the COM1 device as surely as `COM1` does.
+                matches!(
+                    tail,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+    };
+    if matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) || numbered("COM")
+        || numbered("LPT")
+    {
+        return Err(format!(
+            "{name:?} is a reserved Windows device name and cannot be an exported file"
+        ));
+    }
+    Ok(name)
+}
+
+/// Record one destination and refuse a second source that differs only in case. NTFS resolves
+/// those names to one file, so planning both would copy one over the other.
+#[cfg(windows)]
+fn claim_export_target(
+    plan: &mut ExportPlan,
+    target: &std::path::Path,
+) -> std::result::Result<(), String> {
+    let key = target.as_os_str().to_string_lossy().to_lowercase();
+    if !plan.seen.insert(key) {
+        return Err(format!(
+            "{} names the same Windows destination as an earlier source; two sources that differ \
+             only in case would overwrite each other",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse, before the first byte moves, a destination that cannot take the planned tree: an
+/// existing file where a directory is needed, a directory where a file is needed, or a reparse
+/// point at either. The copy repeats these checks on the handles it opens; this pass is what keeps
+/// a late refusal from leaving earlier files behind.
+#[cfg(windows)]
+fn preflight_export(plan: &ExportPlan) -> std::result::Result<(), String> {
+    for directory in &plan.directories {
+        if std::fs::symlink_metadata(directory).is_ok() {
+            check_real_directory(directory)?;
+        }
+        preflight_export_ancestors(&plan.root, directory)?;
+    }
+    for (_, target) in &plan.files {
+        match std::fs::symlink_metadata(target) {
+            Ok(metadata) => {
+                if metadata.file_attributes() & 0x400 != 0 {
+                    return Err(format!(
+                        "{} is a symlink or reparse point; nothing is written through one",
+                        target.display()
+                    ));
+                }
+                if metadata.is_dir() {
+                    return Err(format!(
+                        "{} is a directory; the source is a file",
+                        target.display()
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot read {}: {error}", target.display())),
+        }
+        preflight_export_ancestors(&plan.root, target)?;
+    }
+    Ok(())
+}
+
+/// Check every existing directory between the admitted root and `target`, stopping at the first
+/// component that does not exist yet. The copy creates those levels one by one.
+#[cfg(windows)]
+fn preflight_export_ancestors(
+    root: &std::path::Path,
+    target: &std::path::Path,
+) -> std::result::Result<(), String> {
+    let relative = target.strip_prefix(root).map_err(|_| {
+        format!(
+            "{} is outside the export destination {}",
+            target.display(),
+            root.display()
+        )
+    })?;
+    check_real_directory(root)?;
+    let mut components = relative.components().peekable();
+    let mut current = root.to_path_buf();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(format!("invalid export path: {}", target.display()));
+        }
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(_) => check_real_directory(&current)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(format!("cannot read {}: {error}", current.display())),
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a destination name that is already taken, or that is not a name a fresh file can be
+/// created under.
+///
+/// Only absence is publishable. No supported provider here can bind the bytes a destination held at
+/// plan time to the object a later rename would replace, so "replace this file" is refused now
+/// rather than attempted optimistically at commit. The caller exports to a fresh name.
+#[cfg(windows)]
+fn planned_destination(target: &std::path::Path) -> Result<()> {
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) => {
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err(subshell_error(
+                    SUBSHELL_EXPORT,
+                    format!(
+                        "{} is a symlink or reparse point; nothing is written through one",
+                        target.display()
+                    ),
+                ));
+            }
+            if metadata.is_dir() {
+                return Err(subshell_error(
+                    SUBSHELL_EXPORT,
+                    format!("{} is a directory; the source is a file", target.display()),
+                ));
+            }
+            Err(subshell_error(
+                SUBSHELL_EXPORT,
+                format!(
+                    "{} already exists at the destination; export to a new name",
+                    target.display()
+                ),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(subshell_error(
+            SUBSHELL_EXPORT,
+            format!("cannot read {}: {error}", target.display()),
+        )),
+    }
+}
+
+/// Add one source subtree to the plan: the files to copy and the directories to create, refusing
+/// any entry that is a symlink and any destination name already taken.
+#[cfg(windows)]
+fn collect_export(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    plan: &mut ExportPlan,
+) -> Result<()> {
+    let name = target.file_name().ok_or_else(|| {
+        subshell_error(
+            SUBSHELL_EXPORT,
+            format!("{} has no file name", target.display()),
+        )
+    })?;
+    export_component(name).map_err(|detail| subshell_error(SUBSHELL_EXPORT, detail))?;
+    claim_export_target(plan, target).map_err(|detail| subshell_error(SUBSHELL_EXPORT, detail))?;
+    let metadata = std::fs::symlink_metadata(source).map_err(|error| {
+        subshell_error(
+            SUBSHELL_EXPORT,
+            format!("cannot read {}: {error}", source.display()),
+        )
+    })?;
+    if metadata.file_attributes() & 0x400 != 0 {
+        return Err(subshell_error(
+            SUBSHELL_EXPORT,
+            format!(
+                "{} is a symlink or reparse point; export sources must be real paths",
+                source.display()
+            ),
+        ));
+    }
+    if !metadata.is_dir() {
+        if !metadata.is_file() {
+            return Err(subshell_error(
+                SUBSHELL_EXPORT,
+                format!(
+                    "{} is not a regular file or directory; nothing else is exported",
+                    source.display()
+                ),
+            ));
+        }
+        planned_destination(target)?;
+        let links = crate::fs::hard_link_count(source).map_err(|error| {
+            subshell_error(
+                SUBSHELL_EXPORT,
+                format!("cannot read {}: {error}", source.display()),
+            )
+        })?;
+        if links > 1 {
+            return Err(subshell_error(
+                SUBSHELL_EXPORT,
+                format!(
+                    "{} has {links} hard links; exporting a file another name can change would \
+                     not be the file the plan admitted",
+                    source.display()
+                ),
+            ));
+        }
+        plan.files
+            .push((PlannedSource::Native(source.to_owned()), target.to_owned()));
+        return Ok(());
+    }
+    plan.directories.push(target.to_owned());
+    for entry in std::fs::read_dir(source).map_err(|error| {
+        subshell_error(
+            SUBSHELL_EXPORT,
+            format!("cannot read {}: {error}", source.display()),
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            subshell_error(
+                SUBSHELL_EXPORT,
+                format!("cannot read {}: {error}", source.display()),
+            )
+        })?;
+        collect_export(&entry.path(), &target.join(entry.file_name()), plan)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum CommandTreeError {
+    Interrupted,
+    Wait(std::io::Error),
+}
+
+/// Which program the command under the collector is: a local command, whose exit status is the
+/// call's outcome; or a WSL launcher, whose end says nothing about the guest namespace behind it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommandRoute {
+    Native,
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "only the Windows host starts a WSL launcher")
+    )]
+    Wsl,
+}
+
+async fn run_command_tree(
+    child: crate::process::Tree,
+    timeout: std::time::Duration,
+    context: &crate::tools::ToolContext,
+) -> std::result::Result<ToolOutput, CommandTreeError> {
+    run_command_tree_route(
+        child,
+        None,
+        timeout,
+        context,
+        CommandRoute::Native,
+        None,
+        None,
+    )
+    .await
+}
+
+/// What asked a managed launcher or client to stop.
+#[derive(Clone, Copy)]
+enum StopCause {
+    Turn,
+    Lease,
+    Handle,
+}
+
+/// Run one managed WSL command to its end, watching every authority that can end it.
+///
+/// The launcher belongs to one call: a turn stop, a permission downgrade and a handle close all
+/// end it through the collector rather than by dropping the wait, so what the guest printed before
+/// the stop is still captured and the result states what was and was not observed. The start
+/// permit is committed here at the guest's readiness, under the authority the call was admitted
+/// at, and every stop is a withdrawal first and a kill only when the guest's terminal proof does
+/// not arrive within the teardown grace.
+#[cfg(windows)]
+async fn run_wsl_command_tree(
+    child: crate::process::Tree,
+    op: &str,
+    required: Permission,
+    timeout: std::time::Duration,
+    context: &crate::tools::ToolContext,
+    lease: &crate::permission::PermissionLease,
+    closed: Option<&tokio_util::sync::CancellationToken>,
+) -> std::result::Result<ToolOutput, CommandTreeError> {
+    run_command_tree_route(
+        child,
+        Some(WslRun {
+            op: op.to_owned(),
+            required,
+        }),
+        timeout,
+        context,
+        CommandRoute::Wsl,
+        Some(lease),
+        closed,
+    )
+    .await
+}
+
+async fn run_command_tree_route(
+    child: crate::process::Tree,
+    wsl: Option<WslRun>,
+    timeout: std::time::Duration,
+    context: &crate::tools::ToolContext,
+    route: CommandRoute,
+    lease: Option<&crate::permission::PermissionLease>,
+    closed: Option<&tokio_util::sync::CancellationToken>,
+) -> std::result::Result<ToolOutput, CommandTreeError> {
+    let stop = tokio_util::sync::CancellationToken::new();
+    let budget = Arc::new(crate::process::OutputBudget::new(MAX_OUTPUT_BYTES));
+    let relay = OutputRelay::for_call(context);
+    #[cfg(windows)]
+    let mut relay = relay;
+    #[cfg_attr(
+        not(windows),
+        allow(
+            unused_mut,
+            reason = "the Windows controller takes the launcher's stdin"
+        )
+    )]
+    let mut child = child;
+    let managed = wsl.is_some();
+    // One owner for a managed launch's whole life: the route holds the launcher's stdin (the
+    // guest's lifetime signal), answers the guest's readiness through the commit gate, and turns
+    // every stop authority into a withdrawal first and a kill only when the guest does not answer
+    // with its terminal proof.
+    #[cfg(windows)]
+    let (frames, mut guest) = match wsl {
+        Some(run) => {
+            let (ready_tx, ready_rx) = tokio::sync::mpsc::channel(1);
+            let permit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let frames = Arc::new(CommandFrames::new(
+                run.op,
+                Arc::clone(&budget),
+                stop.clone(),
+                relay.take(),
+                ready_tx,
+                Arc::clone(&permit),
+            ));
+            let input = child.take_lease_input();
+            let (writes, written) = tokio::sync::mpsc::channel::<LeaseWrite>(2);
+            // The writer detaches with its channel: it ends when the route drops the sender, and
+            // its last act is the hangup that withdraws from the guest.
+            drop(input.map(|input| tokio::spawn(lease_writer(input, written))));
+            let guest = GuestChannel {
+                writes: Some(writes),
+                permit,
+                ready: ready_rx,
+                decided: false,
+                required: run.required,
+            };
+            (Some(frames), Some(guest))
+        }
+        None => (None, None),
+    };
+    #[cfg(not(windows))]
+    let mut guest: Option<()> = {
+        drop(wsl);
+        None
+    };
+    let capture = {
+        #[cfg(windows)]
+        if let Some(frames) = &frames {
+            crate::process::Capture {
+                stdout: crate::process::Keep::Head(0),
+                stderr: crate::process::Keep::Head(8 * crate::text::KIB),
+                sink: Some(frames.clone() as Arc<dyn crate::process::Sink>),
+            }
+        } else {
+            command_capture(&budget, relay)
+        }
+        #[cfg(not(windows))]
+        {
+            command_capture(&budget, relay)
+        }
+    };
+    // A managed launcher answers its own end to the host's deadline and every stop: the route
+    // withdraws first, so the run keeps no timeout of its own and kills the tree only at the
+    // backstop after the teardown grace. The other routes keep the collector's own timeout.
+    let run_timeout = if managed { None } else { Some(timeout) };
+    let running = crate::process::run(
+        child,
+        capture,
+        run_timeout,
+        Some(crate::process::Stop::Graceful(&stop)),
+        DRAIN_TIMEOUT,
+    );
+    tokio::pin!(running);
+    // A route whose transport has no boundary of its own watches the authority that admitted it
+    // and the handle that owns it beside the turn. The first cause to fire is the one reported;
+    // the collector keeps running until the command has ended and its output has been taken.
+    let started = tokio::time::Instant::now();
+    let deadline = started + timeout;
+    let mut stopped_by = None;
+    let mut deadline_hit = false;
+    let mut withdraw_at: Option<tokio::time::Instant> = None;
+    let finished = loop {
+        let teardown_wait = async {
+            match withdraw_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            result = &mut running => break result.map_err(CommandTreeError::Wait)?,
+            () = context.cancellation.cancelled(), if stopped_by.is_none() => {
+                stopped_by = Some(StopCause::Turn);
+                withdraw_at = Some(withdraw_guest(&mut guest));
+            }
+            () = until_revoked(lease), if stopped_by.is_none() => {
+                stopped_by = Some(StopCause::Lease);
+                withdraw_at = Some(withdraw_guest(&mut guest));
+            }
+            () = until_closed(closed), if stopped_by.is_none() => {
+                stopped_by = Some(StopCause::Handle);
+                withdraw_at = Some(withdraw_guest(&mut guest));
+            }
+            notice = guest_ready(&mut guest) => {
+                if notice {
+                    commit_permit(
+                        &mut guest,
+                        lease,
+                        timeout.saturating_sub(started.elapsed()),
+                    );
+                }
+            }
+            () = teardown_wait, if withdraw_at.is_some() => {
+                // The guest did not answer the withdrawal with its terminal proof in time. What
+                // the local kill establishes is only the launcher's end; the record says so.
+                withdraw_at = None;
+                stop.cancel();
+            }
+            () = tokio::time::sleep_until(deadline), if managed && !deadline_hit && stopped_by.is_none() => {
+                deadline_hit = true;
+                withdraw_at = Some(withdraw_guest(&mut guest));
+            }
+        }
+    };
+    #[cfg(windows)]
+    if route == CommandRoute::Wsl {
+        return wsl_route_result(
+            finished,
+            &frames,
+            context,
+            stopped_by,
+            deadline_hit,
+            timeout,
+            &budget,
+        )
+        .await;
+    }
+    let drained = DrainedOutput::from(finished.drained);
+    match (route, finished.ended) {
+        (_, crate::process::Ended::Stopped) => {
+            if let Some(observation) = &context.teardown {
+                // A local command or launcher reaped is the only thing this end observed.
+                observation.note(route == CommandRoute::Native && finished.local_exit.is_some());
+            }
+            match (route, stopped_by) {
+                (_, Some(StopCause::Turn)) | (_, None) => Err(CommandTreeError::Interrupted),
+                (CommandRoute::Native, Some(StopCause::Lease | StopCause::Handle)) => {
+                    Err(CommandTreeError::Interrupted)
+                }
+                (CommandRoute::Wsl, Some(StopCause::Lease | StopCause::Handle)) => {
+                    Err(CommandTreeError::Wait(std::io::Error::other(
+                        "a managed WSL run must end through its own result path",
+                    )))
+                }
+            }
+        }
+        (CommandRoute::Native, crate::process::Ended::OutputBound) => {
+            Ok(killed_command_output(&drained, &output_bound_reason()))
+        }
+        (CommandRoute::Native, crate::process::Ended::TimedOut) => Ok(killed_command_output(
+            &drained,
+            &timed_out_reason(timeout, &budget),
+        )),
+        (
+            CommandRoute::Wsl,
+            crate::process::Ended::OutputBound | crate::process::Ended::TimedOut,
+        ) => Err(CommandTreeError::Wait(std::io::Error::other(
+            "a managed WSL run must end through its own result path",
+        ))),
+        (_, crate::process::Ended::Exited(status)) => {
+            Ok(finish_command(&status, &drained, &budget))
+        }
+    }
+}
+
+/// Until the lease is revoked; never, when this route holds none.
+async fn until_revoked(lease: Option<&crate::permission::PermissionLease>) {
+    match lease {
+        Some(lease) => lease.revoked().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Until `closed` fires; never, when the caller has no handle to watch.
+async fn until_closed(closed: Option<&tokio_util::sync::CancellationToken>) {
+    match closed {
+        Some(closed) => closed.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// What a managed WSL run is: the operation every control frame must echo, and the level the call
+/// was admitted at. The start permit commits only while that authority still holds, so the level
+/// preserved is the one that admitted the call, not whatever the session reads later.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "the Windows controller owns managed launches")
+)]
+struct WslRun {
+    op: String,
+    required: Permission,
+}
+
+/// How long a stopped managed WSL run is given to answer the host's withdrawal with its terminal
+/// proof before the local launcher is torn down anyway. The withdrawal asks the guest to end the
+/// namespace and reap it; the grace is what the question gets before the answer stops mattering.
+#[cfg(windows)]
+const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What one write to a managed launcher's stdin means. The permit is the only thing ever written
+/// after the request; hanging up the pipe is the withdrawal.
+#[cfg(windows)]
+enum LeaseWrite {
+    /// The start permit line: the remaining budget of the one deadline, in milliseconds.
+    Permit(String),
+}
+
+/// The launcher's stdin, held by one writer task. Everything the host writes to the guest goes
+/// through the channel, so no lock ever sits across pipe I/O and the commit that authorizes a
+/// start is a synchronous step.
+#[cfg(windows)]
+struct GuestChannel {
+    /// Dropping the sender ends the writer's loop and with it the launcher's stdin: the hangup is
+    /// the withdrawal the guest reads.
+    writes: Option<tokio::sync::mpsc::Sender<LeaseWrite>>,
+    /// Set in the same synchronous step that commits the start permit, so `Started` before the
+    /// commit is a protocol failure rather than a race.
+    permit: Arc<std::sync::atomic::AtomicBool>,
+    /// The guest's readiness notice, at most one.
+    ready: tokio::sync::mpsc::Receiver<()>,
+    /// The commit decision was made: grant or deny, once.
+    decided: bool,
+    /// The authority the permit commits under.
+    required: Permission,
+}
+
+#[cfg(windows)]
+async fn lease_writer(
+    mut input: tokio::process::ChildStdin,
+    mut writes: tokio::sync::mpsc::Receiver<LeaseWrite>,
+) {
+    use tokio::io::AsyncWriteExt as _;
+
+    while let Some(LeaseWrite::Permit(line)) = writes.recv().await {
+        if input.write_all(line.as_bytes()).await.is_err() {
+            break;
+        }
+    }
+    // Dropping the input hangs up the launcher's stdin, which the guest reads as the host's
+    // withdrawal and answers by tearing its namespace down and reaping it.
+}
+
+/// The guest's readiness notice: the route answers it through the commit gate. Once the decision
+/// is made this pends, so the select arm cannot fire twice.
+#[cfg(windows)]
+async fn guest_ready(guest: &mut Option<GuestChannel>) -> bool {
+    let Some(ready) = guest.as_mut().filter(|guest| !guest.decided) else {
+        std::future::pending::<()>().await;
+        return false;
+    };
+    ready.ready.recv().await.is_some()
+}
+
+/// See the Windows definition: a platform with no managed launcher has nothing to wait for.
+#[cfg(not(windows))]
+async fn guest_ready(_guest: &mut Option<()>) -> bool {
+    std::future::pending::<()>().await;
+    false
+}
+
+/// Withdraw from the guest and return when the teardown grace for its terminal proof ends. A
+/// route with no managed launcher has nothing to ask: its grace is already over, and the kill it
+/// backs is the only end it can establish.
+#[cfg(windows)]
+fn withdraw_guest(guest: &mut Option<GuestChannel>) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    if let Some(guest) = guest.as_mut() {
+        // Dropping the sender ends the writer's loop and with it the launcher's stdin: the hangup
+        // is the withdrawal the guest reads.
+        drop(guest.writes.take());
+        return now + TEARDOWN_GRACE;
+    }
+    now
+}
+
+/// See the Windows definition: a platform with no managed launcher withdraws from nothing.
+#[cfg(not(windows))]
+fn withdraw_guest(_guest: &mut Option<()>) -> tokio::time::Instant {
+    tokio::time::Instant::now()
+}
+
+/// The one synchronous step that decides a start. Under the lease's own setter locks, enqueue the
+/// permit and mark it committed, or refuse: a downgrade or stop that won before the commit cannot
+/// be overtaken, and one landing after it is supervised like any later stop. The permit carries
+/// the one deadline's remaining budget, so what the launch spent is not the guest's to spend.
+#[cfg(windows)]
+fn commit_permit(
+    guest: &mut Option<GuestChannel>,
+    lease: Option<&crate::permission::PermissionLease>,
+    budget: std::time::Duration,
+) {
+    let Some(guest) = guest.as_mut() else {
+        return;
+    };
+    use std::sync::atomic::Ordering;
+
+    guest.decided = true;
+    let line = crate::subshell::permit_line(budget);
+    let granted = {
+        let permit = &guest.permit;
+        let writes = guest.writes.as_ref();
+        let commit = || {
+            let Some(writes) = writes else {
+                return false;
+            };
+            // The flag turns before the line can reach the guest, so a `Started` frame can never
+            // outrun the commit it must match; a failed enqueue turns it back, and a guest that
+            // could see it then cannot exist because no permit line was ever sent.
+            permit.store(true, Ordering::Release);
+            if writes.try_send(LeaseWrite::Permit(line.clone())).is_err() {
+                permit.store(false, Ordering::Release);
+                return false;
+            }
+            true
+        };
+        match lease {
+            // The commit runs under the lease's own setter locks, so a downgrade or stop that won
+            // before it cannot be overtaken.
+            Some(lease) => lease
+                .with_current_authority(guest.required, commit)
+                .unwrap_or(false),
+            // A route that holds no lease has nothing to re-check: the commit is the enqueue.
+            None => commit(),
+        }
+    };
+    if !granted {
+        drop(guest.writes.take());
+    }
+}
+
+/// See the Windows definition: a platform with no managed launcher permits no start.
+#[cfg(not(windows))]
+fn commit_permit(
+    _guest: &mut Option<()>,
+    _lease: Option<&crate::permission::PermissionLease>,
+    _budget: std::time::Duration,
+) {
+}
+
+/// What stopping or ending a managed WSL launch established, in the three shapes the record may
+/// take: the guest reported the reaped namespace, the command never started, or the end is
+/// unconfirmed. The host never derives the guest's end from the launcher's.
+#[cfg(windows)]
+fn wsl_end_reason(reason: &str, end: GuestEnd) -> String {
+    match (end.started, end.stopped) {
+        (false, _) => format!(
+            "{reason}\nThe managed WSL command was never started: no start permit was acknowledged"
+        ),
+        (true, Some(code)) => format!(
+            "{reason}\nThe guest reported the command was reaped and its namespace torn down \
+             (status {code})"
+        ),
+        (true, None) => format!(
+            "{reason}\nThe guest namespace's end is unconfirmed: the local launcher's end does \
+             not confirm it"
+        ),
+    }
+}
+
+/// One managed WSL run's result, from what the guest's own frames proved and what the launcher's
+/// end did. The three shapes of [`wsl_end_reason`] are the whole vocabulary here, and the guest's
+/// reserved exit codes reconcile a launcher status with the outcome the runner reported.
+#[cfg(windows)]
+async fn wsl_route_result(
+    finished: crate::process::Finished,
+    frames: &Option<Arc<CommandFrames>>,
+    context: &crate::tools::ToolContext,
+    stopped_by: Option<StopCause>,
+    deadline_hit: bool,
+    timeout: std::time::Duration,
+    budget: &crate::process::OutputBudget,
+) -> std::result::Result<ToolOutput, CommandTreeError> {
+    let Some(frames) = frames else {
+        return Err(CommandTreeError::Wait(std::io::Error::other(
+            "a managed WSL run without its command stream is a bug in the route",
+        )));
+    };
+    if let Some(error) = frames.error().await {
+        return Err(CommandTreeError::Wait(std::io::Error::other(format!(
+            "the runner's command stream was refused: {error}"
+        ))));
+    }
+    let (drained, end) = match finished.ended {
+        // The runner ended on its own: a stream that stops short of its terminal frames is a
+        // stale or broken runner, and the host says so instead of presenting its partial output.
+        crate::process::Ended::Exited(_) => match frames.outcome().await {
+            Ok(parts) => parts,
+            Err(error) => {
+                // Even a broken stream leaves the record honest: the snapshot says whether a
+                // start was ever observed, which is what the teardown note is derived from.
+                let (_partial, end) = frames.snapshot().await;
+                if let Some(observation) = &context.teardown {
+                    observation.note(!end.started || end.stopped.is_some());
+                }
+                let stderr = String::from_utf8_lossy(&finished.drained.stderr.bytes).into_owned();
+                let stderr = stderr.trim();
+                return Err(CommandTreeError::Wait(std::io::Error::other(
+                    if stderr.is_empty() {
+                        format!("the WSL runner ended before a complete command stream: {error}")
+                    } else {
+                        format!(
+                            "the WSL runner ended before a complete command stream: {error}: \
+                             {stderr}"
+                        )
+                    },
+                )));
+            }
+        },
+        // The host ended the run: a guest killed before it could report owes no terminal frames,
+        // and their absence is the honest record of an unconfirmed end.
+        _ => frames.snapshot().await,
+    };
+    if let Some(observation) = &context.teardown {
+        // Nothing running is a confirmed end: a command that never started has nothing left to
+        // end, and a guest reap is the guest's own record of one.
+        observation.note(!end.started || end.stopped.is_some());
+    }
+    let reason = |lead: &str| wsl_end_reason(lead, end);
+    let guest_cut = frames.output_bound().await;
+    if guest_cut && stopped_by.is_none() && !deadline_hit {
+        return Ok(killed_command_output(
+            &drained,
+            &reason(&output_bound_reason()),
+        ));
+    }
+    match (stopped_by, deadline_hit, finished.ended) {
+        (Some(StopCause::Turn), ..) => Err(CommandTreeError::Interrupted),
+        (Some(StopCause::Lease), ..) => Ok(killed_command_output(
+            &drained,
+            &reason("Permission was lowered; the managed WSL command was stopped."),
+        )),
+        (Some(StopCause::Handle), ..) => Ok(killed_command_output(
+            &drained,
+            &reason("The subshell handle was closed; the managed WSL command was stopped."),
+        )),
+        (None, true, _) => Ok(killed_command_output(
+            &drained,
+            &reason(&timed_out_reason(timeout, budget)),
+        )),
+        (None, false, crate::process::Ended::Exited(status)) => {
+            match status.code() {
+                Some(code) if code == crate::subshell::RUNNER_TIMED_OUT => Ok(
+                    killed_command_output(&drained, &reason(&timed_out_reason(timeout, budget))),
+                ),
+                Some(code) if code == crate::subshell::RUNNER_CANCELED => {
+                    Ok(killed_command_output(
+                        &drained,
+                        &reason("The managed WSL command was canceled."),
+                    ))
+                }
+                Some(code) if code == crate::subshell::RUNNER_ERROR => {
+                    let stderr = String::from_utf8_lossy(&finished.drained.stderr.bytes);
+                    let stderr = stderr.trim();
+                    Err(CommandTreeError::Wait(std::io::Error::other(
+                        if stderr.is_empty() {
+                            "the managed WSL runner failed".to_owned()
+                        } else {
+                            format!("the managed WSL runner failed: {stderr}")
+                        },
+                    )))
+                }
+                // A command's own exit: the launcher's status and the reaped outcome the guest
+                // reported must agree, or the record says which one the host saw and refuses to
+                // present either as the command's exit.
+                code => match (code, end.stopped) {
+                    (Some(code), Some(reported)) if code == reported => {
+                        Ok(finish_command(&status, &drained, budget))
+                    }
+                    (_, Some(reported)) => {
+                        Err(CommandTreeError::Wait(std::io::Error::other(format!(
+                            "the WSL launcher exited {status:?} but the runner reported the \
+                             command was reaped with status {reported}"
+                        ))))
+                    }
+                    (_, None) => Err(CommandTreeError::Wait(std::io::Error::other(
+                        "the WSL runner exited without reporting the command's outcome",
+                    ))),
+                },
+            }
+        }
+        (None, false, ended) => {
+            let lead = match ended {
+                crate::process::Ended::OutputBound => output_bound_reason(),
+                crate::process::Ended::TimedOut => timed_out_reason(timeout, budget),
+                _ => "The managed WSL launcher was stopped.".to_owned(),
+            };
+            Ok(killed_command_output(&drained, &reason(&lead)))
         }
     }
 }
@@ -876,6 +4904,314 @@ fn finish_command(
         None,
         closing_words(&exit_words(exit_code), drained.stopped_early),
     ))
+}
+
+/// The framed command response the WSL runner writes: control frames and stdout/stderr chunks on
+/// one stream. The parser enforces the order (ready, started, output, stopped, done), the operation
+/// identifier on every control frame, the payload bound and the shared output budget, and hands
+/// every accepted chunk to the live relay in arrival order. Raw bytes never reach the transcript,
+/// so the teardown proof cannot be forged by a command's own output.
+///
+/// `ready` is where the guest's sandbox proof reaches the route: the guest proved its sandbox and
+/// waits for the one line that permits a start. The route answers it through the commit gate, and
+/// `Started` is only accepted after that commit, so a permit is never inferred from a start.
+#[cfg(windows)]
+struct CommandFrames {
+    state: tokio::sync::Mutex<CommandFrameState>,
+    budget: Arc<crate::process::OutputBudget>,
+    stop: tokio_util::sync::CancellationToken,
+    relay: Option<OutputRelay>,
+    /// The operation every control frame must echo.
+    op: String,
+    /// Where the readiness notice goes; bounded, and Ready happens at most once.
+    ready: tokio::sync::mpsc::Sender<()>,
+    /// Set in the same synchronous step that commits the start permit, so `Started` before the
+    /// commit is a protocol failure rather than a race.
+    permit: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct CommandFrameState {
+    buffer: Vec<u8>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    ready: bool,
+    started: bool,
+    stopped: Option<i32>,
+    done: bool,
+    error: Option<String>,
+    cut: bool,
+}
+
+#[cfg(windows)]
+impl CommandFrames {
+    fn new(
+        op: String,
+        budget: Arc<crate::process::OutputBudget>,
+        stop: tokio_util::sync::CancellationToken,
+        relay: Option<OutputRelay>,
+        ready: tokio::sync::mpsc::Sender<()>,
+        permit: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(CommandFrameState::default()),
+            budget,
+            stop,
+            relay,
+            op,
+            ready,
+            permit,
+        }
+    }
+
+    /// Parse every complete frame in `chunk`, relaying accepted output after the lock is released.
+    async fn push(&self, chunk: &[u8]) {
+        use std::sync::atomic::Ordering;
+
+        let mut state = self.state.lock().await;
+        if state.error.is_some() {
+            return;
+        }
+        if state.done {
+            if !chunk.is_empty() {
+                state.error = Some("the runner wrote past its done frame".to_string());
+                self.stop.cancel();
+            }
+            return;
+        }
+        state.buffer.extend_from_slice(chunk);
+        let mut relayed = Vec::new();
+        loop {
+            let Some(newline) = state.buffer.iter().position(|byte| *byte == b'\n') else {
+                if state.buffer.len() > crate::subshell::FRAME_BYTES {
+                    state.error = Some("a command frame exceeded its bound".to_string());
+                    self.stop.cancel();
+                }
+                break;
+            };
+            if newline > crate::subshell::FRAME_BYTES {
+                state.error = Some("a command frame exceeded its bound".to_string());
+                self.stop.cancel();
+                break;
+            }
+            let line = state.buffer.get(..newline).unwrap_or_default();
+            let frame = match crate::subshell::Frame::decode(line) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    state.error = Some(format!("{error:#}"));
+                    self.stop.cancel();
+                    break;
+                }
+            };
+            let payload = match &frame {
+                crate::subshell::Frame::Output { len, .. } => match usize::try_from(*len) {
+                    Ok(len) if len <= crate::subshell::FRAME_BYTES => len,
+                    _ => {
+                        state.error = Some("a command output frame exceeded its bound".to_string());
+                        self.stop.cancel();
+                        break;
+                    }
+                },
+                _ => 0,
+            };
+            if state.buffer.len() < newline + 1 + payload {
+                break;
+            }
+            state.buffer.drain(..=newline);
+            let bytes: Vec<u8> = state.buffer.drain(..payload).collect();
+            match frame {
+                crate::subshell::Frame::Ready { op } => {
+                    if op != self.op {
+                        state.error = Some("the runner named another operation".to_string());
+                        self.stop.cancel();
+                        break;
+                    }
+                    if state.ready || state.started || state.stopped.is_some() || state.done {
+                        state.error =
+                            Some("the runner reported readiness out of order".to_string());
+                        self.stop.cancel();
+                        break;
+                    }
+                    state.ready = true;
+                    if self.ready.try_send(()).is_err() {
+                        // The route already stopped watching: no permit can authorize this
+                        // start, and the teardown path owns the launcher now.
+                        state.error = Some(
+                            "the runner reported readiness after the host stopped".to_string(),
+                        );
+                        self.stop.cancel();
+                        break;
+                    }
+                }
+                crate::subshell::Frame::Started { op } => {
+                    if op != self.op {
+                        state.error = Some("the runner named another operation".to_string());
+                        self.stop.cancel();
+                        break;
+                    }
+                    if !self.permit.load(Ordering::Acquire) {
+                        state.error = Some("the runner started without a start permit".to_string());
+                        self.stop.cancel();
+                        break;
+                    }
+                    if !state.ready || state.started || state.stopped.is_some() || state.done {
+                        state.error = Some("a command started out of order".to_string());
+                        self.stop.cancel();
+                        break;
+                    }
+                    state.started = true;
+                }
+                crate::subshell::Frame::Output { stream, .. } => {
+                    if !state.started || state.stopped.is_some() || state.done {
+                        state.error = Some("command output arrived out of order".to_string());
+                        self.stop.cancel();
+                        break;
+                    }
+                    let keep = self.budget.spend(bytes.len());
+                    match stream {
+                        crate::subshell::OutputStream::Stdout => {
+                            state.stdout.extend_from_slice(&bytes)
+                        }
+                        crate::subshell::OutputStream::Stderr => {
+                            state.stderr.extend_from_slice(&bytes)
+                        }
+                    }
+                    if !keep {
+                        state.cut = true;
+                        self.stop.cancel();
+                        break;
+                    }
+                    relayed.push((
+                        match stream {
+                            crate::subshell::OutputStream::Stdout => crate::process::Stream::Stdout,
+                            crate::subshell::OutputStream::Stderr => crate::process::Stream::Stderr,
+                        },
+                        bytes,
+                    ));
+                }
+                crate::subshell::Frame::Stopped { op, code } => {
+                    if op != self.op {
+                        state.error = Some("the runner named another operation".to_string());
+                        self.stop.cancel();
+                        break;
+                    }
+                    if !state.started || state.stopped.is_some() || state.done {
+                        state.error = Some("a command stopped out of order".to_string());
+                        self.stop.cancel();
+                        break;
+                    }
+                    state.stopped = Some(code);
+                }
+                crate::subshell::Frame::Done { op } => {
+                    if op != self.op {
+                        state.error = Some("the runner named another operation".to_string());
+                        self.stop.cancel();
+                        break;
+                    }
+                    if state.stopped.is_none() || state.done {
+                        state.error = Some("a command finished out of order".to_string());
+                        self.stop.cancel();
+                        break;
+                    }
+                    state.done = true;
+                }
+                _ => {
+                    state.error = Some("a transfer frame arrived on a command stream".to_string());
+                    self.stop.cancel();
+                    break;
+                }
+            }
+        }
+        drop(state);
+        if let Some(relay) = &self.relay {
+            for (stream, bytes) in relayed {
+                crate::process::Sink::receive(relay, stream, &bytes).await;
+            }
+        }
+    }
+
+    /// What the parser accepted and what the guest proved. A stream that ends before an observed
+    /// start owes no terminal frames and is a complete answer of its own: the command never
+    /// started. A stream that started and then ended before its terminal frames, or that carries
+    /// a protocol failure, is refused: the host reports a failed transfer-like end rather than
+    /// presenting partial output as a normal command result.
+    async fn outcome(&self) -> std::result::Result<(DrainedOutput, GuestEnd), String> {
+        let state = self.state.lock().await;
+        if let Some(error) = &state.error {
+            return Err(error.clone());
+        }
+        if state.done {
+            if !state.buffer.is_empty() {
+                return Err("the runner ended mid-frame".to_string());
+            }
+            return Ok((state.drained(), state.guest_end()));
+        }
+        if !state.started {
+            return Ok((state.drained(), state.guest_end()));
+        }
+        drop(state);
+        Err("the runner ended before its terminal frames".to_string())
+    }
+
+    /// What the parser accepted and what the guest proved, for a run the host ended itself: the
+    /// missing terminal frames of a guest that was killed before it could report are the record,
+    /// not a stream failure.
+    async fn snapshot(&self) -> (DrainedOutput, GuestEnd) {
+        let state = self.state.lock().await;
+        (state.drained(), state.guest_end())
+    }
+
+    async fn output_bound(&self) -> bool {
+        self.state.lock().await.cut
+    }
+
+    async fn error(&self) -> Option<String> {
+        self.state.lock().await.error.clone()
+    }
+}
+
+#[cfg(windows)]
+impl CommandFrameState {
+    fn drained(&self) -> DrainedOutput {
+        DrainedOutput {
+            stdout: String::from_utf8_lossy(&self.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&self.stderr).into_owned(),
+            stopped_early: false,
+        }
+    }
+
+    fn guest_end(&self) -> GuestEnd {
+        GuestEnd {
+            started: self.started,
+            stopped: self.stopped,
+        }
+    }
+}
+
+/// What the guest's own frames proved about a managed WSL command and its namespace.
+///
+/// The host never derives the guest's end from the launcher's: `stopped` is what the guest
+/// reported after it tore its namespace down and reaped it, which it does on cancellation and
+/// timeout as well as on a normal exit. Its absence is the record's honest answer, not a gap to
+/// paper over.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct GuestEnd {
+    /// The guest acknowledged the start permit with an observed start.
+    started: bool,
+    /// The reaped namespace's exit status, when the guest reported one.
+    stopped: Option<i32>,
+}
+
+#[cfg(windows)]
+#[async_trait]
+impl crate::process::Sink for CommandFrames {
+    async fn receive(&self, stream: crate::process::Stream, chunk: &[u8]) {
+        if stream == crate::process::Stream::Stdout {
+            self.push(chunk).await;
+        }
+    }
 }
 
 /// What a command's drains keep: every byte of both streams, within `budget`, relayed to the
@@ -974,6 +5310,11 @@ fn unconfinable_command() -> MekaError {
 /// what they have, and the result says so.
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a close waits for the calls it cancelled to return. Comfortably more than a stopped
+/// command's drain, and short enough that a wedged guest does not hold the tool call open: past it
+/// the close says the teardown is unconfirmed rather than pretending it finished.
+#[cfg(windows)]
+const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Forwards a running command's output to the frontend as it is produced. The sink of both drains,
 /// so stdout and stderr land in one stream in arrival order, which is what a terminal shows.
 ///
@@ -1079,6 +5420,7 @@ fn relayable(pending: &[u8]) -> (String, usize) {
 }
 
 /// What the two drains returned, and whether they were stopped before the pipes closed.
+#[derive(Debug)]
 struct DrainedOutput {
     stdout: String,
     stderr: String,
@@ -1645,6 +5987,8 @@ mod tests {
         let sandbox_capability = crate::sandbox::detect();
         let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
         ExecuteCommandTool {
+            #[cfg(windows)]
+            wsl_target: None,
             #[cfg(windows)]
             windows_grants: std::sync::Arc::new(crate::sandbox::windows::WindowsGrants::default()),
             scope: crate::workspace::WriteScope::unconfined(),
@@ -2277,6 +6621,8 @@ mod tests {
         );
         let tool = ExecuteCommandTool {
             #[cfg(windows)]
+            wsl_target: None,
+            #[cfg(windows)]
             windows_grants: std::sync::Arc::clone(crate::sandbox::windows::process_grants()),
             scope: crate::workspace::WriteScope::confined(vec![]),
             sandbox_capability: crate::sandbox::SandboxCapability::Unavailable,
@@ -2320,6 +6666,8 @@ mod tests {
             crate::permission::EnabledPermissions::ALL,
         );
         let tool = ExecuteCommandTool {
+            #[cfg(windows)]
+            wsl_target: None,
             #[cfg(windows)]
             windows_grants: std::sync::Arc::new(crate::sandbox::windows::WindowsGrants::default()),
             scope: crate::workspace::WriteScope::unconfined(),
@@ -2387,6 +6735,8 @@ mod tests {
             crate::permission::EnabledPermissions::ALL,
         );
         let tool = ExecuteCommandTool {
+            #[cfg(windows)]
+            wsl_target: None,
             #[cfg(windows)]
             windows_grants: std::sync::Arc::new(crate::sandbox::windows::WindowsGrants::default()),
             scope: crate::workspace::WriteScope::unconfined(),
@@ -2524,6 +6874,8 @@ mod tests {
             let sandbox_capability = crate::sandbox::SandboxCapability::RestrictedToken;
             let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
             ExecuteCommandTool {
+                #[cfg(windows)]
+                wsl_target: None,
                 scope: crate::workspace::WriteScope::unconfined(),
                 windows_grants: std::sync::Arc::new(
                     crate::sandbox::windows::WindowsGrants::default(),
@@ -4189,5 +8541,1376 @@ mod tests {
                 "a write outside every root must be refused by the backend: {result:?}"
             );
         }
+    }
+
+    /// Scratch staging and the rules that guard copying anything back over the source the
+    /// snapshot came from.
+    #[cfg(windows)]
+    mod scratch {
+        use super::*;
+
+        fn target() -> Arc<crate::subshell::Target> {
+            let grant = crate::paths::WslDirectory::from_run_directory(std::path::Path::new(
+                r"\\wsl.localhost\test-guest\home\project",
+            ))
+            .expect("grant")
+            .expect("grant shape");
+            Arc::new(
+                crate::subshell::Target::from_grants(
+                    "test-guest",
+                    crate::subshell::DEFAULT_RUNNER,
+                    &[grant],
+                    &[],
+                    &[],
+                )
+                .expect("target"),
+            )
+        }
+
+        /// A scratch open owns its mount table: additional workspace grants would either be
+        /// silently dropped or mounted beside the snapshot, so the request is refused before any
+        /// transfer runs rather than answered with a handle that does not mean what it says.
+        #[tokio::test]
+        async fn a_scratch_open_refuses_additional_workspace_grants() {
+            let tool = SubshellOpenTool {
+                handles: Arc::new(crate::subshell::Handles::default()),
+                target: target(),
+                permission: crate::permission::SharedPermission::new(
+                    Permission::Workspace,
+                    crate::permission::EnabledPermissions::ALL,
+                ),
+                required: Permission::Read,
+                site: crate::session::ToolSite::for_test(),
+            };
+            let refusal = tool
+                .execute(
+                    serde_json::json!({
+                        "handle": "work",
+                        "scratch": {"source": "/tmp/source"},
+                        "workspace": ["/tmp/other"],
+                    }),
+                    crate::tools::ToolContext::for_test(CancellationToken::new()),
+                )
+                .await
+                .expect_err("additional workspace grants are refused");
+            assert!(
+                refusal.to_string().contains("cannot be combined"),
+                "{refusal}"
+            );
+        }
+
+        fn scratch_state(source_root: std::path::PathBuf) -> crate::subshell::ScratchState {
+            crate::subshell::ScratchState {
+                path: "/var/tmp/meka-scratch/0011223344556677".to_string(),
+                source: "the staged source".to_string(),
+                source_root,
+                quota_bytes: 1024 * 1024,
+                guest_source: false,
+                baseline: std::collections::HashMap::new(),
+            }
+        }
+
+        /// What the runner's stage manifest records is what a later export back over the source
+        /// region is judged against, keyed by the `/`-separated path below the source root.
+        #[test]
+        fn a_stage_manifest_becomes_the_snapshot_baseline() {
+            use sha2::Digest as _;
+
+            let modified =
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_123);
+            let (modified_secs, modified_nanos) = crate::subshell::system_time_parts(modified);
+            let digest: [u8; 32] = sha2::Sha256::digest(b"hello").into();
+            let manifest = crate::subshell::ManifestOnly {
+                roots: Vec::new(),
+                entries: vec![
+                    crate::subshell::TransferEntry {
+                        root: 0,
+                        path: "nested".to_string(),
+                        len: 0,
+                        modified_secs,
+                        modified_nanos,
+                        digest: crate::subshell::digest_hex(&[0; 32]),
+                        directory: true,
+                    },
+                    crate::subshell::TransferEntry {
+                        root: 0,
+                        path: "nested/inner.txt".to_string(),
+                        len: 5,
+                        modified_secs,
+                        modified_nanos,
+                        digest: crate::subshell::digest_hex(&digest),
+                        directory: false,
+                    },
+                ],
+            };
+
+            let baseline = stage_baseline(&manifest).expect("the manifest is a baseline");
+            assert_eq!(baseline.len(), 1, "a directory carries no baseline");
+            let entry = baseline.get("nested/inner.txt").expect("the staged file");
+            assert_eq!(entry.len, 5);
+            assert_eq!(entry.modified, modified);
+            assert_eq!(entry.digest, digest);
+        }
+
+        /// A stage has one source, so an entry numbered for any other is a response the request
+        /// could not have produced.
+        #[test]
+        fn a_stage_manifest_entry_from_an_unknown_root_is_refused() {
+            let manifest = crate::subshell::ManifestOnly {
+                roots: Vec::new(),
+                entries: vec![crate::subshell::TransferEntry {
+                    root: 1,
+                    path: "nested/inner.txt".to_string(),
+                    len: 0,
+                    modified_secs: 0,
+                    modified_nanos: 0,
+                    digest: crate::subshell::digest_hex(&[0; 32]),
+                    directory: false,
+                }],
+            };
+
+            let refusal = stage_baseline(&manifest).expect_err("an unknown root is refused");
+            assert!(refusal.contains("unknown source"), "{refusal}");
+        }
+
+        /// Two entries with one path would make the baseline depend on the runner's order.
+        #[test]
+        fn a_stage_manifest_naming_one_path_twice_is_refused() {
+            use sha2::Digest as _;
+
+            let digest: [u8; 32] = sha2::Sha256::digest(b"x").into();
+            let entry = crate::subshell::TransferEntry {
+                root: 0,
+                path: "same.txt".to_string(),
+                len: 1,
+                modified_secs: 0,
+                modified_nanos: 0,
+                digest: crate::subshell::digest_hex(&digest),
+                directory: false,
+            };
+            let manifest = crate::subshell::ManifestOnly {
+                roots: Vec::new(),
+                entries: vec![entry.clone(), entry],
+            };
+
+            let refusal = stage_baseline(&manifest).expect_err("a repeated path is refused");
+            assert!(refusal.contains("twice"), "{refusal}");
+        }
+
+        /// A stage copies into a workspace it names itself, never into a source root.
+        #[test]
+        fn a_stage_manifest_that_names_a_root_is_refused() {
+            let manifest = crate::subshell::ManifestOnly {
+                roots: vec![crate::subshell::TransferRoot {
+                    source: crate::subshell::ExportSource {
+                        root: crate::subshell::ExportRoot::Mounted(0),
+                        relative: Vec::new(),
+                    },
+                    name: "project".to_string(),
+                    directory: true,
+                }],
+                entries: Vec::new(),
+            };
+
+            let refusal = stage_baseline(&manifest).expect_err("a root is refused");
+            assert!(refusal.contains("source root"), "{refusal}");
+        }
+
+        /// `/workspace` names the staged workspace, as the model was told to work in it; a path
+        /// that names no workspace is left for the scope check to judge.
+        #[test]
+        fn a_scratch_handle_reads_its_workspace_as_workspace_or_by_its_staged_path() {
+            let source = tempfile::tempdir().expect("source");
+            let handle = crate::subshell::Handle::new(
+                target(),
+                None,
+                "/var/tmp/meka-scratch/0011223344556677".to_string(),
+                Vec::new(),
+                Vec::new(),
+                false,
+                Permission::Workspace,
+            )
+            .with_scratch(scratch_state(source.path().to_path_buf()));
+
+            assert_eq!(
+                scratch_workspace_alias(&handle, "/workspace"),
+                "/var/tmp/meka-scratch/0011223344556677"
+            );
+            assert_eq!(
+                scratch_workspace_alias(&handle, "/workspace/out.bin"),
+                "/var/tmp/meka-scratch/0011223344556677/out.bin"
+            );
+            assert_eq!(
+                scratch_workspace_alias(&handle, "/workspace-else"),
+                "/workspace-else"
+            );
+            assert_eq!(
+                scratch_workspace_alias(&handle, "/references/0/x"),
+                "/references/0/x"
+            );
+
+            let direct = crate::subshell::Handle::new(
+                target(),
+                None,
+                "/home/project".to_string(),
+                Vec::new(),
+                Vec::new(),
+                false,
+                Permission::Workspace,
+            );
+            assert_eq!(scratch_workspace_alias(&direct, "/workspace"), "/workspace");
+        }
+
+        /// What an export back over the staged source may never overwrite: a file the snapshot
+        /// does not hold as it now stands. Changed, deleted and new each refuse it; a file left as
+        /// it was staged is no conflict.
+        #[test]
+        fn a_copy_back_over_the_staged_source_refuses_changes_the_snapshot_does_not_hold() {
+            let source = tempfile::tempdir().expect("source");
+            std::fs::write(source.path().join("kept"), b"same").expect("kept");
+            std::fs::write(source.path().join("changed"), b"before").expect("changed");
+            std::fs::write(source.path().join("deleted"), b"gone").expect("deleted");
+            std::fs::write(source.path().join("appeared"), b"new").expect("appeared");
+            let mut state = scratch_state(source.path().to_path_buf());
+            for name in ["kept", "changed", "deleted"] {
+                let held = std::fs::metadata(source.path().join(name)).expect("metadata");
+                use sha2::Digest as _;
+                let digest: [u8; 32] = sha2::Sha256::digest(
+                    std::fs::read(source.path().join(name)).expect("contents"),
+                )
+                .into();
+                state
+                    .baseline
+                    .insert(name.to_string(), crate::subshell::BaselineEntry {
+                        len: held.len(),
+                        modified: held.modified().expect("mtime"),
+                        digest,
+                    });
+            }
+            std::fs::write(source.path().join("changed"), b"afterwards").expect("changed again");
+            std::fs::remove_file(source.path().join("deleted")).expect("delete");
+
+            let files: Vec<(PlannedSource, std::path::PathBuf)> =
+                ["kept", "changed", "deleted", "appeared"]
+                    .iter()
+                    .map(|name| {
+                        (
+                            PlannedSource::Native(std::path::PathBuf::from("the staged copy")),
+                            source.path().join(name),
+                        )
+                    })
+                    .collect();
+            let conflicts = scratch_conflicts(&state, &files);
+
+            assert_eq!(conflicts.len(), 3, "{conflicts:?}");
+            assert!(
+                conflicts.iter().any(|conflict| conflict
+                    == &format!(
+                        "{}: changed after it was staged",
+                        source.path().join("changed").display()
+                    )),
+                "{conflicts:?}"
+            );
+            assert!(
+                conflicts
+                    .iter()
+                    .any(|conflict| conflict.ends_with("deleted after it was staged")),
+                "{conflicts:?}"
+            );
+            assert!(
+                conflicts
+                    .iter()
+                    .any(|conflict| conflict.ends_with("appeared after staging")),
+                "{conflicts:?}"
+            );
+
+            // A target outside the staged source region is not a conflict of the snapshot's.
+            let outside = tempfile::tempdir().expect("outside");
+            std::fs::write(outside.path().join("elsewhere"), b"new").expect("elsewhere");
+            assert!(
+                scratch_conflicts(&state, &[(
+                    PlannedSource::Native(std::path::PathBuf::from("ignored")),
+                    outside.path().join("elsewhere"),
+                )],)
+                .is_empty()
+            );
+        }
+
+        /// The staged temporary's name is what the tests use to judge what a refusal left
+        /// behind.
+        fn export_leftovers(directory: &std::path::Path) -> Vec<String> {
+            std::fs::read_dir(directory)
+                .expect("read the destination")
+                .filter_map(std::result::Result::ok)
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    name.starts_with(".meka-export").then_some(name)
+                })
+                .collect()
+        }
+
+        /// The commit's rename is bound to the pinned directory handle and never replaces: a name
+        /// that appears before the publish fails the publish and keeps its bytes.
+        #[test]
+        fn a_handle_relative_rename_takes_only_an_absent_name_beneath_the_pin() {
+            use std::os::windows::io::AsRawHandle as _;
+
+            let dir = tempfile::tempdir().expect("dir");
+            let pinned = PinnedDirectory::pin(dir.path(), None).expect("pin");
+            let staged_path = dir.path().join("staged.bin");
+            std::fs::write(&staged_path, b"new").expect("staged");
+            let staged = open_staged(&staged_path).expect("open");
+
+            rename_relative_no_replace(
+                staged.as_raw_handle(),
+                pinned.raw(),
+                std::ffi::OsStr::new("artifact.bin"),
+            )
+            .expect("an absent name is taken");
+            assert_eq!(
+                std::fs::read(dir.path().join("artifact.bin")).expect("artifact"),
+                b"new",
+                "the rename publishes the staged bytes"
+            );
+
+            let other = dir.path().join("taken.bin");
+            std::fs::write(&other, b"original").expect("taken");
+            let staged_two = dir.path().join("staged2.bin");
+            std::fs::write(&staged_two, b"replacement").expect("staged");
+            let staged_two = open_staged(&staged_two).expect("open");
+            let refusal = rename_relative_no_replace(
+                staged_two.as_raw_handle(),
+                pinned.raw(),
+                std::ffi::OsStr::new("taken.bin"),
+            )
+            .expect_err("a taken name is never replaced");
+            assert_eq!(
+                refusal.kind(),
+                std::io::ErrorKind::AlreadyExists,
+                "a taken name reads as the name being taken: {refusal}"
+            );
+            assert_eq!(
+                std::fs::read(&other).expect("taken"),
+                b"original",
+                "the entry that was already there keeps its bytes"
+            );
+        }
+
+        /// Stage and publish one file the way the export does, for the tests that judge the
+        /// commit itself.
+        fn publish_one(
+            source: &std::path::Path,
+            target: &std::path::Path,
+        ) -> std::result::Result<u64, String> {
+            let staged = stage_export_file(source, target)?;
+            let pinned = target
+                .parent()
+                .map(|parent| PinnedDirectory::pin(parent, None))
+                .transpose()?
+                .ok_or_else(|| format!("{} has no parent directory", target.display()))?;
+            publish_export_temp(staged, target, pinned)
+        }
+
+        /// An absent destination is published only while it is still absent: an entry created
+        /// after the plan is refused, never replaced by the copy.
+        #[test]
+        fn an_absent_export_target_is_not_replaced_by_a_later_appearance() {
+            let destination = tempfile::tempdir().expect("destination");
+            let source = destination.path().join("source.bin");
+            std::fs::write(&source, b"new bytes").expect("source");
+            let target = destination.path().join("artifact.bin");
+
+            let copied = publish_one(&source, &target).expect("an absent target publishes");
+            assert_eq!(copied, 9);
+            assert_eq!(std::fs::read(&target).expect("target"), b"new bytes");
+            assert!(export_leftovers(destination.path()).is_empty());
+
+            std::fs::write(&target, b"someone else's").expect("the target appears");
+            let refusal = publish_one(&source, &target).expect_err("an appearance is refused");
+            assert!(refusal.contains("appeared at the destination"), "{refusal}");
+            assert_eq!(
+                std::fs::read(&target).expect("target"),
+                b"someone else's",
+                "the entry that appeared keeps its bytes"
+            );
+            assert!(export_leftovers(destination.path()).is_empty());
+        }
+
+        /// The publication is bound to the bytes the export wrote: a staged temporary that
+        /// changed under it is refused before the rename, and the name it would have taken stays
+        /// absent.
+        #[test]
+        fn a_staged_file_that_changed_before_the_commit_is_refused() {
+            let destination = tempfile::tempdir().expect("destination");
+            let source = destination.path().join("source.bin");
+            std::fs::write(&source, b"new bytes").expect("source");
+            let target = destination.path().join("artifact.bin");
+
+            let staged = stage_export_file(&source, &target).expect("stage");
+            std::fs::write(&staged.path, b"tampered").expect("tamper with the staged file");
+            let pinned = PinnedDirectory::pin(destination.path(), None).expect("pin");
+            let refusal =
+                publish_export_temp(staged, &target, pinned).expect_err("a tampered stage");
+            assert!(refusal.contains("no longer holds the bytes"), "{refusal}");
+            assert!(
+                !target.exists(),
+                "nothing is published from a tampered stage"
+            );
+            assert!(export_leftovers(destination.path()).is_empty());
+            assert_eq!(
+                std::fs::read(&source).expect("source"),
+                b"new bytes",
+                "the export's own source is untouched"
+            );
+        }
+
+        /// The supported publication providers are the ones that can hold the identity and
+        /// no-replace guarantees: a local fixed NTFS or ReFS volume, and nothing else.
+        #[test]
+        fn only_a_fixed_ntfs_or_refs_volume_may_take_a_publication() {
+            const DRIVE_FIXED: u32 = 3;
+            const DRIVE_REMOTE: u32 = 4;
+            const DRIVE_NO_ROOT_DIR: u32 = 1;
+
+            assert!(publication_provider_allows("NTFS", DRIVE_FIXED));
+            assert!(publication_provider_allows("ReFS", DRIVE_FIXED));
+            for refused in [
+                ("NTFS", DRIVE_REMOTE),
+                ("ReFS", DRIVE_NO_ROOT_DIR),
+                ("9p", DRIVE_FIXED),
+                ("FAT32", DRIVE_FIXED),
+                ("unknown", DRIVE_FIXED),
+                ("NTFS", 0),
+            ] {
+                assert!(
+                    !publication_provider_allows(refused.0, refused.1),
+                    "{refused:?} was accepted"
+                );
+            }
+        }
+
+        /// A destination name that is already taken is refused while the plan is made, before a
+        /// temporary is created or any byte is read. The export's contract is a fresh name; it has
+        /// no replacement path to attempt.
+        #[test]
+        fn an_existing_export_destination_is_refused_before_the_copy() {
+            let destination = tempfile::tempdir().expect("destination");
+            let source = destination.path().join("source.bin");
+            std::fs::write(&source, b"replacement").expect("source");
+            let target = destination.path().join("artifact.bin");
+            std::fs::write(&target, b"original").expect("target");
+
+            let refusal = planned_destination(&target).expect_err("an existing name is refused");
+            assert!(refusal.to_string().contains("already exists"), "{refusal}");
+            assert!(refusal.to_string().contains("new name"), "{refusal}");
+            assert_eq!(
+                std::fs::read(&target).expect("target"),
+                b"original",
+                "the existing file keeps its bytes"
+            );
+            assert!(export_leftovers(destination.path()).is_empty());
+        }
+
+        /// A Windows-backed export source is admitted in Windows spelling and resolved as the
+        /// host path itself, with no UNC translation.
+        #[test]
+        fn an_export_source_accepts_a_windows_path_beneath_the_grant() {
+            let temp = tempfile::tempdir().expect("temp");
+            let file_path = temp.path().join("artifact.bin");
+            std::fs::write(&file_path, b"payload").expect("write");
+            let grant = temp.path().to_string_lossy().to_string();
+            let target = Arc::new(
+                crate::subshell::Target::from_grants(
+                    "test-guest",
+                    crate::subshell::DEFAULT_RUNNER,
+                    &[],
+                    &[],
+                    std::slice::from_ref(&grant),
+                )
+                .expect("target"),
+            );
+            let handle = crate::subshell::Handle::new(
+                Arc::clone(&target),
+                None,
+                grant.clone(),
+                Vec::new(),
+                Vec::new(),
+                false,
+                Permission::Workspace,
+            );
+            let source = file_path.to_string_lossy().to_string();
+            let result = export_source(&handle, &source);
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(result.unwrap(), file_path);
+        }
+
+        /// A guest name that Windows would read as structure is refused before the plan runs.
+        #[test]
+        fn export_names_are_single_windows_components() {
+            use std::ffi::OsStr;
+
+            assert_eq!(
+                export_component(OsStr::new("artifact.bin")),
+                Ok("artifact.bin")
+            );
+            assert_eq!(export_component(OsStr::new("COM10")), Ok("COM10"));
+            assert_eq!(
+                export_component(OsStr::new("console.txt")),
+                Ok("console.txt")
+            );
+            for refused in [
+                "",
+                ".",
+                "..",
+                "name.",
+                "name ",
+                "a\\b",
+                "a/b",
+                "a:b",
+                "a*b",
+                "a?b",
+                "a\"b",
+                "a<b",
+                "a>b",
+                "a|b",
+                "a\tb",
+                "CON",
+                "con.txt",
+                "PRN",
+                "AUX",
+                "NUL",
+                "COM1",
+                "lpt9.log",
+                "CONIN$",
+                "conout$.txt",
+                "CLOCK$",
+            ] {
+                assert!(
+                    export_component(OsStr::new(refused)).is_err(),
+                    "{refused:?} was accepted"
+                );
+            }
+            let long = "a".repeat(256);
+            assert!(export_component(OsStr::new(&long)).is_err());
+        }
+
+        /// Two planned names that differ only in case would land on one Windows file.
+        #[test]
+        fn an_export_plan_refuses_case_aliases() {
+            let mut plan = ExportPlan {
+                root: std::path::PathBuf::from(r"C:\out"),
+                files: Vec::new(),
+                directories: Vec::new(),
+                seen: std::collections::HashSet::new(),
+                guest_sources: Vec::new(),
+            };
+            claim_export_target(&mut plan, std::path::Path::new(r"C:\out\Foo\a")).unwrap();
+            let alias = claim_export_target(&mut plan, std::path::Path::new(r"C:\out\foo\A"));
+            assert!(alias.is_err(), "{alias:?}");
+            assert!(claim_export_target(&mut plan, std::path::Path::new(r"C:\out\Foo\b")).is_ok());
+        }
+    }
+
+    /// A downgrade after a WSL launcher is owned withdraws the guest first and kills only when no
+    /// terminal proof arrives, keeps what the command printed, and records the guest end as
+    /// unconfirmed rather than treating the local reap as the namespace's end.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_wsl_command_stopped_by_a_downgrade_keeps_its_output_and_says_the_guest_end_is_unconfirmed()
+     {
+        let op = crate::subshell::new_op();
+        let permission = shared_permission_for_test();
+        let lease = permission.lease();
+        let context = crate::tools::ToolContext {
+            teardown: Some(std::sync::Arc::new(
+                crate::tools::TeardownObservation::default(),
+            )),
+            ..crate::tools::ToolContext::for_test(tokio_util::sync::CancellationToken::new())
+        };
+        // The stand-in proves its start and then leaves a marker: the downgrade lands only after
+        // the route observed the start, so the test's order is its own, not the scheduler's.
+        let marker =
+            std::env::temp_dir().join(format!("meka-stop-marker-{}", uuid::Uuid::new_v4()));
+        let mut command = stand_in_runner(&format!(
+            "'{{\"frame\":\"ready\",\"op\":\"{op}\"}}'; \
+             if ($null -ne [Console]::In.ReadLine()) {{ \
+             '{{\"frame\":\"started\",\"op\":\"{op}\"}}'; \
+             [Console]::Out.Write('{{\"frame\":\"output\",\"stream\":\"stdout\",\"len\":7}}' + \"`n\"); \
+             [Console]::Out.Write(\"before`n\"); [Console]::Out.Flush(); \
+             New-Item -ItemType File -Path '{}' | Out-Null }}; \
+             Start-Sleep -Seconds 30",
+            marker.display()
+        ));
+        let tree = crate::process::spawn_tree(&mut command).expect("spawn the stand-in launcher");
+        let downgraded = tokio::spawn(async move {
+            for _ in 0..600 {
+                if marker.exists() {
+                    permission.set_unchecked(Permission::Read);
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("the stand-in never reached its start");
+        });
+        let output = run_command_tree_route(
+            tree,
+            Some(WslRun {
+                op,
+                required: Permission::Read,
+            }),
+            std::time::Duration::from_secs(30),
+            &context,
+            CommandRoute::Wsl,
+            Some(&lease),
+            None,
+        )
+        .await
+        .expect("a stopped route reports what it collected");
+        downgraded.await.expect("the downgrade ran");
+        let text = output
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                crate::conversation::ToolResultContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("Permission was lowered"), "{text}");
+        assert!(text.contains("before"), "{text}");
+        assert!(text.contains("end is unconfirmed"), "{text}");
+        assert_eq!(
+            context
+                .teardown
+                .as_ref()
+                .expect("the test asked for an observation")
+                .confirmed(),
+            Some(false),
+            "a local launcher's end is not a confirmed guest teardown"
+        );
+    }
+
+    /// A stop that wins before the guest ever acknowledges a start denies the permit: the command
+    /// never runs, and the record says so instead of guessing at a namespace's state.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_wsl_stop_before_the_start_permit_denies_the_start() {
+        let op = crate::subshell::new_op();
+        let permission = shared_permission_for_test();
+        let lease = permission.lease();
+        let context = crate::tools::ToolContext {
+            teardown: Some(std::sync::Arc::new(
+                crate::tools::TeardownObservation::default(),
+            )),
+            ..crate::tools::ToolContext::for_test(tokio_util::sync::CancellationToken::new())
+        };
+        // The stand-in waits out the stop before it ever proves its sandbox, and says `ran` only
+        // if a permit line actually arrives: the guest that never gets a permit never starts.
+        let mut command = stand_in_runner(&format!(
+            "Start-Sleep -Milliseconds 500; \
+             '{{\"frame\":\"ready\",\"op\":\"{op}\"}}'; \
+             if ($null -ne [Console]::In.ReadLine()) {{ [Console]::Out.Write('ran') }}; \
+             Start-Sleep -Seconds 30"
+        ));
+        let tree = crate::process::spawn_tree(&mut command).expect("spawn the stand-in launcher");
+        let downgraded = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            permission.set_unchecked(Permission::Read);
+        });
+        let output = run_command_tree_route(
+            tree,
+            Some(WslRun {
+                op,
+                required: Permission::Workspace,
+            }),
+            std::time::Duration::from_secs(30),
+            &context,
+            CommandRoute::Wsl,
+            Some(&lease),
+            None,
+        )
+        .await
+        .expect("a denied start is a result, not a crash");
+        downgraded.await.expect("the downgrade ran");
+        let text = output
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                crate::conversation::ToolResultContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(!text.contains("ran"), "the command must never run: {text}");
+        assert!(text.contains("never started"), "{text}");
+        assert_eq!(
+            context
+                .teardown
+                .as_ref()
+                .expect("the test asked for an observation")
+                .confirmed(),
+            Some(true),
+            "a command that never started has nothing left running"
+        );
+    }
+
+    /// A complete framed response presents stdout and stderr separately and records the guest's
+    /// own teardown proof, which a local launcher exit alone could not provide.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_wsl_command_with_a_complete_frame_stream_proves_its_teardown() {
+        let op = crate::subshell::new_op();
+        let context = crate::tools::ToolContext {
+            teardown: Some(std::sync::Arc::new(
+                crate::tools::TeardownObservation::default(),
+            )),
+            ..crate::tools::ToolContext::for_test(tokio_util::sync::CancellationToken::new())
+        };
+        let mut command = stand_in_runner(&format!(
+            "'{{\"frame\":\"ready\",\"op\":\"{op}\"}}'; \
+             $null = [Console]::In.ReadLine(); \
+             '{{\"frame\":\"started\",\"op\":\"{op}\"}}'; \
+             [Console]::Out.Write('{{\"frame\":\"output\",\"stream\":\"stdout\",\"len\":6}}' + \"`n\"); \
+             [Console]::Out.Write(\"hello`n\"); \
+             [Console]::Out.Write('{{\"frame\":\"output\",\"stream\":\"stderr\",\"len\":5}}' + \"`n\"); \
+             [Console]::Out.Write(\"warn`n\"); \
+             '{{\"frame\":\"stopped\",\"op\":\"{op}\",\"code\":0}}'; \
+             '{{\"frame\":\"done\",\"op\":\"{op}\"}}'"
+        ));
+        let tree = crate::process::spawn_tree(&mut command).expect("spawn the stand-in runner");
+        let output = run_command_tree_route(
+            tree,
+            Some(WslRun {
+                op,
+                required: Permission::Read,
+            }),
+            std::time::Duration::from_secs(30),
+            &context,
+            CommandRoute::Wsl,
+            None,
+            None,
+        )
+        .await
+        .expect("a complete stream is a result");
+        let text = output
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                crate::conversation::ToolResultContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("hello"), "{text}");
+        assert!(text.contains("--- stderr ---\nwarn"), "{text}");
+        assert_eq!(
+            context
+                .teardown
+                .as_ref()
+                .expect("the test asked for an observation")
+                .confirmed(),
+            Some(true),
+            "the stopped frame proves the guest reaped the shell"
+        );
+    }
+
+    /// A stand-in launcher for the framed protocol: PowerShell, its stdin piped so the route's
+    /// start permit and withdrawal reach it.
+    #[cfg(windows)]
+    fn stand_in_runner(script: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+    }
+
+    #[cfg(windows)]
+    fn command_frame(frame: crate::subshell::Frame) -> Vec<u8> {
+        frame.encode().expect("encode a frame")
+    }
+    #[cfg(windows)]
+    fn output_frame(stream: crate::subshell::OutputStream, bytes: &[u8]) -> Vec<u8> {
+        let mut encoded = command_frame(crate::subshell::Frame::Output {
+            stream,
+            len: bytes.len() as u64,
+        });
+        encoded.extend_from_slice(bytes);
+        encoded
+    }
+
+    /// One command stream parser for a test, with the notice channel and the permit flag the
+    /// route would hold.
+    #[cfg(windows)]
+    fn test_frames(
+        op: &str,
+        bound: usize,
+    ) -> (
+        CommandFrames,
+        tokio::sync::mpsc::Receiver<()>,
+        Arc<std::sync::atomic::AtomicBool>,
+        tokio_util::sync::CancellationToken,
+    ) {
+        let (ready_tx, ready_rx) = tokio::sync::mpsc::channel(1);
+        let permit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = tokio_util::sync::CancellationToken::new();
+        let frames = CommandFrames::new(
+            op.to_owned(),
+            Arc::new(crate::process::OutputBudget::new(bound)),
+            stop.clone(),
+            None,
+            ready_tx,
+            Arc::clone(&permit),
+        );
+        (frames, ready_rx, permit, stop)
+    }
+
+    /// A command's framed stream is accepted in one order only: readiness, then the permit the
+    /// route commits, then `started`, and only a complete `stopped`, `done` sequence proves the
+    /// guest reaped the shell.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn command_frames_carry_output_and_prove_teardown_in_order() {
+        use std::sync::atomic::Ordering;
+
+        use crate::subshell::{Frame, OutputStream};
+
+        let op = crate::subshell::new_op();
+        let (frames, mut ready, permit, stop) = test_frames(&op, 1024);
+        let mut stream = command_frame(Frame::Ready { op: op.clone() });
+        frames.push(&stream).await;
+        assert!(ready.try_recv().is_ok(), "readiness reaches the route");
+        permit.store(true, Ordering::Release);
+        stream.clear();
+        stream.extend(command_frame(Frame::Started { op: op.clone() }));
+        stream.extend(output_frame(OutputStream::Stdout, b"out\n"));
+        stream.extend(output_frame(OutputStream::Stderr, b"err\n"));
+        stream.extend(command_frame(Frame::Stopped {
+            op: op.clone(),
+            code: 0,
+        }));
+        stream.extend(command_frame(Frame::Done { op: op.clone() }));
+        frames.push(&stream).await;
+        let (drained, end) = frames.outcome().await.expect("a complete sequence");
+        assert_eq!(drained.stdout, "out\n");
+        assert_eq!(drained.stderr, "err\n");
+        assert!(end.started, "the permit became an observed start");
+        assert_eq!(end.stopped, Some(0), "the stopped frame is the reap proof");
+        assert!(!stop.is_cancelled(), "a complete sequence needs no stop");
+    }
+
+    /// Output before `started`, a start without the committed permit, `done` before `stopped`, a
+    /// control frame naming another operation, and any trailing frame are refusals: a command's
+    /// own bytes can never stand in for a control frame.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn command_frames_refuse_control_out_of_order_or_out_of_operation() {
+        use std::sync::atomic::Ordering;
+
+        use crate::subshell::{Frame, OutputStream};
+
+        let op = crate::subshell::new_op();
+        let (frames, _ready, _permit, _stop) = test_frames(&op, 1024);
+        frames
+            .push(&output_frame(OutputStream::Stdout, b"early"))
+            .await;
+        let error = frames.outcome().await.expect_err("output before started");
+        assert!(error.contains("out of order"), "{error}");
+
+        // A start before the route committed the permit is refused even after readiness.
+        let (frames, _ready, _permit, _stop) = test_frames(&op, 1024);
+        let mut stream = command_frame(Frame::Ready { op: op.clone() });
+        stream.extend(command_frame(Frame::Started { op: op.clone() }));
+        frames.push(&stream).await;
+        let error = frames
+            .outcome()
+            .await
+            .expect_err("a start without the permit");
+        assert!(error.contains("permit"), "{error}");
+
+        let (frames, _ready, permit, _stop) = test_frames(&op, 1024);
+        permit.store(true, Ordering::Release);
+        let mut stream = command_frame(Frame::Started { op: op.clone() });
+        stream.extend(command_frame(Frame::Done { op: op.clone() }));
+        frames.push(&stream).await;
+        let error = frames.outcome().await.expect_err("done before stopped");
+        assert!(error.contains("out of order"), "{error}");
+
+        // A control frame naming another operation is not this run's answer.
+        let (frames, _ready, permit, _stop) = test_frames(&op, 1024);
+        permit.store(true, Ordering::Release);
+        let other = crate::subshell::new_op();
+        let stream = command_frame(Frame::Started { op: other.clone() });
+        frames.push(&stream).await;
+        let error = frames
+            .outcome()
+            .await
+            .expect_err("another operation's frame");
+        assert!(error.contains("another operation"), "{error}");
+    }
+
+    /// The budget stops the run and leaves the bytes that crossed it for the result, exactly as a
+    /// raw command's drain does; the incomplete sequence is never presented as a clean finish.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn command_frames_stop_at_the_output_budget() {
+        use std::sync::atomic::Ordering;
+
+        use crate::subshell::{Frame, OutputStream};
+
+        let op = crate::subshell::new_op();
+        let (frames, mut ready, permit, stop) = test_frames(&op, 4);
+        let mut stream = command_frame(Frame::Ready { op: op.clone() });
+        frames.push(&stream).await;
+        assert!(ready.try_recv().is_ok(), "readiness reaches the route");
+        permit.store(true, Ordering::Release);
+        stream.clear();
+        stream.extend(command_frame(Frame::Started { op: op.clone() }));
+        stream.extend(output_frame(OutputStream::Stdout, b"over the bound"));
+        frames.push(&stream).await;
+        assert!(stop.is_cancelled(), "the run is stopped at the bound");
+        assert!(
+            frames.output_bound().await,
+            "the parser knows it cut output"
+        );
+        let error = frames
+            .outcome()
+            .await
+            .expect_err("a cut stream has no terminal frames");
+        assert!(error.contains("terminal frames"), "{error}");
+    }
+
+    /// Bytes that happen to look like a control frame are still the command's own output: the
+    /// stream's length-delimited payload is never re-read as control.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_output_payload_that_resembles_a_control_frame_stays_output() {
+        use std::sync::atomic::Ordering;
+
+        use crate::subshell::{Frame, OutputStream};
+
+        let op = crate::subshell::new_op();
+        let (frames, mut ready, permit, _stop) = test_frames(&op, 1024);
+        let mut stream = command_frame(Frame::Ready { op: op.clone() });
+        frames.push(&stream).await;
+        assert!(ready.try_recv().is_ok(), "readiness reaches the route");
+        permit.store(true, Ordering::Release);
+        stream.clear();
+        stream.extend(command_frame(Frame::Started { op: op.clone() }));
+        let disguised = format!("{{\"frame\":\"stopped\",\"op\":\"{op}\",\"code\":0}}");
+        stream.extend(output_frame(OutputStream::Stdout, disguised.as_bytes()));
+        frames.push(&stream).await;
+        let error = frames
+            .outcome()
+            .await
+            .expect_err("the sequence has no terminal frames");
+        assert!(error.contains("terminal frames"), "{error}");
+        let (drained, end) = frames.snapshot().await;
+        assert_eq!(drained.stdout, disguised, "the disguised bytes stay output");
+        assert_eq!(
+            end.stopped, None,
+            "no stopped frame was parsed out of output"
+        );
+    }
+
+    /// A launcher that ends before it reports anything is reconciled as a broken stream, never
+    /// as a clean result, and the record says no start was observed.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_launcher_that_ends_before_it_reports_anything_is_not_a_clean_result() {
+        let op = crate::subshell::new_op();
+        let context = crate::tools::ToolContext {
+            teardown: Some(std::sync::Arc::new(
+                crate::tools::TeardownObservation::default(),
+            )),
+            ..crate::tools::ToolContext::for_test(tokio_util::sync::CancellationToken::new())
+        };
+        let mut command = stand_in_runner("exit 3");
+        let tree = crate::process::spawn_tree(&mut command).expect("spawn the stand-in launcher");
+        let error = match run_command_tree_route(
+            tree,
+            Some(WslRun {
+                op,
+                required: Permission::Read,
+            }),
+            std::time::Duration::from_secs(30),
+            &context,
+            CommandRoute::Wsl,
+            None,
+            None,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a stream with nothing in it is not a result"),
+        };
+        let CommandTreeError::Wait(error) = error else {
+            panic!("a broken stream reads as a wait failure, not a start");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("exited without reporting the command's outcome"),
+            "{error}"
+        );
+        assert_eq!(
+            context
+                .teardown
+                .as_ref()
+                .expect("the test asked for an observation")
+                .confirmed(),
+            Some(true),
+            "no start was ever observed, so there is nothing left running"
+        );
+    }
+
+    /// The commit gate is the lease's memory: a permission lowered and raised again still reads
+    /// as lowered at the gate, and the wording counts what was published before it.
+    #[cfg(windows)]
+    #[test]
+    fn the_commit_gate_refuses_a_lease_that_was_lowered_and_raised_again() {
+        let permission = shared_permission_for_test();
+        let lease = permission.lease();
+        let closed = tokio_util::sync::CancellationToken::new();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        assert!(
+            commit_gate(&closed, &cancellation, &lease).is_ok(),
+            "an untouched lease passes the gate"
+        );
+
+        permission.set_unchecked(Permission::Read);
+        permission.set_unchecked(Permission::Workspace);
+        let stop = commit_gate(&closed, &cancellation, &lease)
+            .expect_err("a lease lowered and raised again is still revoked");
+        assert!(matches!(stop, CommitStop::LeaseLowered), "{stop:?}");
+        let report = stop.report(2);
+        assert!(report.contains("2 file(s) were published"), "{report}");
+        assert!(report.contains("and remain"), "{report}");
+
+        let fresh = permission.lease();
+        assert!(
+            commit_gate(&closed, &cancellation, &fresh).is_ok(),
+            "a lease taken after the change is not bound by it"
+        );
+        cancellation.cancel();
+        let stop = commit_gate(&closed, &cancellation, &fresh).expect_err("a cancelled run");
+        assert!(matches!(stop, CommitStop::Canceled), "{stop:?}");
+    }
+
+    /// The pin is the binding: while the export holds its destination directory, nothing may
+    /// rename or remove it, so the names the commit creates cannot be redirected.
+    #[cfg(windows)]
+    #[test]
+    fn a_pinned_destination_directory_cannot_be_renamed_or_removed_while_it_is_held() {
+        let outer = tempfile::tempdir().expect("outer");
+        let destination = outer.path().join("destination");
+        std::fs::create_dir(&destination).expect("destination");
+        let pinned = PinnedDirectory::pin(&destination, None).expect("pin");
+
+        let moved = outer.path().join("moved");
+        assert!(
+            std::fs::rename(&destination, &moved).is_err(),
+            "the pinned directory must not be renamed away"
+        );
+        assert!(
+            std::fs::remove_dir(&destination).is_err(),
+            "the pinned directory must not be removed"
+        );
+        assert!(
+            destination.exists(),
+            "the destination is still the export's"
+        );
+
+        drop(pinned);
+        std::fs::rename(&destination, &moved).expect("released, the directory may move again");
+        assert!(!destination.exists());
+    }
+
+    /// A source that grows while it is copied is refused: what the export publishes is what the
+    /// plan admitted, and a file that changed under it publishes nothing.
+    #[cfg(windows)]
+    #[test]
+    fn a_source_that_grows_during_the_copy_publishes_nothing() {
+        /// Long enough that the grower's appends land while the copy is still reading.
+        const GROWING_SOURCE_BYTES: usize = 24 * 1024 * 1024;
+
+        let destination = tempfile::tempdir().expect("destination");
+        let source = destination.path().join("source.bin");
+        std::fs::write(&source, vec![b'x'; GROWING_SOURCE_BYTES]).expect("source");
+        let target = destination.path().join("artifact.bin");
+        let grower = {
+            let source = source.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                for _ in 0..64 {
+                    let mut appended = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&source)
+                        .expect("open to grow");
+                    std::io::Write::write_all(&mut appended, b"growth").expect("grow");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+        };
+        let refusal = stage_export_file(&source, &target)
+            .err()
+            .expect("a growing source");
+        grower.join().expect("the grower ran");
+        assert!(refusal.contains("changed while it was copied"), "{refusal}");
+        assert!(
+            !target.exists(),
+            "a refused source publishes nothing under its name"
+        );
+    }
+
+    /// A stage snapshot announces the tree it read in walk order and carries each file's bytes
+    /// once: the manifest travels before them and the runner re-checks every digest as it writes.
+    #[cfg(windows)]
+    #[test]
+    fn a_stage_snapshot_announces_the_tree_it_read() {
+        use sha2::Digest as _;
+
+        let base = tempfile::tempdir().expect("source");
+        std::fs::write(base.path().join("a.txt"), b"alpha").expect("a file");
+        std::fs::create_dir(base.path().join("sub")).expect("subdirectory");
+        std::fs::write(base.path().join("sub").join("b.txt"), b"beta").expect("a nested file");
+        let snapshot =
+            snapshot_stage_tree(base.path(), 1024 * 1024).expect("the tree is snapshotted");
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| (entry.path.as_str(), entry.directory))
+                .collect::<Vec<_>>(),
+            vec![("a.txt", false), ("sub", true), ("sub/b.txt", false)]
+        );
+        assert_eq!(snapshot.payload, b"alphabeta");
+        let alpha: [u8; 32] = sha2::Sha256::digest(b"alpha").into();
+        assert_eq!(
+            snapshot.entries[0].parsed_digest().expect("a digest"),
+            alpha
+        );
+    }
+
+    /// A stage snapshot refuses a reparse point: nothing is read through one, since the tree it
+    /// names is not the tree the grant admitted.
+    #[cfg(windows)]
+    #[test]
+    fn a_stage_snapshot_refuses_a_reparse_point() {
+        let base = tempfile::tempdir().expect("source");
+        std::fs::write(base.path().join("a.txt"), b"alpha").expect("a file");
+        std::os::windows::fs::symlink_file(base.path().join("a.txt"), base.path().join("link.txt"))
+            .expect("symlink");
+        let refusal = snapshot_stage_tree(base.path(), 1024 * 1024)
+            .err()
+            .expect("a reparse point is refused");
+        assert!(refusal.contains("reparse point"), "{refusal}");
+    }
+
+    /// A stage snapshot refuses a file another name can change: the fence binds one name, and a
+    /// write through the other would not be seen in the bytes it announced.
+    #[cfg(windows)]
+    #[test]
+    fn a_stage_snapshot_refuses_a_file_another_name_can_change() {
+        let base = tempfile::tempdir().expect("source");
+        std::fs::write(base.path().join("a.txt"), b"alpha").expect("a file");
+        std::fs::hard_link(base.path().join("a.txt"), base.path().join("other.txt"))
+            .expect("hard link");
+        let refusal = snapshot_stage_tree(base.path(), 1024 * 1024)
+            .err()
+            .expect("a hard link is refused");
+        assert!(refusal.contains("another name"), "{refusal}");
+    }
+
+    /// A file that grows while it is read refuses the snapshot: what the upload would carry is
+    /// what the fence read, and a source that changed under it announces nothing.
+    #[cfg(windows)]
+    #[test]
+    fn a_stage_snapshot_refuses_a_source_that_grows_while_it_is_read() {
+        /// Long enough that the grower's appends land while the copy is still reading.
+        const GROWING_SOURCE_BYTES: u64 = 24 * 1024 * 1024;
+
+        let base = tempfile::tempdir().expect("source");
+        let source = base.path().join("source.bin");
+        std::fs::write(&source, vec![b'x'; GROWING_SOURCE_BYTES as usize]).expect("source");
+        let grower = {
+            let source = source.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                for _ in 0..64 {
+                    let mut appended = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&source)
+                        .expect("open to grow");
+                    std::io::Write::write_all(&mut appended, b"growth").expect("grow");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+        };
+        let refusal = read_snapshot_file(&source, "source.bin", GROWING_SOURCE_BYTES)
+            .expect_err("a growing source");
+        grower.join().expect("the grower ran");
+        assert!(refusal.contains("changed while it was staged"), "{refusal}");
+    }
+
+    /// A stage snapshot is bounded by the workspace quota before its bytes are held: a source
+    /// larger than the workspace may hold is refused by the walk, not by the workspace.
+    #[cfg(windows)]
+    #[test]
+    fn a_stage_snapshot_is_bounded_by_the_workspace_quota() {
+        let base = tempfile::tempdir().expect("source");
+        std::fs::write(base.path().join("a.txt"), vec![b'x'; 64]).expect("a file");
+        std::fs::write(base.path().join("b.txt"), vec![b'y'; 64]).expect("another file");
+        let refusal = snapshot_stage_tree(base.path(), 96)
+            .err()
+            .expect("an over-quota source is refused");
+        assert!(refusal.contains("scratch quota"), "{refusal}");
+    }
+
+    /// An upload stream is one manifest line in the frame shape a transfer answers with, and then
+    /// the announced bytes in manifest order: nothing else travels between the request and the
+    /// workspace.
+    #[cfg(windows)]
+    #[test]
+    fn an_upload_stream_is_one_manifest_line_and_then_the_announced_bytes() {
+        let base = tempfile::tempdir().expect("source");
+        std::fs::write(base.path().join("a.txt"), b"alpha").expect("a file");
+        let snapshot = snapshot_stage_tree(base.path(), 1024).expect("the tree is snapshotted");
+        let op = crate::subshell::new_op();
+        let stream = upload_stream(&op, &snapshot).expect("the stream");
+        let newline = stream
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("the manifest line");
+        let frame = crate::subshell::Frame::decode(&stream[..newline]).expect("the manifest");
+        match frame {
+            crate::subshell::Frame::Manifest {
+                op: named,
+                roots,
+                entries,
+            } => {
+                assert_eq!(named, op);
+                assert!(roots.is_empty(), "a stage names no roots");
+                assert_eq!(entries, snapshot.entries);
+            }
+            other => panic!("the upload begins with a manifest, not {other:?}"),
+        }
+        assert_eq!(&stream[newline + 1..], &snapshot.payload[..]);
+    }
+
+    /// The start permit commits only under the authority that admitted the call: a lease already
+    /// lowered when readiness arrives is a denied start, before any stop could reach the guest.
+    #[cfg(windows)]
+    #[test]
+    fn a_start_permit_denies_a_lease_already_lowered() {
+        use std::sync::atomic::Ordering;
+
+        let permission = shared_permission_for_test();
+        let lease = permission.lease();
+        permission.set_unchecked(Permission::Read);
+        let (writes, mut enqueued) = tokio::sync::mpsc::channel(1);
+        let permit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_ready, ready) = tokio::sync::mpsc::channel(1);
+        let guest = GuestChannel {
+            writes: Some(writes),
+            permit: Arc::clone(&permit),
+            ready,
+            decided: false,
+            required: Permission::Read,
+        };
+        commit_permit(
+            &mut Some(guest),
+            Some(&lease),
+            std::time::Duration::from_secs(1),
+        );
+        assert!(
+            !permit.load(Ordering::Acquire),
+            "a lowered lease never commits a start"
+        );
+        assert!(
+            enqueued.try_recv().is_err(),
+            "no permit line is written for a denied start"
+        );
+
+        // A lease that still holds the authority commits exactly one permit line.
+        let (writes, mut enqueued) = tokio::sync::mpsc::channel(1);
+        let permit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_ready, ready) = tokio::sync::mpsc::channel(1);
+        let guest = GuestChannel {
+            writes: Some(writes),
+            permit: Arc::clone(&permit),
+            ready,
+            decided: false,
+            required: Permission::Read,
+        };
+        let fresh = permission.lease();
+        commit_permit(
+            &mut Some(guest),
+            Some(&fresh),
+            std::time::Duration::from_secs(1),
+        );
+        assert!(
+            permit.load(Ordering::Acquire),
+            "a live lease commits the start"
+        );
+        assert!(
+            matches!(enqueued.try_recv(), Ok(LeaseWrite::Permit(_))),
+            "the committed start carries its permit line"
+        );
+    }
+
+    /// A run that reaches its deadline is stopped through the same withdrawal a stop uses, and
+    /// the record says the guest's end is unconfirmed: a deadline is not a guest reap.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_run_that_hits_its_deadline_says_its_end_is_unconfirmed() {
+        let op = crate::subshell::new_op();
+        let context = crate::tools::ToolContext {
+            teardown: Some(std::sync::Arc::new(
+                crate::tools::TeardownObservation::default(),
+            )),
+            ..crate::tools::ToolContext::for_test(tokio_util::sync::CancellationToken::new())
+        };
+        let mut command = stand_in_runner(&format!(
+            "'{{\"frame\":\"ready\",\"op\":\"{op}\"}}'; \
+             if ($null -ne [Console]::In.ReadLine()) {{ \
+             '{{\"frame\":\"started\",\"op\":\"{op}\"}}'; \
+             [Console]::Out.Write('{{\"frame\":\"output\",\"stream\":\"stdout\",\"len\":4}}' + \"`n\"); \
+             [Console]::Out.Write(\"here\"); [Console]::Out.Flush() }}; \
+             Start-Sleep -Seconds 30"
+        ));
+        let tree = crate::process::spawn_tree(&mut command).expect("spawn the stand-in launcher");
+        let output = run_command_tree_route(
+            tree,
+            Some(WslRun {
+                op,
+                required: Permission::Read,
+            }),
+            std::time::Duration::from_secs(3),
+            &context,
+            CommandRoute::Wsl,
+            None,
+            None,
+        )
+        .await
+        .expect("a deadline is a result");
+        let text = output
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                crate::conversation::ToolResultContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("timed out after"), "{text}");
+        assert!(text.contains("end is unconfirmed"), "{text}");
+        assert_eq!(
+            context
+                .teardown
+                .as_ref()
+                .expect("the test asked for an observation")
+                .confirmed(),
+            Some(false),
+            "the local deadline's end does not confirm the guest's"
+        );
     }
 }

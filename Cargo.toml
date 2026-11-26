@@ -6,6 +6,12 @@ rust-version = "1.95"
 license = "AGPL-3.0-or-later"
 description = "A general-purpose AI agent harness"
 repository = "https://github.com/k4yt3x/meka"
+# The `[[bin]]` below makes the loader a second binary, so `cargo run` must be told which it means.
+default-run = "meka"
+
+[[bin]]
+name = "meka-wsl-loader"
+path = "src/sandbox/wsl_loader.rs"
 
 [features]
 default = ["serve"]

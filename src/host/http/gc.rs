@@ -70,7 +70,9 @@ async fn evict_idle(state: &ServerState, idle_timeout: Duration, delete_on_idle:
     // batch, including the `FileLock`s of sessions already removed from the map but still held by
     // `evicted`, whose owners would get `session-locked` for the duration.
     for (_id, entry) in &evicted {
-        entry.release(state.shared.mcp_manager.as_ref()).await;
+        entry
+            .release_and_wait(state.shared.mcp_manager.as_ref())
+            .await;
         entry.frontend.close_feed();
     }
 

@@ -243,6 +243,15 @@ impl SharedProject {
 #[derive(Clone)]
 pub(crate) struct SessionCells {
     pub(crate) permission: crate::permission::SharedPermission,
+    /// Guest grants are supplied by this invocation, never restored from a session row.
+    #[cfg(windows)]
+    pub(crate) wsl: Option<Arc<crate::subshell::Target>>,
+    /// Whether every directory grant the managed WSL target admits is Windows-backed, so opening
+    /// it needs `workspace` rather than `read`: a Windows mount is proved by the host before the
+    /// guest resolves it, and `read` does not carry that proof. False when there is no target; the
+    /// two are set together from the configuration that resolved one.
+    #[cfg(windows)]
+    pub(crate) wsl_needs_workspace: bool,
     pub(crate) cwd: crate::workspace::SharedCwd,
     pub(crate) roots: crate::workspace::SharedRoots,
     /// Directories the session may read but not write, beyond its roots: what a parent's
@@ -287,6 +296,29 @@ pub(crate) struct SessionCells {
     pub(crate) pending_compaction: PendingCompaction,
 }
 
+/// The memory scope keys a session with these targets can satisfy, in this order:
+/// [`crate::memory::SCOPE_WINDOWS`] on a Windows host, then `wsl:<distro>` when a WSL target is
+/// configured.
+///
+/// A free function rather than only a method so the rules can be stated and tested without a
+/// whole session behind them; [`SessionCells::active_memory_scopes`] is the method and the only
+/// caller.
+fn scope_keys(wsl: Option<&str>) -> Vec<String> {
+    let mut scopes: Vec<String> = Vec::new();
+    #[cfg(windows)]
+    {
+        scopes.push(crate::memory::SCOPE_WINDOWS.to_string());
+        if let Some(distribution) = wsl {
+            scopes.push(format!("wsl:{distribution}"));
+        }
+    }
+    // Silenced rather than removed: the parameter exists for the Windows build, where a guest
+    // can be opened, and the Linux build has no WSL target to name.
+    #[cfg(not(windows))]
+    let _ = wsl;
+    scopes
+}
+
 impl SessionCells {
     /// The cells of a session that has not run yet: no session id, an empty checklist, fresh
     /// gauges, nothing in the background.
@@ -299,6 +331,10 @@ impl SessionCells {
     ) -> Self {
         Self {
             permission,
+            #[cfg(windows)]
+            wsl: None,
+            #[cfg(windows)]
+            wsl_needs_workspace: false,
             cwd,
             roots,
             read_only_roots: crate::workspace::SharedRoots::default(),
@@ -316,6 +352,72 @@ impl SessionCells {
             session_lock: crate::store::SessionLockSlot::default(),
             pending_compaction: PendingCompaction::default(),
         }
+    }
+
+    /// Install the managed WSL target together with what its grants are made of.
+    ///
+    /// One fact in two pieces: a target whose every grant is Windows-backed can be opened only at
+    /// `workspace`, so a caller that set the target alone would leave
+    /// [`Self::active_memory_scopes`] claiming a route `Target::request` refuses. `None` with
+    /// `false` is no managed target, which is the default.
+    #[cfg(windows)]
+    pub(crate) fn set_managed_wsl(
+        &mut self,
+        target: Option<Arc<crate::subshell::Target>>,
+        needs_workspace: bool,
+    ) {
+        self.wsl = target;
+        self.wsl_needs_workspace = needs_workspace;
+    }
+
+    /// The scope keys this session can actually be on: `windows` on a Windows host and
+    /// `wsl:<distro>` when the session may open the configured WSL target.
+    ///
+    /// This is the set [`crate::memory::scope_applies`] compares a memory's `scope` against. A
+    /// configured target is not enough: a target a worker's scope denies, one whose tool floor
+    /// an operator raised past the session's level, and one whose own grants need more than the
+    /// session's level can each hold a target's configuration without being able to reach it,
+    /// and a note for that target must not read as a standing instruction there.
+    ///
+    /// `shell` is `shell_execute`'s requirement as the model's real tool catalog states it
+    /// (overrides included), `None` when the catalog does not carry the tool at all. The one-shot
+    /// WSL call is a `shell_execute` route. `level` is the session's permission. The answer is
+    /// what actual dispatch would admit, asked of the same pure rules it uses
+    /// (`Permission::allows` for the confined built-in, `Target::request`'s floors), never a
+    /// guest probe.
+    pub(crate) fn active_memory_scopes(
+        &self,
+        shell: Option<crate::permission::Permission>,
+        level: crate::permission::Permission,
+    ) -> Vec<String> {
+        // Dispatch's rule for a confined built-in (`crate::tools::admit_tool_call` asks
+        // `Permission::allows`), not strict containment: a tool the dispatcher would run at this
+        // level is a route the session is on, and one it would refuse or only ask about is not.
+        let shell_reaches = shell.is_some_and(|required| level.allows(required));
+        // The WSL cell exists only on Windows, where a guest can be opened; the Linux build has
+        // no such target at all. A handle and a one-shot route both need `read` at least
+        // (`Target::request` turns anything below it away unconditionally), and a target whose
+        // only grants are Windows-backed needs `workspace` on top: proving a Windows mount's
+        // identity is what that level buys, and a `read` session can select no working directory
+        // from such a target at all.
+        #[cfg(windows)]
+        let wsl = (shell_reaches
+            && crate::permission::Permission::Read.is_within(level)
+            && (!self.wsl_needs_workspace
+                || crate::permission::Permission::Workspace.is_within(level)))
+        .then(|| {
+            self.wsl
+                .as_deref()
+                .map(crate::subshell::Target::distribution)
+        })
+        .flatten();
+        // Silenced rather than removed for the reason `scope_keys` gives: the rule exists for the
+        // Windows build, where a guest can be opened, and the Linux build has no target to reach.
+        #[cfg(not(windows))]
+        let _ = shell_reaches;
+        #[cfg(not(windows))]
+        let wsl = None;
+        scope_keys(wsl)
     }
 
     /// What is in context as far as Meka knows: the last measurement plus what tools have reserved
@@ -1675,6 +1777,195 @@ mod tests {
         assert!(
             markdown.contains("kept tail answer"),
             "full export must include the retained tail:\n{markdown}"
+        );
+    }
+
+    /// The active memory scopes are the session's actual targets, not the configuration's: the
+    /// host it runs on. A note scoped to it applies, and so does a portable note.
+    #[test]
+    fn a_session_names_the_targets_a_memory_scope_can_match() {
+        let cells = SessionCells::for_test(
+            crate::permission::SharedPermission::new(
+                crate::permission::Permission::Read,
+                crate::permission::EnabledPermissions::ALL,
+            ),
+            crate::workspace::cwd_for_test(),
+            crate::workspace::roots_for_test(),
+            Arc::new(crate::frontend::SilentFrontend),
+        );
+        let bare = cells.active_memory_scopes(
+            Some(crate::permission::Permission::Read),
+            crate::permission::Permission::Read,
+        );
+        #[cfg(windows)]
+        assert_eq!(bare, [crate::memory::SCOPE_WINDOWS.to_string()]);
+        #[cfg(not(windows))]
+        assert!(bare.is_empty(), "{bare:?}");
+        assert!(crate::memory::scope_applies("", &bare), "portable applies");
+    }
+
+    /// The route set answers with the doors actual dispatch reads, over every level and tool
+    /// floor: the tool gate is `crate::tools::admit_tool_call`'s own rule for a confined
+    /// built-in, and the WSL route carries `Target::request`'s unconditional read floor and its
+    /// Windows-backed workspace floor.
+    #[cfg(windows)]
+    #[test]
+    fn the_route_set_matches_what_dispatch_would_admit() {
+        use crate::permission::Permission;
+
+        let mut cells = SessionCells::for_test(
+            crate::permission::SharedPermission::new(
+                Permission::Unrestricted,
+                crate::permission::EnabledPermissions::ALL,
+            ),
+            crate::workspace::cwd_for_test(),
+            crate::workspace::roots_for_test(),
+            Arc::new(crate::frontend::SilentFrontend),
+        );
+        // A managed target whose grants are all Windows-backed, the shape whose identity proof
+        // needs `workspace`.
+        let native = tempfile::tempdir().expect("a temporary directory");
+        let wsl_scope = {
+            let wsl_target = crate::subshell::Target::from_grants(
+                "Test Linux",
+                crate::subshell::DEFAULT_RUNNER,
+                &[],
+                &[],
+                &[native.path().to_string_lossy().into_owned()],
+            )
+            .expect("a target with a Windows grant");
+            cells.set_managed_wsl(Some(Arc::new(wsl_target)), true);
+            format!("wsl:{}", "Test Linux")
+        };
+
+        for required in [
+            None,
+            Some(Permission::None),
+            Some(Permission::Read),
+            Some(Permission::Workspace),
+            Some(Permission::Unrestricted),
+        ] {
+            for level in Permission::ALL {
+                let active = cells.active_memory_scopes(required, level);
+                // The dispatcher's own gate for the confined built-in, asked unattended:
+                // approvals and a probe change what a person sees, not what a hint may
+                // promise.
+                let tool_runs = required.is_some_and(|required| {
+                    matches!(
+                        crate::tools::admit_tool_call(
+                            "shell_execute",
+                            required,
+                            level,
+                            false,
+                            false
+                        ),
+                        crate::tools::Admission::Run
+                    )
+                });
+                let wsl_runs = tool_runs
+                    && Permission::Read.is_within(level)
+                    && Permission::Workspace.is_within(level);
+                assert_eq!(
+                    crate::memory::scope_applies(&wsl_scope, &active),
+                    wsl_runs,
+                    "wsl at level {level}, tool {required:?}"
+                );
+            }
+        }
+    }
+
+    /// The managed WSL target's own gates, which are neither the allowlist nor `read` alone.
+    ///
+    /// A target made only of Windows-backed grants cannot be opened at `read`: proving a Windows
+    /// mount's identity is what `workspace` buys, and the tool refuses the request below it. The
+    /// same target made of a guest grant is reachable at `read`. And the operator's floor is read
+    /// from `shell_execute`'s live requirement: below `workspace` a raised floor closes the route,
+    /// while at `workspace` the dispatcher runs the confined built-in whatever it requires
+    /// (`Permission::allows`), so the route stays open where the call would still run.
+    #[cfg(windows)]
+    #[test]
+    fn a_wsl_target_applies_only_where_its_grants_and_floor_admit_the_session() {
+        use crate::permission::Permission;
+
+        const DISTRIBUTION: &str = "Test Linux";
+        let cells = SessionCells::for_test(
+            crate::permission::SharedPermission::new(
+                Permission::Read,
+                crate::permission::EnabledPermissions::ALL,
+            ),
+            crate::workspace::cwd_for_test(),
+            crate::workspace::roots_for_test(),
+            Arc::new(crate::frontend::SilentFrontend),
+        );
+        let scope = format!("wsl:{DISTRIBUTION}");
+        let at = |cells: &SessionCells, shell, level| cells.active_memory_scopes(shell, level);
+
+        // A target whose only grants are native Windows directories.
+        let native = tempfile::tempdir().expect("a temporary directory");
+        let windows_target = crate::subshell::Target::from_grants(
+            DISTRIBUTION,
+            crate::subshell::DEFAULT_RUNNER,
+            &[],
+            &[],
+            &[native.path().to_string_lossy().into_owned()],
+        )
+        .expect("a target with a Windows grant");
+        let mut windows_only = cells.clone();
+        windows_only.set_managed_wsl(Some(Arc::new(windows_target)), true);
+        assert!(
+            !crate::memory::scope_applies(
+                &scope,
+                &at(&windows_only, Some(Permission::Read), Permission::Read)
+            ),
+            "a Windows-backed mount needs `workspace` to be proved",
+        );
+        assert!(crate::memory::scope_applies(
+            &scope,
+            &at(&windows_only, Some(Permission::Read), Permission::Workspace)
+        ));
+        assert!(
+            !crate::memory::scope_applies(
+                &scope,
+                &at(&windows_only, Some(Permission::Workspace), Permission::Read)
+            ),
+            "an operator's floor above the session's level refuses the tool that reaches it",
+        );
+
+        // The same target with a guest grant: `read` can select it, so `read` reaches it.
+        let guest = crate::paths::WslDirectory::from_run_directory(std::path::Path::new(&format!(
+            r"\\wsl.localhost\{DISTRIBUTION}\home"
+        )))
+        .expect("a WSL path")
+        .expect("a WSL directory");
+        let guest_target = crate::subshell::Target::from_grants(
+            DISTRIBUTION,
+            crate::subshell::DEFAULT_RUNNER,
+            std::slice::from_ref(&guest),
+            &[],
+            &[],
+        )
+        .expect("a target with a guest grant");
+        let mut guest_only = cells;
+        guest_only.set_managed_wsl(Some(Arc::new(guest_target)), false);
+        assert!(crate::memory::scope_applies(
+            &scope,
+            &at(&guest_only, Some(Permission::Read), Permission::Read)
+        ));
+        assert!(
+            !crate::memory::scope_applies(&scope, &at(&guest_only, None, Permission::Read)),
+            "no tool, no route",
+        );
+        assert!(
+            crate::memory::scope_applies(
+                &scope,
+                &at(
+                    &guest_only,
+                    Some(Permission::Unrestricted),
+                    Permission::Workspace
+                )
+            ),
+            "a raised tool floor does not close the route at `workspace`, where dispatch runs \
+             the confined built-in",
         );
     }
 }

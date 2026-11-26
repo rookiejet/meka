@@ -45,6 +45,10 @@ mod landlock;
 pub(crate) mod seatbelt;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;
+#[cfg(target_os = "linux")]
+pub(crate) mod wsl_guest;
+#[cfg(windows)]
+pub(crate) mod wsl_host;
 
 #[cfg(target_os = "linux")]
 use self::bubblewrap::*;

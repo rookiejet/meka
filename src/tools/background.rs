@@ -19,11 +19,11 @@ use super::{
     util::{require_str, resolve_session_id},
 };
 use crate::{
-    background::{BackgroundTasks, TASK_INDEX_TOOL},
+    background::{BackgroundTasks, StopReport, TASK_INDEX_TOOL},
     error::Result,
     permission::Permission,
     provider::ToolDefinition,
-    store::{Store, background::TaskStatus},
+    store::{Store, background::StopReason},
 };
 
 /// How much of a finished task's output `task_list` shows. Enough to recognize what happened, not
@@ -189,35 +189,42 @@ impl Tool for TaskCancelTool {
         let session_id = resolve_session_id(&self.context.site.session_id, "task_cancel")?;
 
         if super::util::optional_bool(&input, "all", "task_cancel")?.unwrap_or(false) {
-            // Recorded before signaling, exactly as the single-id path below does and for the same
-            // reason: the work reacting to its token reports an interruption, which would otherwise
-            // land as `failed` and tell the agent its build broke rather than that it was stopped.
-            // Read from the store, so a row whose process is gone is retired as the single-id path
-            // retires it, and only what was recorded is signaled.
+            // One stop path for the whole session: each task's live owner is claimed and signaled
+            // before the request is recorded, and rows already `stopping` are included so their
+            // owners are signaled again rather than told a prior request succeeded.
             let store = self.context.store.background_store();
-            let running = store
-                .list_running_background_tasks(session_id)
-                .await?
-                .into_iter()
-                .map(|task| task.id)
-                .collect();
-            let canceled = store
-                .stop_background_tasks(running, TaskStatus::Canceled)
+            let reports = self
+                .context
+                .tasks
+                .request_stop_session(&store, session_id, StopReason::AgentRequest)
                 .await?;
-            for id in &canceled {
-                self.context.tasks.cancel(id).await;
+            let mut asked = 0;
+            let mut unconfirmed = 0;
+            for (_, report) in &reports {
+                match report {
+                    StopReport::AlreadyEnded => {}
+                    StopReport::Signaled { .. } => asked += 1,
+                    StopReport::NotSignaled { .. } => unconfirmed += 1,
+                }
             }
-            let signaled = canceled.len();
-            return Ok(ToolOutput::text(
-                if signaled == 0 {
-                    "No running background tasks to cancel.".to_string()
-                } else {
-                    format!(
-                        "Asked {signaled} background task(s) to stop. Each will report back once it has."
-                    )
-                },
-                false,
-            ));
+            if asked == 0 && unconfirmed == 0 {
+                return Ok(ToolOutput::text(
+                    "No running background tasks to cancel.".to_string(),
+                    false,
+                ));
+            }
+            let mut text = format!(
+                "Asked {asked} background task(s) to stop. Each will report back once it has."
+            );
+            if unconfirmed > 0 {
+                text.push_str(&format!(
+                    " {unconfirmed} more had no live runner in this process: their stops are \
+                     recorded, but nothing signaled them and nothing here can confirm how they \
+                     ended. Their rows stay open until their work reports or a reopen reconciles \
+                     them."
+                ));
+            }
+            return Ok(ToolOutput::text(text, false));
         }
 
         let id_prefix = require_str(&input, "id", "task_cancel")?;
@@ -247,41 +254,51 @@ impl Tool for TaskCancelTool {
                 false,
             ));
         }
-
-        // Record the cancellation before signaling: the record writes only over a `running` row, so
-        // a task that finishes in the same instant keeps its outcome and is not signaled, and one
-        // stopped is never told it succeeded.
-        let stopped = self
+        // An open `stopping` row is deliberately stopped again: its record is not proof the signal
+        // ever reached its owner, and a repeat request that reports success from that state is
+        // exactly the lie this path exists not to tell.
+        let store = self.context.store.background_store();
+        let report = self
             .context
-            .store
-            .background_store()
-            .stop_background_tasks(vec![task.id.clone()], TaskStatus::Canceled)
+            .tasks
+            .request_stop(&store, session_id, &task.id, StopReason::AgentRequest)
             .await?;
-        if stopped.is_empty() {
-            return Ok(ToolOutput::text(
-                format!(
-                    "Task {} already finished and is not running.",
-                    task.short_id()
-                ),
-                false,
-            ));
-        }
-        let signaled = self.context.tasks.cancel(&task.id).await;
-        if !signaled {
-            // The row was ours to retire but the handle was not: the task belonged to a process
-            // that is gone. Recording it is still the right move, and is what stops the agent
-            // waiting forever.
-            let short_id = task.short_id();
-            tracing::debug!(
-                "task {short_id} had no live handle in this process; recorded as canceled"
-            );
-        }
         Ok(ToolOutput::text(
-            format!(
-                "Asked task {} ({}) to stop. It will report back once it has.",
-                task.short_id(),
-                task.label
-            ),
+            match report {
+                StopReport::AlreadyEnded => {
+                    format!(
+                        "Task {} already finished and is not running.",
+                        task.short_id()
+                    )
+                }
+                StopReport::Signaled { repeated: true, .. } => format!(
+                    "Asked task {} ({}) to stop again; its signal has been re-sent. It will \
+                     report back once it has.",
+                    task.short_id(),
+                    task.label
+                ),
+                StopReport::Signaled { .. } => format!(
+                    "Asked task {} ({}) to stop. It will report back once it has.",
+                    task.short_id(),
+                    task.label
+                ),
+                StopReport::NotSignaled { recorded: true, .. } => format!(
+                    "Task {} ({}) is recorded as stopping, but no live runner for it is held in \
+                     this process: nothing signaled it, and its teardown cannot be confirmed \
+                     here. Its row stays open until its work reports or a reopen reconciles it.",
+                    task.short_id(),
+                    task.label
+                ),
+                StopReport::NotSignaled {
+                    recorded: false, ..
+                } => format!(
+                    "Task {} ({}) could not be stopped here: no live runner holds it and the \
+                     stop could not be recorded. Its row will be reconciled when the session is \
+                     reopened.",
+                    task.short_id(),
+                    task.label
+                ),
+            },
             false,
         ))
     }
@@ -312,7 +329,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::store::background::BackgroundTask;
+    use crate::store::background::{BackgroundTask, TaskStatus};
 
     async fn context() -> (TaskContext, Uuid) {
         let store = Store::for_test().await;
@@ -353,6 +370,15 @@ mod tests {
             .await
             .expect("start task");
         task
+    }
+
+    async fn cancel(tool: &TaskCancelTool, input: serde_json::Value) -> ToolOutput {
+        tool.execute(
+            input,
+            crate::tools::ToolContext::for_test(CancellationToken::new()),
+        )
+        .await
+        .expect("ok")
     }
 
     #[tokio::test]
@@ -421,31 +447,351 @@ mod tests {
         assert!(!row.contains("running"), "{row}");
     }
 
-    /// The cancellation has to be recorded even when the handle is gone, or the agent waits forever
-    /// on a task it was told it had stopped.
+    /// A missing in-process handle is not evidence the work ended. A stop that reaches no live
+    /// runner records its request and says what that means (nothing was signaled, nothing
+    /// confirmed) and leaves the row open, because a terminal outcome claimed here would be a
+    /// guess the agent would read as fact.
     #[tokio::test]
-    async fn task_cancel_records_a_terminal_outcome() {
+    async fn a_stop_with_no_live_runner_records_intent_without_claiming_an_outcome() {
         let (context, session_id) = context().await;
         let task = seed(&context, session_id, "sleep 600").await;
         let store = context.store.clone();
         let tool = TaskCancelTool { context };
 
-        let result = tool
-            .execute(
-                serde_json::json!({"id": &task.id[..8]}),
-                crate::tools::ToolContext::for_test(CancellationToken::new()),
+        let result = cancel(&tool, serde_json::json!({"id": &task.id[..8]})).await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(
+            result.text_content().contains("no live runner"),
+            "{}",
+            result.text_content()
+        );
+        assert!(
+            result
+                .text_content()
+                .contains("teardown cannot be confirmed"),
+            "{}",
+            result.text_content()
+        );
+
+        // The row records the request and nothing more: open, `stopping`, and out of every
+        // delivery pool until the work reports or a reopen reconciles it.
+        let row = store
+            .background_store()
+            .background_task_by_id(&task.id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(row.status, TaskStatus::Stopping);
+        assert!(row.finished_at.is_none(), "nothing has ended it");
+        assert!(
+            store
+                .background_store()
+                .list_undelivered_background_tasks(session_id)
+                .await
+                .expect("list")
+                .is_empty(),
+            "a request is not an outcome, so there is nothing to deliver"
+        );
+    }
+
+    /// A cancel request is not an outcome: the row has to stay open, out of the delivery pool,
+    /// until the work it signaled reports. A terminal row written at request time is the row the
+    /// work's own result can no longer correct, which is how a stopped build came to be reported
+    /// with the outcome the stop guessed rather than the teardown it got.
+    #[tokio::test]
+    async fn a_cancel_request_leaves_the_row_open_until_the_work_ends() {
+        let (context, session_id) = context().await;
+        let task = seed(&context, session_id, "sleep 600").await;
+        let store = context.store.clone();
+        let tasks = context.tasks.clone();
+        let token = CancellationToken::new();
+        assert!(
+            tasks
+                .try_reserve(task.id.clone(), session_id, token.clone(), 10)
+                .await
+        );
+        let tool = TaskCancelTool { context };
+
+        let result = cancel(&tool, serde_json::json!({"id": &task.id[..8]})).await;
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(
+            result.text_content().contains("will report back"),
+            "{}",
+            result.text_content()
+        );
+        assert!(token.is_cancelled(), "the work is told to stop");
+
+        let background = store.background_store();
+        let row = background
+            .background_task_by_id(&task.id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(
+            row.status,
+            TaskStatus::Stopping,
+            "the request is recorded, the outcome is not"
+        );
+        assert!(row.finished_at.is_none(), "nothing has ended it yet");
+        assert!(
+            background
+                .list_undelivered_background_tasks(session_id)
+                .await
+                .expect("list")
+                .is_empty(),
+            "a request must not be delivered as if it were the outcome"
+        );
+        assert_eq!(
+            background
+                .list_running_background_tasks(session_id)
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "it is still running, and shown as stopping"
+        );
+
+        // The work observes the token, reports its interruption, and that result is the outcome.
+        let (status, _reason) = tasks.outcome_end(&task.id, true).await;
+        assert_eq!(status, TaskStatus::Canceled);
+        background
+            .finish_background_task(
+                &task.id,
+                status,
+                Some("Tool execution interrupted.".to_string()),
+                None,
             )
             .await
-            .expect("ok");
-        assert!(!result.is_error, "{:?}", result.content);
+            .expect("finish");
 
-        let undelivered = store
+        let delivered = background
+            .list_undelivered_background_tasks(session_id)
+            .await
+            .expect("list");
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].status, TaskStatus::Canceled);
+        let outcome = delivered[0].outcome.as_deref().unwrap_or_default();
+        assert!(
+            outcome.contains("local teardown is confirmed"),
+            "the run's own result is what ended it: {outcome}"
+        );
+        assert!(
+            outcome.contains("Tool execution interrupted."),
+            "and what it reported is kept below the note: {outcome}"
+        );
+    }
+
+    /// Canceling in the window between reserving and spawning is the case the join handle could
+    /// not cover: there is nothing to join yet, so a wait that keyed on it returned while the work
+    /// the stop had just signaled ran on. The reservation is what the wait observes instead.
+    #[tokio::test]
+    async fn a_cancel_before_the_work_is_attached_still_ends_the_row() {
+        let (context, session_id) = context().await;
+        let task = seed(&context, session_id, "sleep 600").await;
+        let store = context.store.clone();
+        let tasks = context.tasks.clone();
+        let token = CancellationToken::new();
+        assert!(
+            tasks
+                .try_reserve(task.id.clone(), session_id, token.clone(), 10)
+                .await
+        );
+        let tool = TaskCancelTool { context };
+        cancel(&tool, serde_json::json!({"id": task.id.clone()})).await;
+        assert!(token.is_cancelled());
+
+        // The spawn the dispatch wrapper was about to make, and the wait a host would run.
+        tasks
+            .attach(
+                &task.id,
+                tokio::spawn({
+                    let (tasks, store, id) = (tasks.clone(), store.clone(), task.id.clone());
+                    async move {
+                        let (status, _reason) = tasks.outcome_end(&id, true).await;
+                        store
+                            .background_store()
+                            .finish_background_task(
+                                &id,
+                                status,
+                                Some("Tool execution interrupted.".to_string()),
+                                None,
+                            )
+                            .await
+                            .expect("finish");
+                        tasks.forget(&id).await;
+                    }
+                }),
+            )
+            .await;
+        tasks.wait_all().await;
+
+        let row = store
+            .background_store()
+            .background_task_by_id(&task.id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(row.status, TaskStatus::Canceled);
+        assert_eq!(tasks.running_count(session_id).await, 0);
+    }
+
+    /// A task that has already ended keeps the outcome its work reported: the stop loses the race
+    /// in the store, so nothing is signaled and nothing is rewritten.
+    #[tokio::test]
+    async fn canceling_a_finished_task_keeps_its_outcome() {
+        let (context, session_id) = context().await;
+        let task = seed(&context, session_id, "cargo test").await;
+        let store = context.store.clone();
+        let token = CancellationToken::new();
+        assert!(
+            context
+                .tasks
+                .try_reserve(task.id.clone(), session_id, token.clone(), 10)
+                .await
+        );
+        store
+            .background_store()
+            .finish_background_task(
+                &task.id,
+                TaskStatus::Completed,
+                Some("42 passed".to_string()),
+                None,
+            )
+            .await
+            .expect("finish");
+        let tool = TaskCancelTool { context };
+
+        let result = cancel(&tool, serde_json::json!({"id": task.id.clone()})).await;
+        assert!(!result.is_error);
+        assert!(
+            result.text_content().contains("already completed"),
+            "{}",
+            result.text_content()
+        );
+        assert!(!token.is_cancelled(), "a finished task is not signaled");
+
+        let row = store
+            .background_store()
+            .background_task_by_id(&task.id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(row.status, TaskStatus::Completed);
+        assert_eq!(row.outcome.as_deref(), Some("42 passed"));
+    }
+
+    /// A shell task stopped locally may have been routed into WSL, and the stop here cannot tell
+    /// whether it was, so the delivered outcome must not name a route the run never recorded. It
+    /// carries the hedge true of every route instead; per-route evidence speaks only where the run
+    /// recorded one.
+    #[tokio::test]
+    async fn a_cancelled_shell_task_hedges_about_a_route_it_never_recorded() {
+        let (context, session_id) = context().await;
+        let task = seed(&context, session_id, "make all").await;
+        let store = context.store.clone();
+        let tasks = context.tasks.clone();
+        let token = CancellationToken::new();
+        assert!(
+            tasks
+                .try_reserve(task.id.clone(), session_id, token.clone(), 10)
+                .await
+        );
+        let tool = TaskCancelTool { context };
+        cancel(&tool, serde_json::json!({"id": task.id.clone()})).await;
+
+        // The work observes the stop and reports; what the run saw of its own teardown is only
+        // that its result landed, never that anything it started elsewhere was stopped.
+        let (status, reason) = tasks.outcome_end(&task.id, true).await;
+        store
+            .background_store()
+            .finish_background_task_observed(
+                &task.id,
+                status,
+                Some("Tool execution interrupted.".to_string()),
+                None,
+                crate::store::background::Teardown {
+                    started: true,
+                    confirmed: false,
+                    route: crate::store::background::RouteEvidence::Unrecorded,
+                    reason,
+                },
+            )
+            .await
+            .expect("finish");
+
+        let delivered = store
             .background_store()
             .list_undelivered_background_tasks(session_id)
             .await
             .expect("list");
-        assert_eq!(undelivered.len(), 1);
-        assert_eq!(undelivered[0].status, TaskStatus::Canceled);
+        assert_eq!(delivered[0].status, TaskStatus::Canceled);
+        let outcome = delivered[0].outcome.as_deref().unwrap_or_default();
+        assert!(
+            outcome.contains("Stopped at the agent's request"),
+            "the reason rides into the outcome: {outcome}"
+        );
+        assert!(
+            outcome.contains("local teardown is unconfirmed"),
+            "{outcome}"
+        );
+        assert!(
+            outcome.contains("recorded no route for this call"),
+            "{outcome}"
+        );
+        assert!(
+            !outcome.contains("guest command"),
+            "no route was recorded, so no route may be named: {outcome}"
+        );
+        let rendered = crate::background::render_outcomes(&delivered);
+        assert!(rendered.contains("was canceled"), "{rendered}");
+        assert!(
+            rendered.contains("recorded no route"),
+            "the hedge has to survive into the delivered text: {rendered}"
+        );
+    }
+
+    /// A stop that reached no live runner still left its ask in the row; when the work reports its
+    /// own end afterwards, that result is what ended the task and the outcome keeps both facts (
+    /// its own end is recorded as it reported it, and the ask's teardown is what nothing confirmed)
+    /// rather than burying the one thing the run could not tell anyone at the time.
+    #[tokio::test]
+    async fn a_result_landing_after_an_unreached_stop_keeps_both_facts() {
+        let (context, session_id) = context().await;
+        let task = seed(&context, session_id, "sleep 600").await;
+        let store = context.store.clone();
+        let tool = TaskCancelTool { context };
+        cancel(&tool, serde_json::json!({"id": task.id.clone()})).await;
+
+        store
+            .background_store()
+            .finish_background_task(
+                &task.id,
+                TaskStatus::Failed,
+                Some("the build failed on its own".to_string()),
+                None,
+            )
+            .await
+            .expect("finish");
+
+        let delivered = store
+            .background_store()
+            .list_undelivered_background_tasks(session_id)
+            .await
+            .expect("list");
+        assert_eq!(
+            delivered[0].status,
+            TaskStatus::Failed,
+            "its own result is what ended it: nothing here ever signaled it"
+        );
+        let outcome = delivered[0].outcome.as_deref().unwrap_or_default();
+        assert!(
+            outcome.contains("A stop was requested"),
+            "the pending ask is part of the record: {outcome}"
+        );
+        assert!(
+            outcome.contains("the build failed on its own"),
+            "and its own words are kept below the note: {outcome}"
+        );
     }
 
     #[tokio::test]
@@ -520,29 +866,56 @@ mod tests {
         );
     }
 
+    /// Canceling in bulk records a request too: the row must not be `failed` (the run's own
+    /// interruption) once the work answers, and must not be `canceled` before it does.
     #[tokio::test]
     async fn task_cancel_all_records_canceled_not_failed() {
         let (context, session_id) = context().await;
         let task = seed(&context, session_id, "sleep 600").await;
-        // A live handle, so the bulk path has something to enumerate.
-        context
-            .tasks
-            .try_reserve(task.id.clone(), session_id, CancellationToken::new(), 10)
-            .await;
+        // A live handle, so the bulk path has something to signal.
+        let token = CancellationToken::new();
+        assert!(
+            context
+                .tasks
+                .try_reserve(task.id.clone(), session_id, token.clone(), 10)
+                .await
+        );
         let store = context.store.clone();
+        let tasks = context.tasks.clone();
         let tool = TaskCancelTool { context };
 
-        let result = tool
-            .execute(
-                serde_json::json!({"all": true}),
-                crate::tools::ToolContext::for_test(CancellationToken::new()),
+        let result = cancel(&tool, serde_json::json!({"all": true})).await;
+        assert!(!result.is_error);
+        assert!(token.is_cancelled());
+
+        let background = store.background_store();
+        let row = background
+            .background_task_by_id(&task.id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(row.status, TaskStatus::Stopping);
+        assert!(
+            background
+                .list_undelivered_background_tasks(session_id)
+                .await
+                .expect("list")
+                .is_empty(),
+            "a request is not delivered as the outcome"
+        );
+
+        let (status, _reason) = tasks.outcome_end(&task.id, true).await;
+        assert_eq!(status, TaskStatus::Canceled);
+        background
+            .finish_background_task(
+                &task.id,
+                status,
+                Some("Tool execution interrupted.".to_string()),
+                None,
             )
             .await
-            .expect("ok");
-        assert!(!result.is_error);
-
-        let undelivered = store
-            .background_store()
+            .expect("finish");
+        let undelivered = background
             .list_undelivered_background_tasks(session_id)
             .await
             .expect("list");

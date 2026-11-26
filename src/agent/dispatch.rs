@@ -451,6 +451,7 @@ impl Agent {
                 frontend: Arc::clone(&self.cells.frontend),
                 cancellation,
                 task_id: None,
+                teardown: None,
             })
             .await
         };
@@ -645,9 +646,43 @@ impl Agent {
             );
         }
 
+        // The start claim orders this launch against stop intent: a stop that landed between the
+        // reservation and here wins without the work ever beginning, and its requester still gets
+        // the completion record the refusal writes. A stop landing after the claim is the other
+        // order: the run below starts and is supervised against the token it is given.
+        match self
+            .cells
+            .background_tasks
+            .claim_start(&self.store.background_store(), &task.id)
+            .await
+        {
+            Ok(crate::background::StartClaim::StartWon) => {}
+            Ok(crate::background::StartClaim::StopWon) => {
+                self.cells.background_tasks.forget(&task.id).await;
+                return crate::tools::ToolOutput::text(
+                    format!(
+                        "Task {} ({}) was stopped before it started; nothing was run.",
+                        task.short_id(),
+                        task.label
+                    ),
+                    false,
+                );
+            }
+            Err(error) => {
+                // The claim could not be established, so this launch cannot be ordered against a
+                // stop. Unwound like any start that fails, rather than run unsupervised.
+                self.withdraw_background_call(&task.id).await;
+                return crate::tools::ToolOutput::text(
+                    format!("Error: could not claim the background task's start: {error}"),
+                    true,
+                );
+            }
+        }
+
         // Published for the frontend as well as passed to the tool: a delegated `fs/*` or
         // elicitation must race the token the work runs under, not the session's current turn.
         // See `crate::frontend::scope_call_cancellation`.
+        let teardown = Arc::new(crate::tools::TeardownObservation::default());
         let context = |cancellation: CancellationToken| crate::tools::ToolContext {
             session_id: Some(session_id),
             tool_call_id: Some(tool_call_id.to_string()),
@@ -655,6 +690,7 @@ impl Agent {
             frontend: Arc::clone(&self.cells.frontend),
             cancellation,
             task_id: Some(task.id.clone()),
+            teardown: Some(Arc::clone(&teardown)),
         };
         let begun = async {
             use std::ops::ControlFlow;
@@ -719,6 +755,7 @@ impl Agent {
             let tasks = self.cells.background_tasks.clone();
             let task_id = task.id.clone();
             let tool_name = task.tool.clone();
+            let teardown = Arc::clone(&teardown);
             async move {
                 let run =
                     crate::frontend::scope_call_cancellation(cancellation, running.run(context));
@@ -739,7 +776,16 @@ impl Agent {
                     }
                 };
 
-                let status = tasks.outcome_status(&task_id, output.is_error).await;
+                let (status, reason) = tasks.outcome_end(&task_id, output.is_error).await;
+                // Route evidence stays `Unrecorded` until `TeardownObservation` carries what the
+                // run recorded about where the work ran: only the tool knows its route, and a
+                // guess here would put one route's caveat on another call's outcome.
+                let teardown = crate::store::background::Teardown {
+                    started: true,
+                    confirmed: teardown.confirmed() == Some(true),
+                    route: crate::store::background::RouteEvidence::Unrecorded,
+                    reason,
+                };
                 let (outcome, scratchpad_entry, named_entry) = background_outcome(
                     &store,
                     session_id,
@@ -757,6 +803,7 @@ impl Agent {
                     outcome,
                     scratchpad_entry,
                     named_entry,
+                    teardown,
                 )
                 .await;
                 tasks.forget(&task_id).await;
@@ -965,6 +1012,7 @@ async fn record_background_outcome(
     outcome: String,
     scratchpad_entry: Option<String>,
     named_entry: Option<crate::store::background::SavedOutput>,
+    teardown: crate::store::background::Teardown,
 ) {
     let background = store.background_store();
     let finish = |outcome: String, named_entry: Option<crate::store::background::SavedOutput>| {
@@ -974,12 +1022,20 @@ async fn record_background_outcome(
             match named_entry {
                 Some(entry) => {
                     background
-                        .finish_background_task_into_entry(task_id, status, outcome, entry)
+                        .finish_background_task_into_entry_observed(
+                            task_id, status, outcome, entry, teardown,
+                        )
                         .await
                 }
                 None => {
                     background
-                        .finish_background_task(task_id, status, Some(outcome), scratchpad_entry)
+                        .finish_background_task_observed(
+                            task_id,
+                            status,
+                            Some(outcome),
+                            scratchpad_entry,
+                            teardown,
+                        )
                         .await
                 }
             }
@@ -1600,6 +1656,8 @@ mod tests {
         let registry = crate::tools::ToolRegistry::new();
         registry
             .register(Arc::new(crate::tools::shell::ExecuteCommandTool {
+                #[cfg(windows)]
+                wsl_target: None,
                 scope: crate::workspace::WriteScope::unconfined(),
                 #[cfg(windows)]
                 windows_grants: Arc::new(crate::sandbox::windows::WindowsGrants::default()),
@@ -2691,8 +2749,9 @@ mod tests {
     }
 
     /// The row is written before the start step runs, and a call stopped while it starts is an
-    /// interrupted call: the row is withdrawn and the slot freed, whatever a second press that
-    /// stopped every task recorded on it meanwhile, since nothing ran for a report to tell of.
+    /// interrupted call whatever order the race takes: the work began and reports its own
+    /// interruption, or the stop won the start claim and the record that nothing ran is what the
+    /// requester is owed. Either way nothing waits on it and no slot is held.
     #[tokio::test]
     async fn a_call_stopped_while_it_starts_is_interrupted_and_leaves_no_task() {
         let (agent, store, session_id) = agent_with_start(StartAs::Stopped).await;
@@ -2738,20 +2797,43 @@ mod tests {
         .await
         .expect("the row appears while the start step waits, and the stop ends it");
 
-        assert!(output.is_error);
-        assert_eq!(output.text_content(), "Tool execution interrupted.");
+        // Either order of the race is an interruption: the work began and its interrupted end is
+        // what the call reports, or the stop won the start claim and nothing ran at all. Neither
+        // leaves anything running or a slot held; a row that remains is the completion record of
+        // the run that never began, which the requester of the stop is owed.
+        let text = output.text_content();
         assert!(
-            store
-                .background_store()
-                .list_background_tasks(session_id)
-                .await
-                .expect("tasks")
-                .is_empty()
+            text == "Tool execution interrupted." || text.contains("was stopped before it started"),
+            "a stop in the start window ends the call as its stop, never as a success: {text}"
         );
         assert_eq!(
             agent.cells.background_tasks.running_count(session_id).await,
             0
         );
+        let rows = store
+            .background_store()
+            .list_background_tasks(session_id)
+            .await
+            .expect("tasks");
+        if let Some(row) = rows.first() {
+            assert_eq!(
+                rows.len(),
+                1,
+                "the call leaves at most its completion record"
+            );
+            assert_eq!(
+                row.status,
+                crate::store::background::TaskStatus::Interrupted
+            );
+            assert!(
+                row.outcome
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("before the work began"),
+                "{:?}",
+                row.outcome
+            );
+        }
     }
 
     /// A background run's output reaches its report through the doors a round's result takes:

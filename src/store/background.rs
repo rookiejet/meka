@@ -12,6 +12,156 @@ pub(crate) struct SavedOutput {
     pub(crate) content: String,
 }
 
+/// Where a task's work ran, which decides what ending it on this machine can prove about it. A
+/// native process tree can be killed and reaped here; a guest command leaves this machine with a
+/// launcher, whose end is not the command's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteEvidence {
+    /// Work native to this machine: what was ended here is the whole of it.
+    Local,
+    /// A command in the managed WSL guest: ending the local launcher does not end the guest's
+    /// namespace.
+    Guest,
+    /// The run recorded no route, so nothing here speaks for what the work started elsewhere.
+    Unrecorded,
+}
+
+/// Who asked for a stop. The note a stopped task's outcome opens with names it, so a stored and
+/// delivered outcome says why the work ended rather than only that it did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopReason {
+    /// The agent's own `task_cancel` call.
+    AgentRequest,
+    /// A person or client at a host surface: `/task cancel`, `meka task cancel`,
+    /// `DELETE /v1/tasks/{id}`.
+    UserRequest,
+    /// The host releasing the session or shutting down: nobody asked for this work to stop, so it
+    /// reports `interrupted`, not `canceled`.
+    HostRelease,
+}
+impl StopReason {
+    /// The status a task stopped for this reason reports.
+    pub(crate) fn status(self) -> TaskStatus {
+        match self {
+            Self::AgentRequest | Self::UserRequest => TaskStatus::Canceled,
+            Self::HostRelease => TaskStatus::Interrupted,
+        }
+    }
+
+    /// The reason a stop recorded as `status` reports, for the callers that stop work in bulk and
+    /// name the status rather than the door they stand in.
+    pub(crate) fn matching(status: TaskStatus) -> Self {
+        match status {
+            TaskStatus::Interrupted => Self::HostRelease,
+            _ => Self::UserRequest,
+        }
+    }
+}
+
+/// What the run recorded about the end of a stopped task: whether the work had begun at all,
+/// whether the task's own result landed after the stop, where the work ran, and who asked it to
+/// stop. The note [`stop_outcome`] builds is worded from these, so a stored and delivered outcome
+/// carries the evidence instead of a guess about a route the run may never have taken.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Teardown {
+    /// Whether the work had begun. A stop that won before the start has no run to report and
+    /// nothing to tear down; its note says so and drops the route clause, since nothing ran
+    /// anywhere.
+    pub(crate) started: bool,
+    /// Whether the task's own result landed after the stop. Only that says the cleanup the run
+    /// performs after observing the stop happened; a caller that only asked cannot establish it.
+    pub(crate) confirmed: bool,
+    /// Where the work ran.
+    pub(crate) route: RouteEvidence,
+    /// Who asked for the stop, when a stop is what ended the task.
+    pub(crate) reason: Option<StopReason>,
+}
+impl Teardown {
+    /// A caller that observed only its own result: a run that began and ended, with nothing
+    /// recorded about where the work ran or who stopped it.
+    pub(crate) const RECORDED: Teardown = Teardown {
+        started: true,
+        confirmed: true,
+        route: RouteEvidence::Unrecorded,
+        reason: None,
+    };
+}
+
+/// The tools whose calls can run off this machine: a shell command routed through WSL, and
+/// the WSL subshell tools. Only these get the route hedge below when the run recorded no route;
+/// for anything else there is nothing off this machine to speak for.
+fn route_capable(tool: &str) -> bool {
+    matches!(
+        tool,
+        "shell_execute"
+            | "subshell_open"
+            | "subshell_execute"
+            | "subshell_export"
+            | "subshell_close"
+    )
+}
+
+/// The route a tool's work always runs on when the run recorded none. A subshell call is guest
+/// work by definition and any other tool is local by definition; a shell command is neither, so
+/// `Unrecorded` is the honest answer for one until its run records the route it took.
+fn default_route(tool: &str) -> RouteEvidence {
+    match tool {
+        "subshell_open" | "subshell_execute" | "subshell_export" | "subshell_close" => {
+            RouteEvidence::Guest
+        }
+        "shell_execute" => RouteEvidence::Unrecorded,
+        _ => RouteEvidence::Local,
+    }
+}
+
+/// The sentence a stopped task's outcome opens with: who asked, what the stop itself established,
+/// and the one thing stopping on this machine cannot establish for work that runs elsewhere.
+///
+/// The route clause is per route evidence, never keyed on the tool alone: a WSL command must not
+/// inherit a caveat meant for another route. A run that recorded no route and ran on a tool that
+/// can route gets the neutral sentence that says exactly that, rather than a claim about any one
+/// route.
+fn stop_outcome(tool: &str, teardown: Teardown, outcome: Option<String>) -> String {
+    let mut note = match teardown.reason {
+        Some(StopReason::AgentRequest) => "Stopped at the agent's request",
+        Some(StopReason::UserRequest) => "Stopped on request",
+        Some(StopReason::HostRelease) => "Stopped when the host released the session",
+        None => "A stop was requested",
+    }
+    .to_string();
+    if !teardown.started {
+        note.push_str(" before the work began: nothing ran, so there is nothing to tear down.");
+    } else if teardown.confirmed {
+        note.push_str("; the task's own work ended afterwards, so local teardown is confirmed.");
+    } else {
+        note.push_str(", but nothing reported after it: local teardown is unconfirmed.");
+    }
+    if teardown.started {
+        match teardown.route {
+            RouteEvidence::Local => {}
+            RouteEvidence::Guest => note.push_str(
+                "\nThe guest command's state is unknown: stopping the local launcher does not stop \
+                 what it started.",
+            ),
+            RouteEvidence::Unrecorded => match default_route(tool) {
+                RouteEvidence::Guest => note.push_str(
+                    "\nThe guest command's state is unknown: stopping the local launcher does not \
+                     stop what it started.",
+                ),
+                _ if route_capable(tool) => note.push_str(
+                    "\nThe run recorded no route for this call, so what it started beyond this \
+                     process is unknown.",
+                ),
+                _ => {}
+            },
+        }
+    }
+    match outcome {
+        Some(outcome) if !outcome.trim().is_empty() => format!("{note}\n\n{outcome}"),
+        _ => note,
+    }
+}
+
 /// Background work's slice of the session database, handed out by
 /// [`crate::store::Store::background_store`].
 #[derive(Clone)]
@@ -55,9 +205,15 @@ impl BackgroundStore {
 
     /// Record a terminal outcome.
     ///
-    /// Guarded on `status = 'running'` so a task that was canceled, or swept to `interrupted`,
-    /// cannot be overwritten by its own work finishing a moment later. The first terminal write
-    /// wins, which is what keeps a canceled task from reporting success.
+    /// Guarded on the task not having ended yet, so one swept to `interrupted` cannot be
+    /// overwritten by its own work finishing a moment later. A `stopping` row is still open: a
+    /// stop request moved it there without deciding how it ended, and this write is the one that
+    /// does, which is why the first *terminal* write still wins and a canceled task cannot report
+    /// success.
+    ///
+    /// This form is the run's own result landing, with nothing recorded about where the work ran
+    /// or who stopped it; a caller holding that evidence takes
+    /// [`Self::finish_background_task_observed`].
     pub(crate) async fn finish_background_task(
         &self,
         id: &str,
@@ -65,15 +221,58 @@ impl BackgroundStore {
         outcome: Option<String>,
         scratchpad_entry: Option<String>,
     ) -> crate::error::Result<()> {
+        self.finish_background_task_observed(
+            id,
+            status,
+            outcome,
+            scratchpad_entry,
+            Teardown::RECORDED,
+        )
+        .await
+    }
+
+    /// [`Self::finish_background_task`] with what the run saw of its own stop. A caller that
+    /// watched a cancellation request cannot assume confirmation: only an observation can say
+    /// the work's processes ended. The evidence rides into the stored outcome, so what is
+    /// delivered says who asked for the stop and what ending it here could and could not prove.
+    pub(crate) async fn finish_background_task_observed(
+        &self,
+        id: &str,
+        status: TaskStatus,
+        outcome: Option<String>,
+        scratchpad_entry: Option<String>,
+        teardown: Teardown,
+    ) -> crate::error::Result<()> {
         let id = id.to_string();
+        let stopped = matches!(status, TaskStatus::Canceled | TaskStatus::Interrupted);
         let status = status.name().to_string();
         let finished_at = chrono::Utc::now().to_rfc3339();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
+                // Read first only to word a stop: what the row ends as is decided by the one
+                // guarded write below, so a row that moves between the two reads changes nothing,
+                // and a write that fails leaves no half-done work behind. A run reporting its own
+                // end on a row a stop was recorded against keeps the ask in the outcome too: the
+                // record is half of what the row carries, and dropping it would hide the one thing
+                // nobody could tell the agent at the time.
+                let open = connection
+                    .query_row(
+                        "SELECT tool, status FROM background_tasks \
+                         WHERE id = ?1 AND status IN ('running', 'stopping')",
+                        [id.as_str()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()?;
+                let outcome = match open {
+                    Some((tool, recorded)) if stopped || recorded == "stopping" => {
+                        Some(stop_outcome(&tool, teardown, outcome))
+                    }
+                    _ => outcome,
+                };
                 connection.execute(
                     "UPDATE background_tasks \
                      SET status = ?2, outcome = ?3, scratchpad_entry = ?4, finished_at = ?5 \
-                     WHERE id = ?1 AND status = 'running'",
+                     WHERE id = ?1 AND status IN ('running', 'stopping')",
                     rusqlite::params![id, status, outcome, scratchpad_entry, finished_at],
                 )?;
                 Ok(())
@@ -86,8 +285,13 @@ impl BackgroundStore {
 
     /// Record each of `ids` still running as stopped with `status`, in one transaction, and answer
     /// the ids whose row moved: the ones to signal, since a task whose own outcome landed first
-    /// keeps it. Recorded ahead of the signal, because the work reacting to it reports an
-    /// interruption, which would otherwise land as `failed` and tell the agent its build broke.
+    /// keeps it.
+    ///
+    /// For a test that simulates a terminal stop recorded by another owner: the row is terminal
+    /// before the work ends, so its own result is never recorded. Production paths record a
+    /// request with [`Self::request_stop_background_tasks`] and let the work's result end the row,
+    /// because a caller cannot observe a teardown it did not perform.
+    #[cfg(test)]
     pub(crate) async fn stop_background_tasks(
         &self,
         ids: Vec<String>,
@@ -96,24 +300,50 @@ impl BackgroundStore {
         if ids.is_empty() {
             return Ok(ids);
         }
+        let stopped_word = matches!(status, TaskStatus::Canceled | TaskStatus::Interrupted);
+        let reason = stopped_word.then(|| StopReason::matching(status));
         let status = status.name().to_string();
         let finished_at = chrono::Utc::now().to_rfc3339();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
-                let transaction = connection.transaction()?;
-                let mut canceled = Vec::with_capacity(ids.len());
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let mut stopped = Vec::with_capacity(ids.len());
                 for id in ids {
+                    let open = transaction
+                        .query_row(
+                            "SELECT tool FROM background_tasks \
+                             WHERE id = ?1 AND status = 'running'",
+                            [id.as_str()],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?;
+                    let Some(tool) = open else {
+                        continue;
+                    };
+                    let outcome = stopped_word.then(|| {
+                        stop_outcome(
+                            &tool,
+                            Teardown {
+                                started: true,
+                                confirmed: false,
+                                route: RouteEvidence::Unrecorded,
+                                reason,
+                            },
+                            None,
+                        )
+                    });
                     let moved = transaction.execute(
-                        "UPDATE background_tasks SET status = ?3, finished_at = ?2 \
+                        "UPDATE background_tasks SET status = ?3, outcome = ?4, finished_at = ?2 \
                          WHERE id = ?1 AND status = 'running'",
-                        rusqlite::params![id, finished_at, status],
+                        rusqlite::params![id, finished_at, status, outcome],
                     )?;
                     if moved > 0 {
-                        canceled.push(id);
+                        stopped.push(id);
                     }
                 }
                 transaction.commit()?;
-                Ok(canceled)
+                Ok(stopped)
             })
             .await
             .map_err(|error| {
@@ -121,27 +351,115 @@ impl BackgroundStore {
             })
     }
 
+    /// Record that `ids` were asked to stop, without deciding how they ended: each row becomes
+    /// `stopping`, stays out of every delivery pool, and the work's own result ends it.
+    ///
+    /// This is the durable acceptance of a stop, recorded by the stop service *after* the live
+    /// claim has signaled the owner: a request whose future dies before this write has still
+    /// stopped its task, and a row left `stopping` here is what a retry re-signals against. A
+    /// task whose outcome landed first is left alone, and answers the ids whose row moved: those
+    /// are the requests this write accepted.
+    pub(crate) async fn request_stop_background_tasks(
+        &self,
+        ids: Vec<String>,
+    ) -> crate::error::Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        let stopping = TaskStatus::Stopping.name().to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let mut requested = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let moved = transaction.execute(
+                        "UPDATE background_tasks SET status = ?2 \
+                         WHERE id = ?1 AND status = 'running'",
+                        rusqlite::params![id, stopping],
+                    )?;
+                    if moved > 0 {
+                        requested.push(id);
+                    }
+                }
+                transaction.commit()?;
+                Ok(requested)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to request a background task stop: {error}"))
+            })
+    }
+
+    /// Claim the start of `id` against recorded stop intent, as the durable half of
+    /// [`crate::background::BackgroundTasks::claim_start`].
+    ///
+    /// The guarded write is the serialization point against
+    /// [`Self::request_stop_background_tasks`]: both only move a `running` row, so exactly one of
+    /// them observes it as `running` and the loser sees what the winner wrote. `false` means a
+    /// stop intent or a terminal outcome already owns the row (or there is no row), and the work
+    /// must not start.
+    pub(crate) async fn claim_task_start(&self, id: &str) -> crate::error::Result<bool> {
+        let id = id.to_string();
+        let running = TaskStatus::Running.name().to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let moved = connection.execute(
+                    "UPDATE background_tasks SET status = ?2 \
+                     WHERE id = ?1 AND status = ?2",
+                    rusqlite::params![id, running],
+                )?;
+                Ok(moved > 0)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to claim a background task start: {error}"))
+            })
+    }
+
     /// [`Self::finish_background_task`] for a call that named a scratchpad entry: the entry is
-    /// saved with the outcome, in one transaction and only while the row is still running, so a
-    /// task stopped before its work came back has no say over an entry the model named.
-    pub(crate) async fn finish_background_task_into_entry(
+    /// saved with the outcome, in one transaction and only while the row is still open, so a task
+    /// stopped before its work came back has no say over an entry the model named.
+    pub(crate) async fn finish_background_task_into_entry_observed(
         &self,
         id: &str,
         status: TaskStatus,
         outcome: String,
         entry: SavedOutput,
+        teardown: Teardown,
     ) -> crate::error::Result<()> {
         let id = id.to_string();
+        let stopped = matches!(status, TaskStatus::Canceled | TaskStatus::Interrupted);
         let status = status.name().to_string();
         let finished_at = chrono::Utc::now().to_rfc3339();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let transaction = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let open = transaction
+                    .query_row(
+                        "SELECT tool, status FROM background_tasks \
+                         WHERE id = ?1 AND status IN ('running', 'stopping')",
+                        [id.as_str()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()?;
+                let Some((tool, recorded)) = open else {
+                    transaction.commit()?;
+                    return Ok(());
+                };
+                // A run reporting its own end on a row a stop was recorded against keeps the ask
+                // in the outcome, for the same reason
+                // [`Self::finish_background_task_observed`] does.
+                let outcome = if stopped || recorded == "stopping" {
+                    stop_outcome(&tool, teardown, Some(outcome))
+                } else {
+                    outcome
+                };
                 let finished = transaction.execute(
                     "UPDATE background_tasks \
                      SET status = ?2, outcome = ?3, scratchpad_entry = NULL, finished_at = ?4 \
-                     WHERE id = ?1 AND status = 'running'",
+                     WHERE id = ?1 AND status IN ('running', 'stopping')",
                     rusqlite::params![id, status, outcome, finished_at],
                 )?;
                 if finished > 0 {
@@ -180,6 +498,10 @@ impl BackgroundStore {
 
     /// A session's tasks still running, oldest first. Backs the `[Background]` index and the Ctrl+C
     /// survivor line.
+    ///
+    /// A task with a stop requested is still running until its work answers, so it belongs here:
+    /// the model should see that it is on its way out, not read the task as gone before the
+    /// teardown has happened.
     pub(crate) async fn list_running_background_tasks(
         &self,
         session_id: Uuid,
@@ -187,7 +509,7 @@ impl BackgroundStore {
         self.query_background_tasks(
             "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
              started_at, finished_at, announced_at, delivered_at, subagent_id FROM background_tasks \
-             WHERE session_id = ?1 AND status = 'running' ORDER BY started_at ASC",
+             WHERE session_id = ?1 AND status IN ('running', 'stopping') ORDER BY started_at ASC",
             vec![session_id.to_string()],
         )
         .await
@@ -195,6 +517,9 @@ impl BackgroundStore {
 
     /// A session's finished-but-unreported tasks, oldest first. The delivery poll's query; served
     /// by `idx_background_tasks_session_id_status`.
+    ///
+    /// A `stopping` row is excluded: a stop request is not an outcome, and delivering one would
+    /// tell the agent the work had ended before anything established that it had.
     ///
     /// This and [`Self::mark_background_tasks_delivered`] are two statements, not one transaction,
     /// so two processes that both list before either marks would each render the same outcome. That
@@ -209,8 +534,8 @@ impl BackgroundStore {
         self.query_background_tasks(
             "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
              started_at, finished_at, announced_at, delivered_at, subagent_id FROM background_tasks \
-             WHERE session_id = ?1 AND status != 'running' AND delivered_at IS NULL \
-             ORDER BY finished_at ASC",
+             WHERE session_id = ?1 AND status NOT IN ('running', 'stopping') \
+             AND delivered_at IS NULL ORDER BY finished_at ASC",
             vec![session_id.to_string()],
         )
         .await
@@ -309,8 +634,8 @@ impl BackgroundStore {
         self.query_background_tasks(
             "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
              started_at, finished_at, announced_at, delivered_at, subagent_id FROM background_tasks \
-             WHERE session_id = ?1 AND status != 'running' AND announced_at IS NULL \
-             AND delivered_at IS NULL ORDER BY finished_at ASC",
+             WHERE session_id = ?1 AND status NOT IN ('running', 'stopping') \
+             AND announced_at IS NULL AND delivered_at IS NULL ORDER BY finished_at ASC",
             vec![session_id.to_string()],
         )
         .await
@@ -351,34 +676,93 @@ impl BackgroundStore {
             })
     }
 
-    /// Retire every `running` task in this session as [`TaskStatus::Interrupted`], returning how
-    /// many were swept.
+    /// Retire every task in this session that a dead process left `running` or `stopping`, as
+    /// [`TaskStatus::Interrupted`], returning how many were swept, sparing only the rows named in
+    /// `still_live`.
     ///
     /// Called when a process takes ownership of a session. The session lock
-    /// ([`crate::store::Store::lock_session`]) is the lease: holding it means no other
-    /// process can still be running this session's tasks, so any row that still says `running`
-    /// belongs to a process that is gone. Without this a task in flight at shutdown would leave the
-    /// agent waiting on a report that can never arrive, having very likely already promised one.
-    pub(crate) async fn sweep_interrupted_background_tasks(
+    /// ([`crate::store::Store::lock_session`]) is the lease: a release holds it until its work has
+    /// settled, so the lock can only be taken once every previous owner has finished or died, and
+    /// a row that still says `running` with no live handle behind it belongs to a process that is
+    /// gone. Without this a task in flight at shutdown would leave the agent waiting on a report
+    /// that can never arrive, having very likely already promised one.
+    ///
+    /// A `stopping` row is a stop somebody asked for and no result answered, so its outcome says
+    /// the teardown is unconfirmed: the agent asked for the work to end and is owed the fact that
+    /// nothing established that it did. A swept `running` row keeps no outcome of its own: nothing
+    /// reported one, and `interrupted` is the whole of what is known.
+    pub(crate) async fn sweep_interrupted_background_tasks_except(
         &self,
         session_id: Uuid,
+        still_live: &[String],
     ) -> crate::error::Result<usize> {
         let session_id = session_id.to_string();
+        let still_live = still_live.to_vec();
         let status = TaskStatus::Interrupted.name().to_string();
         let finished_at = chrono::Utc::now().to_rfc3339();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
-                let swept = connection.execute(
-                    "UPDATE background_tasks SET status = ?2, finished_at = ?3 \
-                     WHERE session_id = ?1 AND status = 'running'",
-                    rusqlite::params![session_id, status, finished_at],
-                )?;
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let open: Vec<(String, String, String)> = {
+                    let mut statement = transaction.prepare(
+                        "SELECT id, tool, status FROM background_tasks \
+                         WHERE session_id = ?1 AND status IN ('running', 'stopping')",
+                    )?;
+                    statement
+                        .query_map([session_id.as_str()], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                let mut swept = 0;
+                for (id, tool, was) in &open {
+                    if still_live.contains(id) {
+                        continue;
+                    }
+                    let outcome = (was == TaskStatus::Stopping.name()).then(|| {
+                        stop_outcome(
+                            tool,
+                            Teardown {
+                                started: true,
+                                confirmed: false,
+                                route: RouteEvidence::Unrecorded,
+                                reason: None,
+                            },
+                            None,
+                        )
+                    });
+                    swept += transaction.execute(
+                        "UPDATE background_tasks SET status = ?2, outcome = ?3, finished_at = ?4 \
+                         WHERE id = ?1 AND status IN ('running', 'stopping')",
+                        rusqlite::params![id, status, outcome, finished_at],
+                    )?;
+                }
+                transaction.commit()?;
                 Ok(swept)
             })
             .await
             .map_err(|error| {
                 MekaError::Database(format!("failed to sweep background tasks: {error}"))
             })
+    }
+
+    /// [`Self::sweep_interrupted_background_tasks_except`] sparing nothing: the form for a caller
+    /// that holds no live work of this session in its process and so can retire every open row the
+    /// lease behind the sweep proves dead.
+    // Exercised only by tests today: every live door may hold released work and spares it. Kept at
+    // this arity for `agent/turn`'s sweep test, which simulates a later process sweeping.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn sweep_interrupted_background_tasks(
+        &self,
+        session_id: Uuid,
+    ) -> crate::error::Result<usize> {
+        self.sweep_interrupted_background_tasks_except(session_id, &[])
+            .await
     }
 
     /// One task by its full id, whatever session it is in, or `None` when no task has it.
@@ -598,11 +982,16 @@ impl BackgroundTaskRow {
 }
 /// How a task ended, or that it hasn't.
 ///
-/// The four terminal states deliver identically and differ only in their rendered header. Keeping
-/// them distinct is what lets the agent tell "your build failed" from "your build never ran".
+/// The terminal states deliver identically and differ only in their rendered header. Keeping them
+/// distinct is what lets the agent tell "your build failed" from "your build never ran". The two
+/// open states are told apart for the same reason: one says the work is still going, the other
+/// that it has been asked to stop and has not said yet how it went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskStatus {
     Running,
+    /// A stop was asked for and the work has not reported since. Open: the request is not an
+    /// outcome, and a row in this state is never delivered.
+    Stopping,
     Completed,
     /// The tool returned an error, or panicked.
     Failed,
@@ -614,8 +1003,9 @@ pub(crate) enum TaskStatus {
 }
 impl TaskStatus {
     /// Every status, in lifecycle order.
-    pub(crate) const ALL: [TaskStatus; 5] = [
+    pub(crate) const ALL: [TaskStatus; 6] = [
         Self::Running,
+        Self::Stopping,
         Self::Completed,
         Self::Failed,
         Self::Canceled,
@@ -634,13 +1024,14 @@ impl TaskStatus {
     /// the task. The agent asked to be told about the first two and cannot infer the third, and
     /// there may be no human about to type.
     pub(crate) fn wakes_a_host(self) -> bool {
-        !matches!(self, Self::Canceled)
+        self.is_terminal() && !matches!(self, Self::Canceled)
     }
 
     /// The one spelling of this status: the `status` column, the HTTP view and `task_list`.
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Stopping => "stopping",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Canceled => "canceled",
@@ -659,13 +1050,14 @@ impl TaskStatus {
 
     /// Whether the task has ended, whichever way.
     pub(crate) fn is_terminal(self) -> bool {
-        !matches!(self, Self::Running)
+        !matches!(self, Self::Running | Self::Stopping)
     }
 
     /// The header word the delivered turn leads with.
     pub(crate) fn headline(self) -> &'static str {
         match self {
             Self::Running => "is still running",
+            Self::Stopping => "is stopping",
             Self::Completed => "finished",
             Self::Failed => "failed",
             Self::Canceled => "was canceled",
@@ -1279,7 +1671,7 @@ mod tests {
 
         let swept = store
             .background_store()
-            .sweep_interrupted_background_tasks(session_id)
+            .sweep_interrupted_background_tasks_except(session_id, &[])
             .await
             .expect("sweep");
         assert_eq!(swept, 1);
@@ -1300,7 +1692,7 @@ mod tests {
         assert_eq!(
             store
                 .background_store()
-                .sweep_interrupted_background_tasks(session_id)
+                .sweep_interrupted_background_tasks_except(session_id, &[])
                 .await
                 .expect("second sweep"),
             0
@@ -1323,7 +1715,7 @@ mod tests {
         // A fresh process takes the session: it holds no handles, and the sweep is all it knows.
         store
             .background_store()
-            .sweep_interrupted_background_tasks(session_id)
+            .sweep_interrupted_background_tasks_except(session_id, &[])
             .await
             .expect("sweep");
 
@@ -1340,7 +1732,9 @@ mod tests {
     }
 
     /// A canceled task whose work happens to finish a moment later must not overwrite the
-    /// cancellation and report success.
+    /// cancellation and report success. The cancellation's own word says what was and was not
+    /// established: the work ended, so its teardown is behind it, and a routed command's remote
+    /// side is not something stopping here can speak for.
     #[tokio::test]
     async fn the_first_terminal_write_wins() {
         let store = Store::for_test().await;
@@ -1380,7 +1774,351 @@ mod tests {
             undelivered[0].status,
             crate::store::background::TaskStatus::Canceled
         );
-        assert!(undelivered[0].outcome.is_none());
+        let outcome = undelivered[0].outcome.as_deref().unwrap_or_default();
+        assert!(outcome.contains("local teardown is confirmed"), "{outcome}");
+        assert!(
+            !outcome.contains("finished anyway"),
+            "the late result must not be carried into the cancellation: {outcome}"
+        );
+    }
+
+    /// A stop request is a state of its own, not an outcome: the row leaves the running pools'
+    /// delivery side but stays open, so the work's own result is what the agent is told. Writing
+    /// `canceled` here would make that result unwritable, which is how the reported outcome came to
+    /// be the stop's guess at the teardown rather than the teardown.
+    #[tokio::test]
+    async fn a_stop_request_is_not_an_outcome() {
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        let task = task_fixture(&store, session_id, "sleep 600").await;
+
+        let requested = store
+            .background_store()
+            .request_stop_background_tasks(vec![task.id.clone()])
+            .await
+            .expect("request");
+        assert_eq!(requested, vec![task.id.clone()]);
+
+        let row = store
+            .background_store()
+            .background_task_by_id(&task.id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(row.status, TaskStatus::Stopping);
+        assert!(row.finished_at.is_none(), "nothing has ended it");
+        assert!(
+            store
+                .background_store()
+                .list_undelivered_background_tasks(session_id)
+                .await
+                .expect("list undelivered")
+                .is_empty(),
+            "a request must never be delivered as the outcome"
+        );
+        assert!(
+            store
+                .background_store()
+                .list_unannounced_background_tasks(session_id)
+                .await
+                .expect("list unannounced")
+                .is_empty(),
+            "and never announced as one either"
+        );
+        assert_eq!(
+            store
+                .background_store()
+                .list_running_background_tasks(session_id)
+                .await
+                .expect("list running")
+                .iter()
+                .map(|task| task.status)
+                .collect::<Vec<_>>(),
+            vec![TaskStatus::Stopping],
+            "it is still running, and says it is stopping"
+        );
+
+        // A second request has nothing left to move, and the work's result still ends the row.
+        assert!(
+            store
+                .background_store()
+                .request_stop_background_tasks(vec![task.id.clone()])
+                .await
+                .expect("request again")
+                .is_empty()
+        );
+        store
+            .background_store()
+            .finish_background_task(
+                &task.id,
+                TaskStatus::Canceled,
+                Some("Tool execution interrupted.".to_string()),
+                None,
+            )
+            .await
+            .expect("finish");
+        let delivered = store
+            .background_store()
+            .list_undelivered_background_tasks(session_id)
+            .await
+            .expect("list undelivered");
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].status, TaskStatus::Canceled);
+        let outcome = delivered[0].outcome.as_deref().unwrap_or_default();
+        assert!(outcome.contains("local teardown is confirmed"), "{outcome}");
+        assert!(
+            outcome.contains("Tool execution interrupted."),
+            "the work's own report is kept: {outcome}"
+        );
+    }
+
+    /// An outcome nothing confirmed says which side could not be confirmed: a WSL command's
+    /// guest state, or what an unrecorded run started beyond this process. A call that never runs
+    /// code beyond this process has no route to hedge about, and a routed call whose route was
+    /// never recorded must not borrow another route's caveat.
+    #[tokio::test]
+    async fn an_unconfirmed_stop_carries_the_evidence_for_its_route() {
+        async fn unconfirmed_outcome(
+            store: &Store,
+            session_id: Uuid,
+            tool: &'static str,
+            route: RouteEvidence,
+        ) -> String {
+            let task = BackgroundTask {
+                id: Uuid::new_v4().to_string(),
+                session_id,
+                tool: tool.to_string(),
+                label: "make".to_string(),
+                status: TaskStatus::Running,
+                outcome: None,
+                scratchpad_entry: None,
+                started_at: chrono::Utc::now(),
+                finished_at: None,
+                announced_at: None,
+                delivered_at: None,
+                subagent_id: None,
+            };
+            store
+                .background_store()
+                .start_background_task(&task)
+                .await
+                .expect("record");
+            store
+                .background_store()
+                .finish_background_task_observed(
+                    &task.id,
+                    TaskStatus::Canceled,
+                    None,
+                    None,
+                    Teardown {
+                        started: true,
+                        confirmed: false,
+                        route,
+                        reason: Some(StopReason::UserRequest),
+                    },
+                )
+                .await
+                .expect("finish");
+            store
+                .background_store()
+                .list_undelivered_background_tasks(session_id)
+                .await
+                .expect("list undelivered")
+                .into_iter()
+                .find(|row| row.id == task.id)
+                .expect("delivered")
+                .outcome
+                .unwrap_or_default()
+        }
+
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+
+        // A WSL command's hedge names the side it cannot reach: the guest.
+        let guest =
+            unconfirmed_outcome(&store, session_id, "shell_execute", RouteEvidence::Guest).await;
+        assert!(
+            guest.contains("guest command's state is unknown"),
+            "{guest}"
+        );
+
+        // A routed command whose route was never recorded can borrow no caveat; the hedge
+        // says what is actually unknown.
+        let unrecorded = unconfirmed_outcome(
+            &store,
+            session_id,
+            "shell_execute",
+            RouteEvidence::Unrecorded,
+        )
+        .await;
+        assert!(
+            unrecorded.contains("The run recorded no route for this call"),
+            "{unrecorded}"
+        );
+        assert!(!unrecorded.contains("the guest command"), "{unrecorded}");
+
+        let local =
+            unconfirmed_outcome(&store, session_id, "agent_spawn", RouteEvidence::Unrecorded).await;
+        assert!(local.contains("local teardown is unconfirmed"), "{local}");
+        assert!(!local.contains("recorded no route"), "{local}");
+    }
+
+    /// A process that died between recording a stop and hearing the result leaves the row
+    /// `stopping`. The sweep is what ends it, and it has to end it as the stop it was: unconfirmed,
+    /// hedged for a tool that runs code beyond this process.
+    #[tokio::test]
+    async fn a_stop_left_by_a_dead_process_is_swept_as_an_unconfirmed_stop() {
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        let task = task_fixture(&store, session_id, "sleep 600").await;
+        store
+            .background_store()
+            .request_stop_background_tasks(vec![task.id.clone()])
+            .await
+            .expect("request");
+
+        assert_eq!(
+            store
+                .background_store()
+                .sweep_interrupted_background_tasks_except(session_id, &[])
+                .await
+                .expect("sweep"),
+            1
+        );
+        let delivered = store
+            .background_store()
+            .list_undelivered_background_tasks(session_id)
+            .await
+            .expect("list undelivered");
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(
+            delivered[0].status,
+            crate::store::background::TaskStatus::Interrupted
+        );
+        let outcome = delivered[0].outcome.as_deref().unwrap_or_default();
+        assert!(
+            outcome.contains("local teardown is unconfirmed"),
+            "the stop was never answered by the work: {outcome}"
+        );
+        assert!(
+            outcome.contains("The run recorded no route for this call"),
+            "what a routed command started beyond this process is the unknown part: {outcome}"
+        );
+    }
+
+    /// The sweep ends rows whose owners are gone and spares rows whose owners are live in this
+    /// process: a row with a live handle behind it has an owner that can still report, and ending
+    /// it would race that owner's own result.
+    #[tokio::test]
+    async fn the_sweep_spares_tasks_whose_owners_are_still_live() {
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        let owned = task_fixture(&store, session_id, "sleep 600").await;
+        let orphaned = task_fixture(&store, session_id, "sleep 601").await;
+
+        assert_eq!(
+            store
+                .background_store()
+                .sweep_interrupted_background_tasks_except(
+                    session_id,
+                    std::slice::from_ref(&owned.id)
+                )
+                .await
+                .expect("sweep"),
+            1,
+            "only the row whose owner is gone is retired"
+        );
+        assert!(
+            store
+                .background_store()
+                .background_task_by_id(&owned.id)
+                .await
+                .expect("load")
+                .expect("row")
+                .finished_at
+                .is_none(),
+            "the live owner's row is untouched, and it still reports in its own time"
+        );
+        assert_eq!(
+            store
+                .background_store()
+                .background_task_by_id(&orphaned.id)
+                .await
+                .expect("load")
+                .expect("row")
+                .status,
+            TaskStatus::Interrupted
+        );
+
+        // Once the owner is gone too, the sweep retires the rest.
+        assert_eq!(
+            store
+                .background_store()
+                .sweep_interrupted_background_tasks_except(session_id, &[])
+                .await
+                .expect("second sweep"),
+            1
+        );
+    }
+
+    /// A start claim only wins against a row nothing has stopped: a stop that recorded its intent
+    /// first owns the row, and a row that already ended keeps the end it has.
+    #[tokio::test]
+    async fn a_start_claim_yields_to_a_stop_that_recorded_first() {
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        let task = task_fixture(&store, session_id, "sleep 600").await;
+
+        assert!(
+            store
+                .background_store()
+                .claim_task_start(&task.id)
+                .await
+                .expect("first claim"),
+            "an open row is the start's to claim"
+        );
+        store
+            .background_store()
+            .request_stop_background_tasks(vec![task.id.clone()])
+            .await
+            .expect("request");
+        assert!(
+            !store
+                .background_store()
+                .claim_task_start(&task.id)
+                .await
+                .expect("claim after the stop"),
+            "a recorded stop intent owns the row: the work must not start"
+        );
+
+        store
+            .background_store()
+            .finish_background_task(&task.id, TaskStatus::Canceled, None, None)
+            .await
+            .expect("finish");
+        assert!(
+            !store
+                .background_store()
+                .claim_task_start(&task.id)
+                .await
+                .expect("claim after the end"),
+            "a natural terminal write that already won stays"
+        );
     }
 
     #[tokio::test]

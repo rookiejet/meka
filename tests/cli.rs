@@ -74,6 +74,260 @@ fn help_flag_lists_subcommands() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires Bubblewrap with fd binds, Landlock, Python 3 and an ext4 TMPDIR on the distro root mount"]
+async fn guest_subshell_command_is_confined_to_its_lease() {
+    use std::{process::Stdio, time::Duration};
+
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let install = Install::new();
+    let workspace = install.work_dir();
+    let reference = install.root().join("reference");
+    std::fs::create_dir(&reference).unwrap();
+    std::fs::write(reference.join("allowed"), "reference\n").unwrap();
+    std::fs::write(install.root().join("private"), "private\n").unwrap();
+    std::os::unix::fs::symlink(install.root().join("private"), workspace.join("outside")).unwrap();
+    let socket = std::os::unix::net::UnixListener::bind(workspace.join("socket")).unwrap();
+    for (access, script, status) in [
+        (
+            "read",
+            "set -eu; if touch wrote || touch /references/0/wrote; then exit 99; fi; \
+             test ! -e outside; test \"$(cat /references/0/allowed)\" = reference; \
+             test ! -e /init; test ! -e /mnt/c; test -z \"${MEKA_TEST_MARKER:-}\"; \
+             touch /tmp/probe; exit 37",
+            Some(37),
+        ),
+        (
+            "workspace",
+            concat!(
+                "set -eu; touch wrote; if touch /references/0/wrote; then exit 99; fi\n",
+                "python3 - <<'PYTHON'\n",
+                "import ctypes, errno, socket\n",
+                "for open_socket in (socket.socketpair, lambda: socket.socket(socket.AF_UNIX)):\n",
+                "    try:\n",
+                "        open_socket()\n",
+                "    except PermissionError as error:\n",
+                "        assert error.errno == errno.EPERM\n",
+                "    else:\n",
+                "        raise AssertionError('guest socket reachable')\n",
+                "libc = ctypes.CDLL(None, use_errno=True)\n",
+                "assert libc.prctl(1, 0, 0, 0, 0) == -1 and ctypes.get_errno() == errno.EPERM\n",
+                "PYTHON\n",
+                "setsid /bin/sh -c 'touch ready; sleep 2; touch survived' &\n",
+                "while [ ! -e ready ]; do sleep .01; done; echo ready; while :; do sleep 1; done",
+            ),
+            None,
+        ),
+        (
+            "workspace",
+            "setsid /bin/sh -c 'touch timed; sleep 2; touch survived' & \
+             while :; do sleep 1; done",
+            Some(124),
+        ),
+    ] {
+        let mut command = tokio::process::Command::from(install.meka(&["subshell-runner"]));
+        let mut child = command
+            .env("MEKA_TEST_MARKER", "not for the command")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut lease = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut hello = String::new();
+        tokio::time::timeout(Duration::from_secs(3), stdout.read_line(&mut hello))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hello, "MEKA-RUNNER 7\n");
+        let timeout_ms = if status == Some(124) { 900 } else { 5_000 };
+        let request = serde_json::json!({
+            "version": 7, "op": format!("{:032x}", timeout_ms),
+            "access": access, "working_directory": workspace,
+            "workspace": [], "readable": [reference], "timeout_ms": timeout_ms, "script": script,
+        });
+        lease
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        lease.flush().await.unwrap();
+        let mut ready = String::new();
+        loop {
+            let mut line = String::new();
+            let read =
+                tokio::time::timeout(Duration::from_secs(3), stdout.read_line(&mut line)).await;
+            let frame: serde_json::Value =
+                serde_json::from_str(line.trim()).unwrap_or(serde_json::Value::Null);
+            match frame["frame"].as_str() {
+                // The handshake the wire adds: the runner proves its sandbox and waits for the
+                // one line that permits the start before anything runs.
+                Some("ready") => {
+                    lease
+                        .write_all(format!("{timeout_ms}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    lease.flush().await.unwrap();
+                }
+                Some("started") => continue,
+                Some("output") if frame["stream"] == "stdout" => {
+                    let len = frame["len"].as_u64().unwrap_or(0) as usize;
+                    let mut bytes = vec![0u8; len];
+                    stdout.read_exact(&mut bytes).await.unwrap();
+                    ready.push_str(&String::from_utf8_lossy(&bytes));
+                    if status.is_none() && ready.contains("ready\n") {
+                        break;
+                    }
+                }
+                Some("output") => {
+                    let len = frame["len"].as_u64().unwrap_or(0) as usize;
+                    let mut bytes = vec![0u8; len];
+                    stdout.read_exact(&mut bytes).await.unwrap();
+                }
+                Some("stopped") => {}
+                Some("done") => break,
+                _ => {
+                    drop(lease);
+                    let output = child.wait_with_output().await.unwrap();
+                    panic!(
+                        "expected protocol frames, got {read:?} {line:?}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        }
+        if status.is_none() {
+            assert!(ready.contains("ready\n"), "{ready:?}");
+            drop(lease);
+        }
+        let output = tokio::time::timeout(Duration::from_secs(7), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(status.unwrap_or(125)),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(workspace.join("wrote").exists(), access == "workspace");
+        assert!(!reference.join("wrote").exists());
+    }
+    // A request of another version is refused at the first exchange and names the version it
+    // found: the runner never interprets a shape it does not speak.
+    let mut command = tokio::process::Command::from(install.meka(&["subshell-runner"]));
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut lease = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut hello = String::new();
+    tokio::time::timeout(Duration::from_secs(3), stdout.read_line(&mut hello))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(hello, "MEKA-RUNNER 7\n");
+    let stale = serde_json::json!({
+        "version": 6, "op": "0123456789abcdef0123456789abcdef",
+        "access": "workspace", "working_directory": workspace,
+        "workspace": [], "readable": [], "timeout_ms": 5_000, "script": "echo stale",
+    });
+    lease
+        .write_all(format!("{stale}\n").as_bytes())
+        .await
+        .unwrap();
+    lease.flush().await.unwrap();
+    drop(lease);
+    let output = tokio::time::timeout(Duration::from_secs(7), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(126), "{:?}", output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported subshell protocol version 6"),
+        "{stderr}"
+    );
+    drop(socket);
+    assert!(
+        workspace.join("timed").exists(),
+        "the timed command never started"
+    );
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert!(!workspace.join("survived").exists());
+    assert!(!install.database().exists());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires a Linux kernel with executable, sealable memory files"]
+async fn the_guest_deployment_verifies_the_sealed_runner_before_exec() {
+    use std::{process::Stdio, time::Duration};
+
+    use sha2::{Digest as _, Sha256};
+    use tokio::io::AsyncWriteExt as _;
+
+    let executable = std::fs::read("/usr/bin/printf").expect("system printf");
+    let digest = Sha256::digest(&executable);
+    for (length, payload, digest, expected) in [
+        (executable.len() as u64, executable.as_slice(), digest, None),
+        (
+            executable.len() as u64,
+            executable.as_slice(),
+            Default::default(),
+            Some("failed SHA-256 verification"),
+        ),
+        (
+            executable.len() as u64,
+            &[],
+            digest,
+            Some("host disconnected"),
+        ),
+        (
+            129 * 1024 * 1024,
+            &[],
+            digest,
+            Some("invalid runner payload length"),
+        ),
+    ] {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_meka-wsl-loader"))
+            .current_dir(directory.path())
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        input.write_all(&length.to_le_bytes()).await.unwrap();
+        input.write_all(&digest).await.unwrap();
+        input.write_all(payload).await.unwrap();
+        drop(input);
+        let result = tokio::time::timeout(Duration::from_secs(3), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(reason) = expected {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert_eq!(result.status.code(), Some(126), "{stderr}");
+            assert!(stderr.contains(reason), "{stderr}");
+            assert!(result.stdout.is_empty());
+        } else {
+            assert!(result.status.success(), "{:?}", result.stderr);
+            assert_eq!(result.stdout, b"subshell-runner");
+        }
+    }
+}
+
 #[test]
 fn session_subcommand_help_lists_actions() {
     let output = meka()
@@ -938,6 +1192,1208 @@ fn an_unresolvable_workspace_directory_warns_without_failing_the_run() {
         !stderr.contains("does not resolve"),
         "a root that exists must not warn: {stderr}"
     );
+}
+
+// Do not depend on WSL being installed: even a distro that is not installed belongs to the guest
+// namespace, and must not cause a native UNC lookup to decide whether the run can start.
+#[cfg(windows)]
+#[test]
+fn wsl_directory_flags_are_refused_without_a_managed_target() {
+    let install = Install::new();
+    for (flag, path) in [
+        (
+            "--additional-workspace-directory",
+            r"\\wsl.localhost\meka-test-unknown-distro\home\project",
+        ),
+        (
+            "--additional-readable-directory",
+            r"\\wsl$\meka-test-unknown-distro\home\references",
+        ),
+    ] {
+        let output = resolve_config(&install, "", &[flag, path]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(stderr.contains("managed WSL execution target"), "{stderr}");
+        assert!(!stderr.contains("does not resolve"), "{stderr}");
+        assert!(
+            !install.database().exists(),
+            "refuse before opening the store"
+        );
+    }
+}
+
+#[cfg(windows)]
+const TEST_WSL_TARGET: &str = r#"
+[shell.wsl]
+distribution = "meka-test-unknown-distro"
+"#;
+
+#[cfg(windows)]
+const TEST_WSL_PROJECT: &str = r"\\wsl.localhost\meka-test-unknown-distro\home\Project";
+
+#[cfg(windows)]
+#[test]
+fn a_managed_wsl_catalog_follows_the_shell_tool_policy() {
+    let install = Install::new();
+    for (policy, required, enabled) in [
+        ("", "read", true),
+        (
+            "[tools.tool_permissions]\nshell_execute = 'none'\nsubshell_execute = 'none'",
+            "read",
+            true,
+        ),
+        (
+            "[tools.tool_permissions]\nshell_execute = 'unrestricted'",
+            "unrestricted",
+            true,
+        ),
+        ("[tools]\ndisabled_tools = ['shell_execute']", "read", false),
+        (
+            "[tools]\nallowed_tools = ['subshell_execute']",
+            "read",
+            false,
+        ),
+    ] {
+        install.write_config(&format!("{TEST_WSL_TARGET}{policy}\n"));
+        let listed = json_stdout(run_isolated(&install, &[
+            "--additional-workspace-directory",
+            TEST_WSL_PROJECT,
+            "tool",
+            "list",
+            "--format",
+            "json",
+        ]));
+        for name in [
+            "subshell_close",
+            "subshell_execute",
+            "subshell_export",
+            "subshell_open",
+        ] {
+            let guest = listed["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} must be listed under {policy}"));
+            assert_eq!(guest["required_permission"], required, "{policy}: {guest}");
+            assert_eq!(guest["enabled"], enabled, "{policy}: {guest}");
+        }
+    }
+    let listed = json_stdout(run_isolated(&install, &[
+        "tool", "list", "--format", "json",
+    ]));
+    assert!(listed["tools"].as_array().unwrap().iter().all(|tool| {
+        !tool["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("subshell_"))
+    }));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_windows_turn_refuses_an_ungranted_wsl_directory_before_launch() {
+    let install = Install::new();
+    install.write_config(&format!("{CAPABLE_CONFIG}\n{TEST_WSL_TARGET}"));
+    let output = run_scripted_from(
+        &install,
+        install.root(),
+        r#"[
+      [{"type":"tool_use_start","id":"guest","name":"subshell_open"},
+       {"type":"tool_use_end","input":{"handle":"work","working_directory":"/home/project"}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"text","text":"done"},{"type":"message_end","stop_reason":"end_turn"}]
+    ]"#,
+        &[
+            "--additional-workspace-directory",
+            TEST_WSL_PROJECT,
+            "--permission",
+            "read",
+            "--oneshot",
+            "-p",
+            "Run the command",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    let result: String = store(&install)
+        .query_row(
+            "SELECT content FROM messages WHERE kind = 'tool_results'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("recorded tool result");
+    assert!(result.contains("an exact WSL directory grant"), "{result}");
+}
+
+/// A scratch directory in the test distro, removed when the test ends.
+#[cfg(windows)]
+struct GuestDirectory {
+    distro: String,
+    path: String,
+}
+
+#[cfg(windows)]
+impl GuestDirectory {
+    fn command(&self, args: &[&str]) -> std::process::Output {
+        let output = std::process::Command::new("wsl.exe")
+            .args(["--distribution", &self.distro, "--cd", "/", "--exec"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        output
+    }
+}
+
+#[cfg(windows)]
+impl Drop for GuestDirectory {
+    fn drop(&mut self) {
+        if !self.path.is_empty()
+            && let Err(error) = std::process::Command::new("wsl.exe")
+                .args([
+                    "--distribution",
+                    &self.distro,
+                    "--cd",
+                    "/",
+                    "--exec",
+                    "/usr/bin/rm",
+                    "-rf",
+                    "--",
+                    &self.path,
+                ])
+                .status()
+        {
+            eprintln!("cannot remove guest test directory: {error}");
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires an embedded Linux payload and a compatible WSL 2 distro"]
+fn windows_wsl_uses_the_bundle_only_when_the_installed_runner_is_absent() {
+    let mut guest = GuestDirectory {
+        distro: std::env::var("MEKA_TEST_WSL_DISTRO").expect("set a test distro"),
+        path: String::new(),
+    };
+    let root = std::env::var("MEKA_TEST_WSL_TMPDIR")
+        .expect("set a guest temp directory on the root ext filesystem");
+    let output = guest.command(&[
+        "/usr/bin/mktemp",
+        "-d",
+        "--",
+        &format!("{root}/meka-test.XXXXXXXX"),
+    ]);
+    guest.path = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    assert!(guest.path.starts_with(&format!("{root}/meka-test.")));
+    let work = format!("{}/work", guest.path);
+    let other = format!("{}/untrusted", guest.path);
+    guest.command(&["/usr/bin/mkdir", "--", &work, &other]);
+    guest.command(&[
+        "/usr/bin/cp",
+        "/usr/bin/printf",
+        &format!("{other}/meka-runner"),
+    ]);
+    let grant = format!(
+        r"\\wsl.localhost\{}{}",
+        guest.distro,
+        work.replace('/', "\\")
+    );
+
+    let run = |installed: &str| {
+        let install = Install::new();
+        install.write_config(&format!(
+            "{CAPABLE_CONFIG}\n[shell.wsl]\ndistribution = {:?}\nrunner = {installed:?}\n",
+            guest.distro
+        ));
+        let script = serde_json::json!([
+            [
+                {"type":"tool_use_start", "id":"open", "name":"subshell_open"},
+                {"type":"tool_use_end", "input":{"handle":"work","working_directory":work}},
+                {"type":"message_end", "stop_reason":"tool_use"}
+            ],
+            [
+                {"type":"tool_use_start", "id":"guest", "name":"subshell_execute"},
+                {"type":"tool_use_end", "input":{"handle":"work","command":"set -eu; test ! -e /mnt/c; test ! -e /init; test ! -e /tmp/probe; touch /tmp/probe; touch ran; printf 'ran in %s\\n' \"$PWD\"; exit 37"}},
+                {"type":"message_end", "stop_reason":"tool_use"}
+            ],
+            [{"type":"text", "text":"done"}, {"type":"message_end", "stop_reason":"end_turn"}]
+        ]);
+        let output = run_scripted_from(&install, install.root(), &script.to_string(), &[
+            "--additional-workspace-directory",
+            &grant,
+            "--permission",
+            "workspace",
+            "--oneshot",
+            "-p",
+            "Run the command",
+        ]);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let connection = store(&install);
+        let mut statement = connection
+            .prepare("SELECT content FROM messages WHERE kind = 'tool_results' ORDER BY rowid")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+    };
+    let unrelated = run("/usr/bin/printf");
+    assert!(
+        unrelated.contains("incompatible meka-runner protocol")
+            && unrelated.contains("subshell-runner"),
+        "{unrelated}"
+    );
+    let untrusted = run(&format!("{other}/meka-runner"));
+    assert!(
+        untrusted.contains("must be a root-owned executable"),
+        "{untrusted}"
+    );
+    guest.command(&["/usr/bin/test", "!", "-e", &format!("{work}/ran")]);
+    // This path is known absent; no assumption about the developer's own installation is needed.
+    let result = run(&format!(
+        "/usr/local/bin/{}",
+        guest.path.rsplit('/').next().unwrap()
+    ));
+    assert!(
+        result.contains("ran in /workspace") && result.contains("\"exit_code\":37"),
+        "{result}"
+    );
+    guest.command(&["/usr/bin/test", "-f", &format!("{work}/ran")]);
+}
+
+/// The tool results one scripted session recorded, as the text the model read, in the order the
+/// rounds produced them.
+#[cfg(windows)]
+fn tool_results(install: &Install) -> Vec<String> {
+    let connection = store(install);
+    let mut statement = connection
+        .prepare("SELECT content FROM messages WHERE kind = 'tool_results' ORDER BY rowid")
+        .expect("prepare");
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rows")
+        .into_iter()
+        .map(|row| {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&row) else {
+                return row;
+            };
+            let texts: Vec<&str> = value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|result| result["content"].as_array().into_iter().flatten())
+                .filter_map(|block| block["text"].as_str())
+                .collect();
+            texts.join("\n")
+        })
+        .collect()
+}
+
+/// A handle is addressed by name within the session that opened it, and close releases it: an
+/// unknown name, a second close and an export from a `read` session are each refused before any
+/// launch, so no distro is needed to watch the refusals land.
+#[cfg(windows)]
+#[test]
+fn a_subshell_handle_is_addressed_within_its_session_and_released_on_close() {
+    let install = Install::new();
+    install.write_config(&format!("{CAPABLE_CONFIG}\n{TEST_WSL_TARGET}"));
+    let output = run_scripted_from(
+        &install,
+        install.root(),
+        r#"[
+      [{"type":"tool_use_start","id":"open","name":"subshell_open"},
+       {"type":"tool_use_end","input":{"handle":"work","working_directory":"/home/Project"}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"tool_use_start","id":"missing","name":"subshell_execute"},
+       {"type":"tool_use_end","input":{"handle":"missing","command":"pwd"}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"tool_use_start","id":"export","name":"subshell_export"},
+       {"type":"tool_use_end","input":{"handle":"work","paths":["/home/Project/out.bin"],"destination":"."}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"tool_use_start","id":"close","name":"subshell_close"},
+       {"type":"tool_use_end","input":{"handle":"work"}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"tool_use_start","id":"again","name":"subshell_close"},
+       {"type":"tool_use_end","input":{"handle":"work"}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"text","text":"done"},{"type":"message_end","stop_reason":"end_turn"}]
+    ]"#,
+        &[
+            "--additional-workspace-directory",
+            TEST_WSL_PROJECT,
+            "--permission",
+            "read",
+            "--oneshot",
+            "-p",
+            "Exercise the handle",
+        ],
+    );
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let results = tool_results(&install);
+    assert!(
+        results[0].contains("opened subshell handle \"work\"")
+            && results[0].contains("/workspace: /home/Project"),
+        "{}",
+        results[0]
+    );
+    assert!(
+        results[1].contains("no subshell handle named \"missing\""),
+        "{}",
+        results[1]
+    );
+    assert!(
+        results[2].contains("managed WSL requires `workspace` permission"),
+        "{}",
+        results[2]
+    );
+    assert!(
+        results[3].contains("closed subshell handle \"work\""),
+        "{}",
+        results[3]
+    );
+    assert!(
+        results[4].contains("no subshell handle named \"work\""),
+        "{}",
+        results[4]
+    );
+}
+
+/// An export is judged against the handle's admitted scope and the parent's current write scope
+/// before anything is read or written: both refusals land with no distro behind them.
+#[cfg(windows)]
+#[test]
+fn an_export_is_judged_against_the_scope_and_the_write_boundary() {
+    let install = Install::new();
+    install.write_config(&format!("{CAPABLE_CONFIG}\n{TEST_WSL_TARGET}"));
+    let output = run_scripted_from(
+        &install,
+        install.root(),
+        r#"[
+      [{"type":"tool_use_start","id":"open","name":"subshell_open"},
+       {"type":"tool_use_end","input":{"handle":"work","working_directory":"/home/Project"}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"tool_use_start","id":"outside","name":"subshell_export"},
+       {"type":"tool_use_end","input":{"handle":"work","paths":["/etc/hostname"],"destination":"."}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"tool_use_start","id":"boundary","name":"subshell_export"},
+       {"type":"tool_use_end","input":{"handle":"work","paths":["/home/Project/out.bin"],"destination":"C:\\"}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"text","text":"done"},{"type":"message_end","stop_reason":"end_turn"}]
+    ]"#,
+        &[
+            "--additional-workspace-directory",
+            TEST_WSL_PROJECT,
+            "--permission",
+            "workspace",
+            "--oneshot",
+            "-p",
+            "Exercise the export refusals",
+        ],
+    );
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let results = tool_results(&install);
+    assert!(
+        results[1].contains("outside the handle's admitted scope"),
+        "{}",
+        results[1]
+    );
+    assert!(
+        results[2].contains("resolves outside the workspace"),
+        "{}",
+        results[2]
+    );
+}
+/// A scratch open names exactly one scope and needs `workspace`: the shape and level refusals land
+/// before any launch, so no distro is needed to watch them.
+#[cfg(windows)]
+#[test]
+fn a_scratch_open_is_refused_below_workspace_and_with_two_scopes() {
+    let install = Install::new();
+    install.write_config(&format!("{CAPABLE_CONFIG}\n{TEST_WSL_TARGET}"));
+    let read_level = run_scripted_from(
+        &install,
+        install.root(),
+        r#"[
+      [{"type":"tool_use_start","id":"level","name":"subshell_open"},
+       {"type":"tool_use_end","input":{"handle":"work","scratch":{"source":"."}}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"text","text":"done"},{"type":"message_end","stop_reason":"end_turn"}]
+    ]"#,
+        &[
+            "--additional-workspace-directory",
+            TEST_WSL_PROJECT,
+            "--permission",
+            "read",
+            "--oneshot",
+            "-p",
+            "Open a scratch handle",
+        ],
+    );
+    assert!(read_level.status.success(), "{:?}", read_level.stderr);
+    let results = tool_results(&install);
+    assert!(
+        results[0].contains("scratch mode needs `workspace` permission"),
+        "{}",
+        results[0]
+    );
+
+    let install = Install::new();
+    install.write_config(&format!("{CAPABLE_CONFIG}\n{TEST_WSL_TARGET}"));
+    let shaped = run_scripted_from(
+        &install,
+        install.root(),
+        r#"[
+      [{"type":"tool_use_start","id":"both","name":"subshell_open"},
+       {"type":"tool_use_end","input":{"handle":"work","working_directory":"/home/Project","scratch":{"source":"."}}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"tool_use_start","id":"neither","name":"subshell_open"},
+       {"type":"tool_use_end","input":{"handle":"work"}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"tool_use_start","id":"frozen","name":"subshell_open"},
+       {"type":"tool_use_end","input":{"handle":"work","scratch":{"source":"."},"read_only":true}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"text","text":"done"},{"type":"message_end","stop_reason":"end_turn"}]
+    ]"#,
+        &[
+            "--additional-workspace-directory",
+            TEST_WSL_PROJECT,
+            "--permission",
+            "workspace",
+            "--oneshot",
+            "-p",
+            "Open a scratch handle",
+        ],
+    );
+    assert!(shaped.status.success(), "{:?}", shaped.stderr);
+    let results = tool_results(&install);
+    assert!(
+        results[0].contains("open exactly one of `working_directory` or `scratch`"),
+        "{}",
+        results[0]
+    );
+    assert!(
+        results[1].contains("open exactly one of `working_directory` or `scratch`"),
+        "{}",
+        results[1]
+    );
+    assert!(
+        results[2].contains("scratch mode is a writable workspace"),
+        "{}",
+        results[2]
+    );
+}
+
+/// A scratch open judges its source against the session's workspace roots and its quota against
+/// the limit before the workspace is created: both refusals land with no distro behind them.
+#[cfg(windows)]
+#[test]
+fn a_scratch_open_refuses_the_source_and_the_quota_it_was_given() {
+    let install = Install::new();
+    install.write_config(&format!("{CAPABLE_CONFIG}\n{TEST_WSL_TARGET}"));
+    let output = run_scripted_from(
+        &install,
+        install.root(),
+        r#"[
+      [{"type":"tool_use_start","id":"outside","name":"subshell_open"},
+       {"type":"tool_use_end","input":{"handle":"work","scratch":{"source":"C:\\Windows"}}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"tool_use_start","id":"huge","name":"subshell_open"},
+       {"type":"tool_use_end","input":{"handle":"work","scratch":{"source":".","quota_mb":9000}}},
+       {"type":"message_end","stop_reason":"tool_use"}],
+      [{"type":"text","text":"done"},{"type":"message_end","stop_reason":"end_turn"}]
+    ]"#,
+        &[
+            "--additional-workspace-directory",
+            TEST_WSL_PROJECT,
+            "--permission",
+            "workspace",
+            "--oneshot",
+            "-p",
+            "Open a scratch handle",
+        ],
+    );
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let results = tool_results(&install);
+    assert!(
+        results[0].contains("beneath one of the session's workspace roots"),
+        "{}",
+        results[0]
+    );
+    assert!(
+        results[1].contains("the scratch quota must be between 1 and 8192 MiB"),
+        "{}",
+        results[1]
+    );
+}
+
+/// The whole handle lifecycle against a real distro: open over the granted directory, export the
+/// artifacts it holds into the write boundary, refuse a symlink source and an existing
+/// destination, export to a fresh destination, and close. The files are staged through `wsl.exe`
+/// rather than a run, so no runner payload is needed: what is under test is the export's own path
+/// boundaries and copying.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires a compatible WSL 2 distro"]
+fn windows_wsl_exports_from_the_admitted_scope_into_the_write_boundary() {
+    let mut guest = GuestDirectory {
+        distro: std::env::var("MEKA_TEST_WSL_DISTRO").expect("set a test distro"),
+        path: String::new(),
+    };
+    let root = std::env::var("MEKA_TEST_WSL_TMPDIR")
+        .expect("set a guest temp directory on the root ext filesystem");
+    let output = guest.command(&[
+        "/usr/bin/mktemp",
+        "-d",
+        "--",
+        &format!("{root}/meka-test.XXXXXXXX"),
+    ]);
+    guest.path = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    let work = format!("{}/work", guest.path);
+    guest.command(&["/usr/bin/mkdir", "--", &work, &format!("{work}/tree")]);
+    guest.command(&[
+        "/bin/sh",
+        "-c",
+        &format!(
+            "printf 'payload\\n' > {work}/artifact.bin; printf 'leaf\\n' > {work}/tree/leaf.txt; ln -s /etc/passwd {work}/link"
+        ),
+    ]);
+    let grant = format!(
+        r"\\wsl.localhost\{}{}",
+        guest.distro,
+        work.replace('/', "\\")
+    );
+
+    let install = Install::new();
+    install.write_config(&format!(
+        "{CAPABLE_CONFIG}\n[shell.wsl]\ndistribution = {:?}\n",
+        guest.distro
+    ));
+    let exported = install.root().join("exported");
+    std::fs::create_dir_all(&exported).expect("create the export destination");
+    let fresh = install.root().join("fresh");
+    std::fs::create_dir_all(&fresh).expect("create the fresh export destination");
+    let script = serde_json::json!([
+        [
+            {"type":"tool_use_start", "id":"open", "name":"subshell_open"},
+            {"type":"tool_use_end", "input":{"handle":"work","working_directory":work}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"artifact", "name":"subshell_export"},
+            {"type":"tool_use_end", "input":{"handle":"work","paths":[format!("{work}/artifact.bin")],"destination":exported.to_string_lossy()}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"tree", "name":"subshell_export"},
+            {"type":"tool_use_end", "input":{"handle":"work","paths":[format!("{work}/tree")],"destination":exported.to_string_lossy()}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"link", "name":"subshell_export"},
+            {"type":"tool_use_end", "input":{"handle":"work","paths":[format!("{work}/link")],"destination":exported.to_string_lossy()}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"missing", "name":"subshell_export"},
+            {"type":"tool_use_end", "input":{"handle":"work","paths":[format!("{work}/missing.bin")],"destination":exported.to_string_lossy()}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"overwrite", "name":"subshell_export"},
+            {"type":"tool_use_end", "input":{"handle":"work","paths":[format!("{work}/artifact.bin")],"destination":exported.to_string_lossy()}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"fresh", "name":"subshell_export"},
+            {"type":"tool_use_end", "input":{"handle":"work","paths":[format!("{work}/artifact.bin")],"destination":fresh.to_string_lossy()}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"close", "name":"subshell_close"},
+            {"type":"tool_use_end", "input":{"handle":"work"}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [{"type":"text", "text":"done"}, {"type":"message_end", "stop_reason":"end_turn"}]
+    ]);
+    let output = run_scripted_from(&install, install.root(), &script.to_string(), &[
+        "--additional-workspace-directory",
+        &grant,
+        "--permission",
+        "workspace",
+        "--oneshot",
+        "-p",
+        "Export the artifacts",
+    ]);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let results = tool_results(&install);
+    assert!(
+        results[0].contains("opened subshell handle \"work\""),
+        "{}",
+        results[0]
+    );
+    assert!(results[1].contains("exported "), "{}", results[1]);
+    assert!(results[2].contains("exported "), "{}", results[2]);
+    assert!(
+        results[3].contains("not a regular file or a real directory"),
+        "{}",
+        results[3]
+    );
+    assert!(results[4].contains("cannot inspect"), "{}", results[4]);
+    assert!(
+        results[5].contains("already exists at the destination"),
+        "{}",
+        results[5]
+    );
+    assert!(results[6].contains("exported "), "{}", results[6]);
+    assert!(
+        results[7].contains("closed subshell handle \"work\"")
+            && results[7].contains("stopped 0 running command(s)"),
+        "{}",
+        results[7]
+    );
+    let copied = std::fs::read_to_string(exported.join("artifact.bin")).expect("copied artifact");
+    assert_eq!(copied, "payload\n");
+    let fresh_copy = std::fs::read_to_string(fresh.join("artifact.bin")).expect("fresh artifact");
+    assert_eq!(fresh_copy, "payload\n");
+    let leaf =
+        std::fs::read_to_string(exported.join("tree").join("leaf.txt")).expect("copied tree");
+    assert_eq!(leaf, "leaf\n");
+}
+/// The whole scratch lifecycle against a real distro: a snapshot of a Windows source is staged
+/// into a private guest workspace, commands run in it, and exports copy artifacts back into the
+/// write boundary under fresh names. An existing destination is refused, a source file edited
+/// since the snapshot is left untouched, and close removes the workspace. The runner payload must
+/// speak the scratch protocol, so the test binary is built with `MEKA_WSL_RUNNER` and
+/// `MEKA_WSL_LOADER` set.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires a compatible WSL 2 distro and an embedded Linux runner payload"]
+fn windows_wsl_stages_a_scratch_workspace_and_deletes_it_on_close() {
+    let guest = GuestDirectory {
+        distro: std::env::var("MEKA_TEST_WSL_DISTRO").expect("set a test distro"),
+        path: String::new(),
+    };
+    let source = tempfile::tempdir().expect("source");
+    std::fs::write(source.path().join("source.txt"), "original\n").expect("source.txt");
+    std::fs::create_dir(source.path().join("nested")).expect("nested");
+    std::fs::write(source.path().join("nested").join("inner.txt"), "inner\n").expect("inner.txt");
+
+    let install = Install::new();
+    install.write_config(&format!(
+        "{CAPABLE_CONFIG}\n[shell.wsl]\ndistribution = {:?}\n",
+        guest.distro
+    ));
+    let source_path = source.path().to_string_lossy().to_string();
+    let edited = source
+        .path()
+        .join("nested")
+        .join("inner.txt")
+        .to_string_lossy()
+        .to_string();
+    let fresh = install.root().join("fresh");
+    std::fs::create_dir_all(&fresh).expect("create the fresh export destination");
+    let script = serde_json::json!([
+        [
+            {"type":"tool_use_start", "id":"open", "name":"subshell_open"},
+            {"type":"tool_use_end", "input":{"handle":"work","scratch":{"source":source_path}}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"run", "name":"subshell_execute"},
+            {"type":"tool_use_end", "input":{"handle":"work","command":"set -eu; printf 'built\\n' > /workspace/out.bin; printf 'changed in the guest\\n' > /workspace/source.txt; printf 'ran in %s\\n' \"$PWD\"; printf 'guest stderr\\n' >&2"}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"artifact", "name":"subshell_export"},
+            {"type":"tool_use_end", "input":{"handle":"work","paths":["/workspace/out.bin"],"destination":source_path}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"existing", "name":"subshell_export"},
+            {"type":"tool_use_end", "input":{"handle":"work","paths":["/workspace/source.txt"],"destination":source_path}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"fresh", "name":"subshell_export"},
+            {"type":"tool_use_end", "input":{"handle":"work","paths":["/workspace/source.txt"],"destination":fresh.to_string_lossy()}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"edit", "name":"file_write"},
+            {"type":"tool_use_end", "input":{"path":edited,"content":"touched\n","force":true}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"conflict", "name":"subshell_export"},
+            {"type":"tool_use_end", "input":{"handle":"work","paths":["/workspace/nested"],"destination":source_path}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"close", "name":"subshell_close"},
+            {"type":"tool_use_end", "input":{"handle":"work"}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [{"type":"text", "text":"done"}, {"type":"message_end", "stop_reason":"end_turn"}]
+    ]);
+    let output = run_scripted_from(&install, install.root(), &script.to_string(), &[
+        "--additional-workspace-directory",
+        &source_path,
+        "--permission",
+        "workspace",
+        "--oneshot",
+        "-p",
+        "Build in the scratch workspace",
+    ]);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let results = tool_results(&install);
+    assert!(
+        results[0].contains("opened subshell handle \"work\"")
+            && results[0].contains("access: workspace")
+            && results[0].contains("staged 2 file(s)"),
+        "{}",
+        results[0]
+    );
+    assert!(results[1].contains("ran in /workspace"), "{}", results[1]);
+    assert!(
+        results[1].contains("--- stderr ---\nguest stderr"),
+        "{}",
+        results[1]
+    );
+    assert!(results[2].contains("exported "), "{}", results[2]);
+    assert!(
+        results[3].contains("already exists at the destination"),
+        "{}",
+        results[3]
+    );
+    assert!(results[4].contains("exported "), "{}", results[4]);
+    assert!(results[5].contains("Successfully wrote"), "{}", results[5]);
+    assert!(
+        results[6].contains("already exists at the destination"),
+        "{}",
+        results[6]
+    );
+    assert!(
+        results[7].contains("closed subshell handle \"work\""),
+        "{}",
+        results[7]
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.path().join("out.bin")).expect("exported artifact"),
+        "built\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.path().join("source.txt")).expect("source"),
+        "original\n",
+        "an existing destination must not be replaced"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fresh.join("source.txt")).expect("fresh copy"),
+        "changed in the guest\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.path().join("nested").join("inner.txt"))
+            .expect("edited source"),
+        "touched\n",
+        "the refused export must leave the edited source alone"
+    );
+    let staged = results[0]
+        .split("meka-scratch/")
+        .nth(1)
+        .and_then(|rest| rest.get(..16))
+        .expect("the report names the staged workspace");
+    assert!(
+        staged
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()),
+        "{}",
+        results[0]
+    );
+    guest.command(&[
+        "/usr/bin/test",
+        "!",
+        "-d",
+        &format!("/var/tmp/meka-scratch/{staged}"),
+    ]);
+}
+
+/// The recorded tool results as the store holds them, the metadata and the error flags included:
+/// what a screen draws of the calls, which the plain text of the results does not carry.
+#[cfg(windows)]
+fn raw_tool_results(install: &Install) -> String {
+    let connection = store(install);
+    let mut statement = connection
+        .prepare("SELECT content FROM messages WHERE kind = 'tool_results' ORDER BY rowid")
+        .expect("prepare");
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rows")
+        .join("\n")
+}
+
+/// [`CAPABLE_CONFIG`] with `unrestricted` admitted as well, for a probe that mixes a guest call
+/// and a host-side one in the same session.
+#[cfg(windows)]
+const WIDE_CONFIG: &str = "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \
+                           \"anthropic-messages\"\n\n[profiles.mock]\naccount = \"mock\"\n\
+                           model = \"claude-sonnet-4-5\"\n\n[permissions]\ndefault = \
+                           \"unrestricted\"\nenabled = [\"read\", \"workspace\", \"unrestricted\"]\n";
+
+/// A command that outruns its timeout against a real distro: the guest tears the namespace down
+/// and reaps it, the record names that reaped status rather than the launcher's end, and the
+/// output the drains kept before the stop stays with the result. The budget the timeout names is
+/// the one the command actually ran under: what the launch spent setting the channel up is not
+/// billed to the command twice, so it sits below the 4000ms the call asked for.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires a compatible WSL 2 distro and an embedded Linux runner payload"]
+fn windows_wsl_a_timeout_mid_output_reports_the_confirmed_reap() {
+    let mut guest = GuestDirectory {
+        distro: std::env::var("MEKA_TEST_WSL_DISTRO").expect("set a test distro"),
+        path: String::new(),
+    };
+    let root = std::env::var("MEKA_TEST_WSL_TMPDIR")
+        .expect("set a guest temp directory on the root ext filesystem");
+    let output = guest.command(&[
+        "/usr/bin/mktemp",
+        "-d",
+        "--",
+        &format!("{root}/meka-test.XXXXXXXX"),
+    ]);
+    guest.path = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    let work = format!("{}/work", guest.path);
+    guest.command(&["/usr/bin/mkdir", "--", &work]);
+    let grant = format!(
+        r"\\wsl.localhost\{}{}",
+        guest.distro,
+        work.replace('/', "\\")
+    );
+    let install = Install::new();
+    install.write_config(&format!(
+        "{CAPABLE_CONFIG}\n[shell.wsl]\ndistribution = {:?}\n",
+        guest.distro
+    ));
+    let script = serde_json::json!([
+        [
+            {"type":"tool_use_start", "id":"open", "name":"subshell_open"},
+            {"type":"tool_use_end", "input":{"handle":"work","working_directory":work}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"run", "name":"subshell_execute"},
+            {"type":"tool_use_end", "input":{"handle":"work","command":"i=0; while :; do printf 'line %s\\n' \"$i\"; i=$((i+1)); sleep 0.1; done","timeout_ms":4000}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"close", "name":"subshell_close"},
+            {"type":"tool_use_end", "input":{"handle":"work"}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [{"type":"text", "text":"done"}, {"type":"message_end", "stop_reason":"end_turn"}]
+    ]);
+    let output = run_scripted_from(&install, install.root(), &script.to_string(), &[
+        "--additional-workspace-directory",
+        &grant,
+        "--permission",
+        "workspace",
+        "--oneshot",
+        "-p",
+        "Run until the timeout",
+    ]);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let results = tool_results(&install);
+    // 137 is the reaped status of the kill the timeout's teardown lands as (128 + SIGKILL);
+    // the runner's own reserved exit code for the timeout never reaches this text.
+    let reported = results[1]
+        .split("Command timed out after ")
+        .nth(1)
+        .and_then(|rest| rest.split("ms").next())
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .expect("the timeout names the budget the command ran under");
+    assert!(
+        reported > 0
+            && reported <= 4000
+            && results[1].contains(
+                "The guest reported the command was reaped and its namespace torn down (status 137)"
+            ),
+        "{}",
+        results[1]
+    );
+    assert!(
+        results[1].contains("line 0") && results[1].contains("line 1"),
+        "the output the drains kept survives the stop: {}",
+        results[1]
+    );
+}
+
+/// A call addressed to a handle the session already closed is refused before anything launches,
+/// and the guest agrees: the command the refused call named never appeared in the directory the
+/// handle had owned.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires a compatible WSL 2 distro"]
+fn windows_wsl_a_call_after_close_is_refused_and_never_runs() {
+    let mut guest = GuestDirectory {
+        distro: std::env::var("MEKA_TEST_WSL_DISTRO").expect("set a test distro"),
+        path: String::new(),
+    };
+    let root = std::env::var("MEKA_TEST_WSL_TMPDIR")
+        .expect("set a guest temp directory on the root ext filesystem");
+    let output = guest.command(&[
+        "/usr/bin/mktemp",
+        "-d",
+        "--",
+        &format!("{root}/meka-test.XXXXXXXX"),
+    ]);
+    guest.path = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    let work = format!("{}/work", guest.path);
+    guest.command(&["/usr/bin/mkdir", "--", &work]);
+    let grant = format!(
+        r"\\wsl.localhost\{}{}",
+        guest.distro,
+        work.replace('/', "\\")
+    );
+    let install = Install::new();
+    install.write_config(&format!(
+        "{CAPABLE_CONFIG}\n[shell.wsl]\ndistribution = {:?}\n",
+        guest.distro
+    ));
+    let script = serde_json::json!([
+        [
+            {"type":"tool_use_start", "id":"open", "name":"subshell_open"},
+            {"type":"tool_use_end", "input":{"handle":"work","working_directory":work}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"close", "name":"subshell_close"},
+            {"type":"tool_use_end", "input":{"handle":"work"}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"run", "name":"subshell_execute"},
+            {"type":"tool_use_end", "input":{"handle":"work","command":"touch after-close"}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [{"type":"text", "text":"done"}, {"type":"message_end", "stop_reason":"end_turn"}]
+    ]);
+    let output = run_scripted_from(&install, install.root(), &script.to_string(), &[
+        "--additional-workspace-directory",
+        &grant,
+        "--permission",
+        "workspace",
+        "--oneshot",
+        "-p",
+        "Use the handle",
+    ]);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let results = tool_results(&install);
+    assert!(
+        results[2].contains("no subshell handle named \"work\""),
+        "{}",
+        results[2]
+    );
+    // Ground truth in the guest, not the narration of the refusal.
+    guest.command(&["/usr/bin/test", "!", "-e", &format!("{work}/after-close")]);
+}
+
+/// Two scratch opens racing on one guest root: each prepares its own workspace while its own
+/// reaper sweeps beside it, and the sweeps take the workspace that outlived its lease and leave
+/// the fresh one and both live handles alone.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires a compatible WSL 2 distro and an embedded Linux runner payload"]
+fn windows_wsl_the_scratch_reaper_takes_only_expired_workspaces_under_concurrency() {
+    fn run(distro: String) {
+        let source = tempfile::tempdir().expect("scratch source");
+        std::fs::write(source.path().join("source.txt"), "staged\n").expect("source.txt");
+        let source_path = source.path().to_string_lossy().to_string();
+        let install = Install::new();
+        install.write_config(&format!(
+            "{CAPABLE_CONFIG}\n[shell.wsl]\ndistribution = {distro:?}\n"
+        ));
+        let script = serde_json::json!([
+            [
+                {"type":"tool_use_start", "id":"open", "name":"subshell_open"},
+                {"type":"tool_use_end", "input":{"handle":"s","scratch":{"source":source_path}}},
+                {"type":"message_end", "stop_reason":"tool_use"}
+            ],
+            [
+                {"type":"tool_use_start", "id":"run", "name":"subshell_execute"},
+                {"type":"tool_use_end", "input":{"handle":"s","command":"printf ok"}},
+                {"type":"message_end", "stop_reason":"tool_use"}
+            ],
+            [
+                {"type":"tool_use_start", "id":"close", "name":"subshell_close"},
+                {"type":"tool_use_end", "input":{"handle":"s"}},
+                {"type":"message_end", "stop_reason":"tool_use"}
+            ],
+            [{"type":"text", "text":"done"}, {"type":"message_end", "stop_reason":"end_turn"}]
+        ]);
+        let output = run_scripted_from(&install, install.root(), &script.to_string(), &[
+            "--additional-workspace-directory",
+            &source_path,
+            "--permission",
+            "workspace",
+            "--oneshot",
+            "-p",
+            "Open a scratch workspace",
+        ]);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let results = tool_results(&install);
+        assert!(
+            results[0].contains("opened subshell handle \"s\"")
+                && results[0].contains("staged 1 file(s)"),
+            "{}",
+            results[0]
+        );
+    }
+
+    let distro = std::env::var("MEKA_TEST_WSL_DISTRO").expect("set a test distro");
+    let guest = GuestDirectory {
+        distro: distro.clone(),
+        path: String::new(),
+    };
+    let expired = "0123456789abcdef";
+    let fresh = "fedcba9876543210";
+    // The file first, so the workspace directory's own mtime is the one set old.
+    guest.command(&[
+        "/bin/sh",
+        "-c",
+        &format!(
+            "rm -rf /var/tmp/meka-scratch/{expired} /var/tmp/meka-scratch/{fresh}; \
+             mkdir -p /var/tmp/meka-scratch/{expired} /var/tmp/meka-scratch/{fresh}; \
+             touch /var/tmp/meka-scratch/{expired}/held /var/tmp/meka-scratch/{fresh}/held; \
+             touch -d '2 days ago' /var/tmp/meka-scratch/{expired}"
+        ),
+    ]);
+    let one = std::thread::spawn({
+        let distro = distro.clone();
+        move || run(distro)
+    });
+    let two = std::thread::spawn(move || run(distro));
+    one.join().expect("first racer");
+    two.join().expect("second racer");
+    guest.command(&[
+        "/usr/bin/test",
+        "!",
+        "-e",
+        &format!("/var/tmp/meka-scratch/{expired}"),
+    ]);
+    guest.command(&[
+        "/usr/bin/test",
+        "-d",
+        &format!("/var/tmp/meka-scratch/{fresh}"),
+    ]);
+    guest.command(&[
+        "/usr/bin/rm",
+        "-rf",
+        "--",
+        &format!("/var/tmp/meka-scratch/{fresh}"),
+    ]);
+}
+
+/// A scratch workspace reaped behind a live handle: the next call names what went missing and
+/// what to do about it rather than reporting an empty success.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires a compatible WSL 2 distro and an embedded Linux runner payload"]
+fn windows_wsl_a_reaped_scratch_workspace_fails_loudly() {
+    let guest = GuestDirectory {
+        distro: std::env::var("MEKA_TEST_WSL_DISTRO").expect("set a test distro"),
+        path: String::new(),
+    };
+    let source = tempfile::tempdir().expect("scratch source");
+    std::fs::write(source.path().join("source.txt"), "staged\n").expect("source.txt");
+    let source_path = source.path().to_string_lossy().to_string();
+    let install = Install::new();
+    install.write_config(&format!(
+        "{WIDE_CONFIG}[shell.wsl]\ndistribution = {:?}\n",
+        guest.distro
+    ));
+    // The workspace is gone before the next call: a host-side sweep between the open and the
+    // call, which is what an expiry the guest missed would look like to the handle.
+    let sweep = format!(
+        "wsl.exe --distribution {:?} --exec /bin/sh -c 'rm -rf /var/tmp/meka-scratch/*'",
+        guest.distro
+    );
+    let script = serde_json::json!([
+        [
+            {"type":"tool_use_start", "id":"open", "name":"subshell_open"},
+            {"type":"tool_use_end", "input":{"handle":"s","scratch":{"source":source_path}}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"sweep", "name":"shell_execute"},
+            {"type":"tool_use_end", "input":{"command":sweep}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"run", "name":"subshell_execute"},
+            {"type":"tool_use_end", "input":{"handle":"s","command":"printf ok"}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [
+            {"type":"tool_use_start", "id":"close", "name":"subshell_close"},
+            {"type":"tool_use_end", "input":{"handle":"s"}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [{"type":"text", "text":"done"}, {"type":"message_end", "stop_reason":"end_turn"}]
+    ]);
+    let output = run_scripted_from(&install, install.root(), &script.to_string(), &[
+        "--additional-workspace-directory",
+        &source_path,
+        "--permission",
+        "unrestricted",
+        "--oneshot",
+        "-p",
+        "Use the scratch workspace",
+    ]);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let results = tool_results(&install);
+    let staged = results[0]
+        .split("meka-scratch/")
+        .nth(1)
+        .and_then(|rest| rest.get(..16))
+        .expect("the report names the staged workspace");
+    assert!(
+        staged
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()),
+        "{}",
+        results[0]
+    );
+    assert!(
+        results[2].contains("the scratch workspace expired")
+            && results[2].contains("the handle must be reopened")
+            && results[2].contains("the managed WSL runner failed"),
+        "{}",
+        results[2]
+    );
+    assert!(
+        raw_tool_results(&install).contains("\"is_error\":true"),
+        "{}",
+        raw_tool_results(&install)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn an_unusable_wsl_directory_names_the_flag_and_path() {
+    let install = Install::new();
+    let flag = "--additional-readable-directory";
+    let path = r"\\wsl$\meka-test-unknown-distro";
+    let output = resolve_config(&install, "", &[flag, path]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains(flag) && stderr.contains(path), "{stderr}");
+    assert!(stderr.contains("below the distribution root"), "{stderr}");
 }
 
 /// A prompt and a skill are a run's first turn, which neither long-lived host has: their turns

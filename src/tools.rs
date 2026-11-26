@@ -250,7 +250,19 @@ pub(crate) fn effective_permission(
     name: &str,
     own: Permission,
 ) -> Permission {
-    overrides.get(name).copied().unwrap_or(own)
+    let required = overrides.get(name).copied().unwrap_or(own);
+    if crate::subshell::is_tool(name) {
+        // The managed guest has its own sandbox, but an explicit shell policy applies to both.
+        required.max(
+            overrides
+                .get("shell_execute")
+                .copied()
+                .unwrap_or(Permission::Read)
+                .max(Permission::Read),
+        )
+    } else {
+        required
+    }
 }
 
 /// Splice `background` into one tool's schema.
@@ -776,6 +788,36 @@ impl ToolOutput {
     }
 }
 
+/// What a run that stopped its own work saw of the end it asked for.
+///
+/// A cancellation request says what the caller wants; it does not say that the work's processes
+/// are gone. A run that kills a tree and reaps it records that here, and a background task's
+/// outcome is worded from the observation rather than from the request. Shared through
+/// [`ToolContext`], because the run and the caller that stores its outcome are not the same
+/// future.
+#[derive(Debug, Default)]
+pub(crate) struct TeardownObservation {
+    observed: std::sync::atomic::AtomicBool,
+    confirmed: std::sync::atomic::AtomicBool,
+}
+
+impl TeardownObservation {
+    /// Record that the work's end was (`true`) or was not (`false`) confirmed.
+    pub(crate) fn note(&self, confirmed: bool) {
+        self.confirmed
+            .store(confirmed, std::sync::atomic::Ordering::Relaxed);
+        self.observed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// What was recorded, or `None` when the run never got as far as stopping its work.
+    pub(crate) fn confirmed(&self) -> Option<bool> {
+        self.observed
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| self.confirmed.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 /// What a tool call knows about the session it runs in, handed to [`Tool::execute`] by whoever
 /// dispatches it. One per call, and the only way a tool learns any of it: the inline dispatch,
 /// the background spawn, the checkpoint turn and a gate probe each build one, so a tool cannot
@@ -797,6 +839,10 @@ pub(crate) struct ToolContext {
     /// The background task this call runs as, when it was detached with `background: true`, so
     /// a tool that starts something long-lived can record it on the task's row.
     pub(crate) task_id: Option<String>,
+    /// Where a run that stops its own work records whether it saw that work end, so the caller
+    /// that stores the outcome can word the stop from what happened rather than from the request.
+    /// `None` for a call nothing records an outcome for.
+    pub(crate) teardown: Option<Arc<TeardownObservation>>,
 }
 
 impl ToolContext {
@@ -821,6 +867,7 @@ impl ToolContext {
             frontend: Arc::new(crate::frontend::SilentFrontend),
             cancellation,
             task_id: None,
+            teardown: None,
         }
     }
 }
@@ -1038,7 +1085,7 @@ fn flatten_tool_text(output: &ToolOutput) -> String {
 /// the primary-parameter table it extends.
 pub(crate) fn builtin_code_param(name: &str) -> Option<(&'static str, &'static str)> {
     match name {
-        "shell_execute" => Some(("command", "bash")),
+        "shell_execute" | "subshell_execute" => Some(("command", "bash")),
         _ => None,
     }
 }
@@ -1227,9 +1274,11 @@ fn builtin_primary_key(name: &str) -> Option<&'static str> {
         "scratchpad_merge" => "sources",
         "scratchpad_rename" => "old",
         "session_search" => "query",
-        "shell_execute" => "command",
+        "shell_execute" | "subshell_execute" => "command",
         "skill_delete" | "skill_edit" | "skill_read" | "skill_write" => "name",
         "skill_search" => "pattern",
+        "subshell_close" | "subshell_open" => "handle",
+        "subshell_export" => "paths",
         "tool_load" => "name",
         "tool_search" => "query",
         "web_fetch" => "url",
@@ -1616,6 +1665,10 @@ mod tests {
         }
 
         for name in BUILTIN_TOOL_NAMES {
+            // Shared config can name the guest tools even on hosts that cannot register them.
+            if !cfg!(windows) && crate::subshell::is_tool(name) {
+                continue;
+            }
             assert!(
                 swept.contains(*name),
                 "{name} was never examined: `registry_with_every_builtin` does not register it, so \
@@ -1624,21 +1677,11 @@ mod tests {
         }
     }
 
-    /// A registry holding every name in [`BUILTIN_TOOL_NAMES`], for tests that must not silently
-    /// skip a family.
-    ///
-    /// `build_default` alone is not enough: the skill authoring tools need `agent_managed`,
-    /// the `task_*` and `context_*` families are registered by their own hosts, and the MCP
-    /// meta-tools appear only once a server is configured. None of them need to *work* here, only
-    /// to answer `definition()`, so the collaborators are the cheapest that construct: an in-memory
-    /// store, a zeroed gauge, and a server whose command does not exist (`prepare` validates config
-    /// and spawns nothing).
-    /// Which built-ins report a failure as their output, so the `scratchpad` redirect takes it:
-    /// the shell alone, whose exit code and output are the result however the command ended.
+    /// Shell tools keep the command's output and status as the result however it ended.
     #[tokio::test]
-    async fn only_the_shell_reports_a_failure_as_its_output() {
+    async fn only_shell_tools_report_a_failure_as_their_output() {
         let registry = registry_with_every_builtin().await;
-        let reporting: Vec<String> = registry
+        let mut reporting: Vec<String> = registry
             .registered_tool_names()
             .into_iter()
             .filter(|name| {
@@ -1647,7 +1690,12 @@ mod tests {
                     .is_some_and(|tool| tool.reports_failure_as_output())
             })
             .collect();
-        assert_eq!(reporting, vec!["shell_execute".to_string()]);
+        reporting.sort_unstable();
+        assert_eq!(reporting, [
+            "shell_execute",
+            #[cfg(windows)]
+            "subshell_execute",
+        ]);
     }
 
     /// Which built-ins keep their result inline, so the `scratchpad` redirect leaves it there:
@@ -1687,6 +1735,51 @@ mod tests {
         let store = Store::for_test().await;
 
         registry.enable_background();
+        #[cfg(windows)]
+        {
+            let grant = crate::paths::WslDirectory::from_run_directory(std::path::Path::new(
+                r"\\wsl.localhost\test-guest\home\project",
+            ))
+            .unwrap()
+            .unwrap();
+            let target = Arc::new(
+                crate::subshell::Target::from_grants(
+                    "test-guest",
+                    crate::subshell::DEFAULT_RUNNER,
+                    &[grant],
+                    &[],
+                    &[],
+                )
+                .unwrap(),
+            );
+            let handles = Arc::new(crate::subshell::Handles::default());
+            registry.register_builtin(Arc::new(shell::SubshellOpenTool {
+                handles: Arc::clone(&handles),
+                target: Arc::clone(&target),
+                permission: shared_permission_for_test(),
+                required: Permission::Read,
+                site: crate::session::ToolSite::for_test(),
+            }));
+            registry.register_builtin(Arc::new(shell::SubshellExecuteTool {
+                handles: Arc::clone(&handles),
+                target: Arc::clone(&target),
+                permission: shared_permission_for_test(),
+                required: Permission::Read,
+            }));
+            registry.register_builtin(Arc::new(shell::SubshellExportTool {
+                handles: Arc::clone(&handles),
+                target: Arc::clone(&target),
+                permission: shared_permission_for_test(),
+                required: Permission::Read,
+                scope: crate::workspace::WriteScope::deny_all(),
+                site: crate::session::ToolSite::for_test(),
+            }));
+            registry.register_builtin(Arc::new(shell::SubshellCloseTool {
+                handles,
+                permission: shared_permission_for_test(),
+                required: Permission::Read,
+            }));
+        }
         for tool in background::build(
             store.clone(),
             crate::session::ToolSite::for_test(),

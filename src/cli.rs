@@ -119,6 +119,25 @@ pub(crate) enum Command {
         #[arg(last = true, required = true, value_name = "COMMAND")]
         command: Vec<std::ffi::OsString>,
     },
+    /// Serve one managed WSL shell command over standard input (internal)
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    SubshellRunner,
+    /// Verify the WSL sandbox and become its command (internal)
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    SubshellExec {
+        #[arg(long)]
+        ready_descriptor: std::os::fd::RawFd,
+        #[arg(long)]
+        start_descriptor: std::os::fd::RawFd,
+        #[arg(long)]
+        writable: Vec<std::path::PathBuf>,
+        #[arg(long)]
+        read_only: Vec<std::path::PathBuf>,
+        #[arg(last = true, required = true)]
+        script: String,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

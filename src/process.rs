@@ -311,6 +311,30 @@ fn physical_memory_bytes() -> io::Result<usize> {
     usize::try_from(status.ullTotalPhys).map_err(io::Error::other)
 }
 
+/// Place the process behind `handle` in a job of its own. A caller that requires the job gets the
+/// error; the door's ordinary spawn logs it and lets the command run.
+#[cfg(windows)]
+fn try_place_in_job(
+    handle: std::os::windows::io::RawHandle,
+    end: JobEnd,
+) -> io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::AsRawHandle;
+
+    let job = open_job(end)?;
+    // SAFETY: both handles are open; the process handle carries the quota and terminate
+    // rights, which is what the job needs of it.
+    if unsafe {
+        windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
+            job.as_raw_handle(),
+            handle,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(job)
+}
+
 /// Place the process behind `handle` in a job of its own, logging a refusal rather than failing:
 /// the command runs either way.
 #[cfg(windows)]
@@ -318,23 +342,7 @@ fn place_in_job(
     handle: std::os::windows::io::RawHandle,
     end: JobEnd,
 ) -> Option<std::os::windows::io::OwnedHandle> {
-    use std::os::windows::io::AsRawHandle;
-
-    let assigned = open_job(end).and_then(|job| {
-        // SAFETY: both handles are open; the process handle carries the quota and terminate
-        // rights, which is what the job needs of it.
-        if unsafe {
-            windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
-                job.as_raw_handle(),
-                handle,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(job)
-    });
-    match assigned {
+    match try_place_in_job(handle, end) {
         Ok(job) => Some(job),
         Err(error) => {
             static ANNOUNCED: AtomicBool = AtomicBool::new(false);
@@ -397,6 +405,9 @@ fn announce_once(announced: &AtomicBool, message: &str) {
 #[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_millis(200);
 
+/// How long a killed tree's root is given to be reaped before its end is called unconfirmed.
+const STOP_CONFIRM: Duration = Duration::from_secs(2);
+
 /// A child that leads a tree of its own, which ends with it: everything the child starts, and
 /// everything they start. On Unix the child leads a session of its own (`setsid`), a process group
 /// with no controlling terminal, so `-pid` names the tree, backgrounded descendants such as
@@ -408,19 +419,101 @@ const KILL_GRACE: Duration = Duration::from_millis(200);
 /// call and only then fires its token, so without the kill on drop every evaluation of such a gate
 /// would leave its command running. `Drop` is synchronous, so there is no grace signal there; a
 /// child already reaped has no id and is not signaled.
-pub(crate) struct Tree(Spawned<tokio::process::Child>);
+pub(crate) struct Tree {
+    child: Spawned<tokio::process::Child>,
+    /// The Windows launcher lease has to remain open even while Tokio waits on the child.
+    #[cfg(windows)]
+    lease: Option<tokio::process::ChildStdin>,
+}
 
 impl Tree {
+    fn new(child: Spawned<tokio::process::Child>) -> Self {
+        Self {
+            child,
+            #[cfg(windows)]
+            lease: None,
+        }
+    }
+
+    /// Take ownership of piped stdin before the child wait can close it.
+    #[cfg(windows)]
+    pub(crate) fn lease_input(&mut self) -> io::Result<&mut tokio::process::ChildStdin> {
+        if self.lease.is_none() {
+            self.lease = self.child.stdin.take();
+        }
+        self.lease
+            .as_mut()
+            .ok_or_else(|| io::Error::other("the child has no stdin lease"))
+    }
+
+    /// Hand the launcher's stdin lease to the caller, for one that writes the guest's start permit
+    /// and withdrawal itself while the tree runs. The tree keeps no lease after this: the caller
+    /// holds the guest's lifetime signal and hangs it up when the guest must end.
+    #[cfg(windows)]
+    pub(crate) fn take_lease_input(&mut self) -> Option<tokio::process::ChildStdin> {
+        if self.lease.is_none() {
+            self.lease = self.child.stdin.take();
+        }
+        self.lease.take()
+    }
+
+    /// Read launcher setup data before handing the same stdout pipe to the command drains.
+    #[cfg(windows)]
+    pub(crate) fn piped_stdout(&mut self) -> io::Result<&mut tokio::process::ChildStdout> {
+        self.child
+            .stdout
+            .as_mut()
+            .ok_or_else(|| io::Error::other("the child has no stdout pipe"))
+    }
+
+    /// Take the framed output pipe of a guest command.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_stdout(&mut self) -> io::Result<tokio::process::ChildStdout> {
+        self.child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("the child has no stdout pipe"))
+    }
+
+    /// Take the framed error pipe of a guest command.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_stderr(&mut self) -> io::Result<tokio::process::ChildStderr> {
+        self.child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("the child has no stderr pipe"))
+    }
+
     /// The child's process id, `None` once it has been reaped.
     pub(crate) fn id(&self) -> Option<u32> {
-        self.0.id()
+        self.child.id()
+    }
+
+    /// Wait for a supervised child whose output is already wired to another process.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.child.wait().await
     }
 
     /// End the tree: on Unix `SIGTERM` to the group, a moment for well-behaved processes to shut
     /// down cleanly, then `SIGKILL`; on Windows the job is terminated.
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            dead_code,
+            reason = "only the Linux tests end a tree with the grace this spells"
+        )
+    )]
     async fn kill(&mut self) {
+        let _ = self.kill_confirmed().await;
+    }
+
+    /// The graceful teardown's own result, reporting the status when the child was actually
+    /// reaped.
+    async fn kill_confirmed(&mut self) -> Option<std::process::ExitStatus> {
         #[cfg(unix)]
-        if let Some(pid) = self.0.id() {
+        if let Some(pid) = self.child.id() {
             let pgid = pid as libc::pid_t;
             // SAFETY: `kill(2)` is always safe to call; it just returns an error if the target is
             // gone. Sending to `-pgid` targets the whole process group. Errors here usually mean
@@ -433,33 +526,67 @@ impl Tree {
             }
             tokio::time::sleep(KILL_GRACE).await;
         }
-        self.kill_at_once().await;
+        self.kill_at_once_confirmed().await
     }
 
     /// End the tree with no grace: `SIGKILL` to the group on Unix, the job terminated on Windows.
     /// The closing `kill` is a no-op once the tree is gone and reaps the child either way.
-    async fn kill_at_once(&mut self) {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            dead_code,
+            reason = "the Linux guest runner uses this; every host reaches the confirmed form"
+        )
+    )]
+    pub(crate) async fn kill_at_once(&mut self) {
+        let _ = self.kill_at_once_confirmed().await;
+    }
+
+    /// [`Self::kill_at_once`], reporting the status when the child was reaped within
+    /// [`STOP_CONFIRM`]. `None` means the kernel did not confirm the end here, which a caller that
+    /// records whether teardown happened must not report as if it had.
+    pub(crate) async fn kill_at_once_confirmed(&mut self) -> Option<std::process::ExitStatus> {
         #[cfg(windows)]
-        if let Err(error) = self.0.terminate_tree() {
+        drop(self.lease.take());
+        #[cfg(windows)]
+        if let Err(error) = self.child.terminate_tree() {
             tracing::debug!("failed to terminate the command's job: {error}");
         }
         #[cfg(unix)]
-        if let Some(pid) = self.0.id() {
+        if let Some(pid) = self.child.id() {
             kill_tree_now(pid);
         }
-        if let Err(error) = self.0.kill().await {
-            tracing::debug!("failed to kill child process: {error}");
+        // `start_kill` rather than `kill`: `kill` waits without a bound, and a process stuck in
+        // the kernel would then hold the cancellation that asked for this. The bounded `wait`
+        // reaps the child and tells the caller whether the end was observed.
+        if let Some(pid) = self.child.id()
+            && let Err(error) = self.child.start_kill()
+        {
+            tracing::debug!("failed to kill child process {pid}: {error}");
+        }
+        match tokio::time::timeout(STOP_CONFIRM, self.child.wait()).await {
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(error)) => {
+                tracing::debug!("failed to reap the killed child: {error}");
+                None
+            }
+            Err(_) => {
+                tracing::debug!("the killed child was not reaped within {STOP_CONFIRM:?}");
+                None
+            }
         }
     }
 }
 
 impl Drop for Tree {
     fn drop(&mut self) {
-        let Some(pid) = self.0.id() else {
+        #[cfg(windows)]
+        drop(self.lease.take());
+        let Some(pid) = self.child.id() else {
             return;
         };
         kill_tree_now(pid);
-        if let Err(error) = self.0.start_kill() {
+        if let Err(error) = self.child.start_kill() {
             tracing::debug!("failed to kill child {pid} on drop: {error}");
         }
     }
@@ -490,8 +617,52 @@ pub(crate) fn spawn_tree(command: &mut tokio::process::Command) -> io::Result<Tr
     #[cfg(unix)]
     let spawned = unsafe { spawn_tree_with_pre_exec(command, || Ok(())) };
     #[cfg(windows)]
-    let spawned = spawn(command).map(Tree);
+    let spawned = spawn(command).map(Tree::new);
     spawned
+}
+
+/// [`spawn_tree`] where the job is part of the spawn contract: if the child cannot be placed in
+/// one, it is killed before this returns and the error is the caller's. A launcher that must be
+/// killable with everything it starts cannot run outside a job.
+#[cfg(windows)]
+pub(crate) fn spawn_tree_required(command: &mut tokio::process::Command) -> io::Result<Tree> {
+    prepare(command);
+    let mut inner = command.spawn()?;
+    let placed = inner
+        .id()
+        .ok_or_else(|| io::Error::other("the spawned child has no process id"))
+        .and_then(try_place_process_in_job);
+    let job = match placed {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = inner.start_kill();
+            return Err(error);
+        }
+    };
+    Ok(Tree::new(Spawned {
+        inner,
+        job: Some(job),
+    }))
+}
+
+/// Open the child by the id it was just spawned with and place its process in a job. The open
+/// handle keeps the id from being reused before the assignment.
+#[cfg(windows)]
+fn try_place_process_in_job(process_id: u32) -> io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    // SAFETY: a plain lookup by id; a null return is the error.
+    let raw = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, process_id) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the handle was just opened by this process and nothing else owns it.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+    try_place_in_job(process.as_raw_handle(), JobEnd::WithHandle)
 }
 
 /// [`spawn_tree`], with `pre_exec` run in the child once the door's own steps have: after the
@@ -520,7 +691,7 @@ where
             pre_exec()
         })
     };
-    spawned.map(Tree)
+    spawned.map(Tree::new)
 }
 
 /// Which of a command's two output streams a chunk was read from.
@@ -822,6 +993,11 @@ pub(crate) enum Ended {
 pub(crate) struct Finished {
     pub(crate) ended: Ended,
     pub(crate) drained: Drained,
+    /// The root's status when its end was observed. Set for a run that exited on its own and for
+    /// one whose tree was killed and reaped within [`STOP_CONFIRM`]; `None` when the kill could
+    /// not be confirmed by a bounded reap, or when the exit path itself was a failed wait. A
+    /// caller that records teardown reports exactly this and never infers it from the variant.
+    pub(crate) local_exit: Option<std::process::ExitStatus>,
 }
 
 /// What ends a run from outside, and how its tree is ended then.
@@ -856,33 +1032,35 @@ pub(crate) async fn run(
     stop: Option<Stop<'_>>,
     drain_timeout: Duration,
 ) -> io::Result<Finished> {
-    let drains = Drains::start(tree.0.stdout.take(), tree.0.stderr.take(), capture);
+    let drains = Drains::start(tree.child.stdout.take(), tree.child.stderr.take(), capture);
     // `biased`, so a bound reached in the same instant the child exits is reported as the bound:
     // the random pick would otherwise call the command clean while its last reads were never
     // taken.
-    let ended = tokio::select! {
+    let (ended, local_exit) = tokio::select! {
         biased;
         () = until_stopped(stop.as_ref()) => {
-            match stop {
-                Some(Stop::AtOnce(_)) => tree.kill_at_once().await,
-                _ => tree.kill().await,
-            }
+            let local_exit = match stop {
+                Some(Stop::AtOnce(_)) => tree.kill_at_once_confirmed().await,
+                _ => tree.kill_confirmed().await,
+            };
             drains.stop.cancel();
-            Ended::Stopped
+            (Ended::Stopped, local_exit)
         }
         () = drains.bound_reached() => {
-            tree.kill().await;
-            Ended::OutputBound
+            (Ended::OutputBound, tree.kill_confirmed().await)
         }
         () = until_elapsed(timeout) => {
-            tree.kill().await;
-            Ended::TimedOut
+            (Ended::TimedOut, tree.kill_confirmed().await)
         }
-        status = tree.0.wait() => Ended::Exited(status?),
+        status = tree.child.wait() => {
+            let status = status?;
+            (Ended::Exited(status), Some(status))
+        }
     };
     Ok(Finished {
         ended,
         drained: drains.collect(drain_timeout).await,
+        local_exit,
     })
 }
 
@@ -1273,6 +1451,7 @@ mod tests {
             "{:?}",
             finished.ended
         );
+        assert!(finished.local_exit.is_some(), "the killed tree was reaped");
         assert_eq!(finished.drained.stdout.bytes, b"escaped\n");
     }
 
@@ -1324,6 +1503,10 @@ mod tests {
             matches!(finished.ended, Ended::Stopped),
             "{:?}",
             finished.ended
+        );
+        assert!(
+            finished.local_exit.is_some(),
+            "a stop at once reaps the tree and reports the end it observed"
         );
         assert!(
             !termed.exists(),

@@ -1,6 +1,6 @@
 //! Permission state machine governing what tools the agent may invoke. Levels: `none` (read-only,
 //! no env info), `read` (filesystem reads), `workspace` (writes confined to the workspace roots),
-//! `unrestricted` (no boundary at all). The level is held in an [`AtomicU8`] so the screen can
+//! `unrestricted` (no boundary at all). The level is held in an atomic cell so the screen can
 //! mutate it concurrently with the agent loop.
 //!
 //! Beside the level sits one switch, **approvals**: whether a call needing more than the level is
@@ -350,13 +350,135 @@ impl EnabledPermissions {
     }
 }
 
-/// Lock-free shared handle to the current [`Permission`] level and the approvals switch. Cloned
-/// freely across agent, screen, and tool-dispatch tasks. The screen mutates it when the user cycles
-/// permission via `Shift+Tab` or `/permission`, or toggles `/approvals`; the dispatch loop reads it
-/// once at the enforcement site so mid-turn changes can't leave a tool acting on a stale snapshot.
+struct SharedLevel {
+    value: AtomicU8,
+    lease: std::sync::Mutex<tokio_util::sync::CancellationToken>,
+}
+
+impl SharedLevel {
+    fn new(level: Permission) -> Self {
+        Self {
+            value: AtomicU8::new(level as u8),
+            lease: std::sync::Mutex::default(),
+        }
+    }
+
+    fn get(&self) -> Permission {
+        SharedPermission::decode(self.value.load(Ordering::Relaxed))
+    }
+
+    fn set(&self, level: Permission) {
+        let mut lease = crate::sync::lock(&self.lease);
+        let previous = SharedPermission::decode(self.value.swap(level as u8, Ordering::Relaxed));
+        // A subsequent raise must not revive work admitted before a downgrade.
+        if level < previous {
+            std::mem::take(&mut *lease).cancel();
+        }
+    }
+
+    fn lease(&self) -> (Permission, tokio_util::sync::CancellationToken) {
+        let lease = crate::sync::lock(&self.lease);
+        (self.get(), lease.clone())
+    }
+}
+
+/// The level of a managed operation and the revocation signal for that snapshot.
+#[derive(Clone)]
+pub(crate) struct PermissionLease {
+    /// Authority held when the lease was taken.
+    pub(crate) level: Permission,
+    /// The cell this snapshot was taken from. Held so a launch can take the same setter lock as a
+    /// later downgrade, which is what makes "the level was still high when the process started"
+    /// one step rather than two observations with a window between them.
+    own: Arc<SharedLevel>,
+    own_token: tokio_util::sync::CancellationToken,
+    /// The parent's cell for a sub-agent, when this lease is bounded by one.
+    ceiling: Option<Arc<SharedLevel>>,
+    ceiling_token: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl PermissionLease {
+    /// Wait for any level that contributed to this snapshot to be lowered.
+    pub(crate) async fn revoked(&self) {
+        match &self.ceiling_token {
+            Some(ceiling) => tokio::select! {
+                () = self.own_token.cancelled() => {},
+                () = ceiling.cancelled() => {},
+            },
+            None => self.own_token.cancelled().await,
+        }
+    }
+
+    /// Whether the lease has already ended, for a caller checking between synchronous steps
+    /// rather than awaiting the revocation.
+    #[cfg_attr(
+        not(windows),
+        allow(
+            dead_code,
+            reason = "the synchronous staging and export walks that poll it are host-side"
+        )
+    )]
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.own_token.is_cancelled()
+            || self
+                .ceiling_token
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    }
+
+    /// Run `launch` only if this lease's authority still holds, holding the same setter locks a
+    /// downgrade takes so the check and the launch cannot interleave with one.
+    ///
+    /// `launch` runs synchronously and must not await: it is for acquiring an owned process, not
+    /// for doing its work. The lock order is ceiling before own, the only order in which two cells
+    /// are ever held together. The snapshot token, not the current level alone, decides: a
+    /// downgrade followed by a raise replaces the cell's token, so a lease taken before that pair
+    /// stays dead even though the level reads high again.
+    ///
+    /// `required.is_within(level)` rather than `level.allows(required)`: the latter treats
+    /// `workspace` and `unrestricted` as equal, which is right for dispatching a tool but wrong for
+    /// a target whose transport has no boundary at all.
+    pub(crate) fn with_current_authority<T>(
+        &self,
+        required: Permission,
+        launch: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let ceiling_guard = self
+            .ceiling
+            .as_ref()
+            .map(|ceiling| crate::sync::lock(&ceiling.lease));
+        let own_guard = crate::sync::lock(&self.own.lease);
+        if self.own_token.is_cancelled()
+            || self
+                .ceiling_token
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+        {
+            return None;
+        }
+        let own = SharedPermission::decode(self.own.value.load(Ordering::Relaxed));
+        let level = match (&self.ceiling, &ceiling_guard) {
+            (Some(ceiling), Some(_guard)) => own.greatest_within_both(SharedPermission::decode(
+                ceiling.value.load(Ordering::Relaxed),
+            )),
+            _ => own,
+        };
+        if !required.is_within(level) {
+            return None;
+        }
+        let launched = launch();
+        drop(own_guard);
+        drop(ceiling_guard);
+        Some(launched)
+    }
+}
+
+/// Shared handle to the current [`Permission`] level and the approvals switch. Ordinary reads
+/// are lock-free. The screen mutates it when the user cycles permission via `Shift+Tab` or
+/// `/permission`, or toggles `/approvals`; the dispatch loop reads it at the enforcement site.
 #[derive(Clone)]
 pub(crate) struct SharedPermission {
-    inner: Arc<AtomicU8>,
+    inner: Arc<SharedLevel>,
     enabled: EnabledPermissions,
     /// A parent's live level, for a sub-agent's handle. [`Self::get`] returns the greatest level
     /// within *both* this and `inner`, so a parent downgrade takes effect on the sub-agent's very
@@ -367,7 +489,7 @@ pub(crate) struct SharedPermission {
     /// sub-agent sees the prompt indicator change and the parent's next call denied, while the
     /// sub-agent keeps writing files and running unsandboxed commands to completion, and
     /// `permissions.md` presents cycling the parent as the way to restrict sub-agents.
-    ceiling: Option<Arc<AtomicU8>>,
+    ceiling: Option<Arc<SharedLevel>>,
     /// Whether a call needing more than the level is submitted for approval rather than refused.
     ///
     /// One cell shared down the tree: a sub-agent built by [`Self::with_ceiling`] holds its
@@ -381,7 +503,7 @@ impl SharedPermission {
     /// A root handle at `initial`, with approvals off.
     pub(crate) fn new(initial: Permission, enabled: EnabledPermissions) -> Self {
         Self {
-            inner: Arc::new(AtomicU8::new(initial as u8)),
+            inner: Arc::new(SharedLevel::new(initial)),
             enabled,
             ceiling: None,
             approvals: Arc::new(AtomicBool::new(false)),
@@ -408,7 +530,7 @@ impl SharedPermission {
         parent: &SharedPermission,
     ) -> Self {
         Self {
-            inner: Arc::new(AtomicU8::new(initial as u8)),
+            inner: Arc::new(SharedLevel::new(initial)),
             enabled,
             // Share the parent's *own* cell rather than its effective value, and flatten a chain:
             // a grandchild whose parent is itself bounded takes the root's cell, and its own
@@ -437,10 +559,32 @@ impl SharedPermission {
 
     /// The level in force right now, bounded by the parent's for a sub-agent.
     pub(crate) fn get(&self) -> Permission {
-        let own = Self::decode(self.inner.load(Ordering::Relaxed));
+        let own = self.inner.get();
         match &self.ceiling {
-            Some(parent) => own.greatest_within_both(Self::decode(parent.load(Ordering::Relaxed))),
+            Some(parent) => own.greatest_within_both(parent.get()),
             None => own,
+        }
+    }
+
+    /// The chosen level and a lease that ends on a downgrade, even if it is immediately undone.
+    pub(crate) fn lease(&self) -> PermissionLease {
+        let (level, own_token) = self.inner.lease();
+        let (level, ceiling, ceiling_token) = if let Some(parent) = &self.ceiling {
+            let (parent_level, parent_lease) = parent.lease();
+            (
+                level.greatest_within_both(parent_level),
+                Some(Arc::clone(parent)),
+                Some(parent_lease),
+            )
+        } else {
+            (level, None, None)
+        };
+        PermissionLease {
+            level,
+            own: Arc::clone(&self.inner),
+            own_token,
+            ceiling,
+            ceiling_token,
         }
     }
 
@@ -480,7 +624,7 @@ impl SharedPermission {
     /// Low-level setter that bypasses the enabled-set check. Used by `try_set` / `cycle` and by
     /// tests that need to construct edge cases.
     pub(crate) fn set_unchecked(&self, permission: Permission) {
-        self.inner.store(permission as u8, Ordering::Relaxed);
+        self.inner.set(permission);
     }
 
     /// Advance to the next enabled level in `none → read → workspace → unrestricted → ...` order,
@@ -530,6 +674,136 @@ mod tests {
         assert!(!Permission::None.allows(Permission::Read));
         assert!(!Permission::None.allows(Permission::Workspace));
         assert!(!Permission::None.allows(Permission::Unrestricted));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn raising_permissions_does_not_revive_a_revoked_guest_lease() {
+        let permission = SharedPermission::new(Permission::Workspace, EnabledPermissions::ALL);
+        let previous = permission.lease();
+        assert_eq!(previous.level, Permission::Workspace);
+        permission.set_unchecked(Permission::Read);
+        assert_eq!(permission.lease().level, Permission::Read);
+        permission.set_unchecked(Permission::Unrestricted);
+        assert!(futures::poll!(std::pin::pin!(previous.revoked())).is_ready());
+        let current = permission.lease();
+        assert_eq!(current.level, Permission::Unrestricted);
+        assert!(futures::poll!(std::pin::pin!(current.revoked())).is_pending());
+    }
+
+    /// The gate checks the snapshot's authority and starts the process under the same setter lock
+    /// a downgrade needs, so neither "the level was high" nor "the process started" can be true
+    /// across a downgrade that slipped between them.
+    #[test]
+    fn a_launch_gate_holds_the_setter_lock_across_the_check_and_the_launch() {
+        let permission = SharedPermission::new(Permission::Unrestricted, EnabledPermissions::ALL);
+        let lease = permission.lease();
+        let inside = Arc::new(std::sync::Barrier::new(2));
+        let (launched, launched_rx) = std::sync::mpsc::channel();
+        let (set_done, set_done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let gate = {
+                let lease = lease.clone();
+                let inside = Arc::clone(&inside);
+                scope.spawn(move || {
+                    lease.with_current_authority(Permission::Unrestricted, || {
+                        launched.send(()).expect("report the launch");
+                        inside.wait();
+                    })
+                })
+            };
+            launched_rx.recv().expect("the launch started");
+            let setter = {
+                let permission = permission.clone();
+                scope.spawn(move || {
+                    permission.set_unchecked(Permission::Read);
+                    set_done.send(()).expect("report the downgrade");
+                })
+            };
+            assert!(
+                set_done_rx
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .is_err(),
+                "a downgrade must wait for the launch gate that holds the level"
+            );
+            inside.wait();
+            gate.join().expect("the gate thread").expect("launched");
+            setter.join().expect("the setter thread");
+            set_done_rx.recv().expect("the downgrade finished");
+        });
+        assert!(lease.is_revoked());
+        assert!(
+            lease
+                .with_current_authority(Permission::Unrestricted, || ())
+                .is_none(),
+            "a completed launch does not leave the lease usable"
+        );
+    }
+
+    /// A downgrade that wins the lock refuses the launch, and a later raise must not revive the
+    /// lease that was already ended.
+    #[test]
+    fn a_downgrade_before_the_launch_refuses_it_and_a_raise_does_not_revive_it() {
+        let permission = SharedPermission::new(Permission::Unrestricted, EnabledPermissions::ALL);
+        let lease = permission.lease();
+        permission.set_unchecked(Permission::Read);
+        let launched = std::cell::Cell::new(false);
+        assert!(
+            lease
+                .with_current_authority(Permission::Unrestricted, || launched.set(true))
+                .is_none()
+        );
+        assert!(!launched.get());
+        permission.set_unchecked(Permission::Unrestricted);
+        assert!(
+            lease
+                .with_current_authority(Permission::Unrestricted, || launched.set(true))
+                .is_none(),
+            "the lease ended at the downgrade even though the level reads high again"
+        );
+        assert!(!launched.get());
+    }
+
+    /// The gate asks the authority-bound question, so `workspace` cannot satisfy a launch that
+    /// requires `unrestricted` merely because it may dispatch that tool.
+    #[test]
+    fn a_launch_gate_uses_the_authority_bound_not_tool_dispatch() {
+        let permission = SharedPermission::new(Permission::Workspace, EnabledPermissions::ALL);
+        let lease = permission.lease();
+        assert!(
+            lease
+                .with_current_authority(Permission::Workspace, || ())
+                .is_some()
+        );
+        assert!(
+            lease
+                .with_current_authority(Permission::Unrestricted, || ())
+                .is_none()
+        );
+    }
+
+    /// A sub-agent's lease is bounded by the parent's live level: lowering the parent refuses a
+    /// launch the child itself still permits.
+    #[test]
+    fn a_launch_gate_honors_a_parent_ceiling() {
+        let parent = SharedPermission::new(Permission::Unrestricted, EnabledPermissions::ALL);
+        let child = SharedPermission::with_ceiling(
+            Permission::Unrestricted,
+            EnabledPermissions::ALL,
+            &parent,
+        );
+        let lease = child.lease();
+        assert!(
+            lease
+                .with_current_authority(Permission::Unrestricted, || ())
+                .is_some()
+        );
+        parent.set_unchecked(Permission::Read);
+        assert!(
+            lease
+                .with_current_authority(Permission::Unrestricted, || ())
+                .is_none()
+        );
     }
 
     /// `workspace` must dispatch every tool, including the ones that declare the rung above it.

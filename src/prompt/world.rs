@@ -26,6 +26,44 @@ pub(crate) fn render_world_state(
     render_world_state_diff(current, previous)
 }
 
+/// [`render_world_state`] and the snapshot to record as told: the candidate corrected for the
+/// bodies this render actually communicated.
+///
+/// A delta names what changed under a budget, and a changed body whose line the entry budget cut
+/// never reached the window. Recording the candidate would claim it did: a later retraction would
+/// say "the copy above is superseded" of a copy that was never above, and a change the model
+/// never saw would stop re-announcing itself. The correction keeps the previous told body for
+/// exactly those entries, so a cut change re-announces on a later turn until it is shown (the
+/// shown entries advance the told state, so a bulk cut converges rather than repeats) and every
+/// retraction claim stays about text that is really in the window. Every other field advances to
+/// the candidate: the lines name what they do not restate.
+pub(crate) fn render_world_state_tracked(
+    current: &WorldSnapshot,
+    previous: Option<&WorldSnapshot>,
+) -> (String, WorldSnapshot) {
+    let Some(previous) = previous else {
+        return (render_world_state_full(current), current.clone());
+    };
+    if previous == current {
+        return (String::new(), current.clone());
+    }
+    let (rendered, bodies_cut) = render_world_state_diff_tracked(current, previous);
+    if bodies_cut.is_empty() {
+        return (rendered, current.clone());
+    }
+    let mut told = current.clone();
+    for entry in &mut told.memories {
+        if bodies_cut.contains(&entry.name) {
+            entry.inline_body = previous
+                .memories
+                .iter()
+                .find(|before| before.name == entry.name)
+                .and_then(|before| before.inline_body.clone());
+        }
+    }
+    (rendered, told)
+}
+
 /// The whole picture, for a session's first turn and for the turn after a compaction.
 pub(super) fn render_world_state_full(current: &WorldSnapshot) -> String {
     let catalog: Vec<ToolCatalogEntry> = current
@@ -68,13 +106,17 @@ pub(super) fn render_world_state_full(current: &WorldSnapshot) -> String {
         ));
     }
 
-    if !current.memories.is_empty() {
-        sections.push(render_memory_section(
-            &current.memories,
-            current.inline_overflow.as_ref(),
-            current.memory_tools,
-            current.project.as_deref(),
-        ));
+    if !current.memories.is_empty() || current.memories_state != MemoryIndexState::Read {
+        sections.push(match current.memories_state {
+            MemoryIndexState::Unknown => render_unavailable_memories(),
+            state => render_memory_section(
+                &current.memories,
+                current.inline_overflow.as_ref(),
+                current.memory_tools,
+                current.project.as_deref(),
+                state,
+            ),
+        });
     }
 
     if !current.scheduled.is_empty() {
@@ -309,6 +351,23 @@ pub(super) const MEMORY_INDEX_MAX_ENTRIES: usize = 200;
 /// signpost, not a census.
 pub(super) const MEMORY_TAG_HISTOGRAM_MAX: usize = 6;
 
+/// The `[Memory]` section for a turn whose store read failed with no last-known index for the
+/// current view.
+///
+/// It must not look like an empty index: the model reads this block as the list of notes in force,
+/// and a bare heading would say the store is empty, which is a claim about the store this turn
+/// cannot make. It also must not name the entries the previous view held, because those belong to
+/// another project, or to a store state that may have moved.
+pub(super) fn render_unavailable_memories() -> String {
+    String::from(
+        "[Memory]\n\
+         The memory store could not be read just now, and no last-known index is available for \
+         this view. The notes in force here are unknown, not empty: none have been shown to be \
+         deleted, and this section is not a statement that there are none. Try `memory_read` or \
+         `memory_search`; an answer they return is current.",
+    )
+}
+
 /// The `[Memory]` section: the header, the standing band, the index and the footers, over the
 /// memories the session sees.
 ///
@@ -322,6 +381,7 @@ pub(super) fn render_memory_section(
     overflow: Option<&InlineOverflow>,
     tools: MemoryTools,
     project: Option<&str>,
+    state: MemoryIndexState,
 ) -> String {
     let now = std::time::SystemTime::now();
     // `memory_read` is unconditional because the section itself is gated on it. The rest is not:
@@ -344,6 +404,15 @@ pub(super) fn render_memory_section(
             " Use `memory_write` for what later sessions need: preferences, constraints, \
              decisions and facts. The scratchpad holds a session's temporary task state and large \
              outputs, and later sessions do not read it.",
+        );
+    }
+    // Cached records are shown, but never as a fresh read: the store may have moved since they
+    // were taken (another client writes without this session's reads succeeding), and a model
+    // that treats them as current acts on a claim this turn cannot make.
+    if state == MemoryIndexState::LastKnown {
+        out.push_str(
+            " The store could not be read just now, so this is its last known index, not fresh: \
+             entries may have changed since.",
         );
     }
     out.push_str("\n\n");
@@ -488,7 +557,7 @@ pub(super) fn render_memory_section(
 /// One index line: name, priority, age, deadline and description.
 fn index_line(entry: &MemoryIndexEntry, now: std::time::SystemTime) -> String {
     format!(
-        "- **{}** (p{}, {}{}): {}\n",
+        "- **{}** (p{}, {}{}{}): {}\n",
         entry.name,
         entry.priority,
         crate::memory::render_age(entry.created, now),
@@ -496,8 +565,19 @@ fn index_line(entry: &MemoryIndexEntry, now: std::time::SystemTime) -> String {
             Some(expires) => format!(", {}", crate::memory::render_expiry(expires, now)),
             None => String::new(),
         },
+        scope_note(entry),
         crate::entry::elide_description_for_index(&entry.description)
     )
+}
+
+/// `, wsl:name` for a memory scoped to a target, empty for a portable one. Stated wherever the
+/// memory is listed so a fact about another machine is never read as a rule for this one.
+fn scope_note(entry: &MemoryIndexEntry) -> String {
+    if entry.scope.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", entry.scope)
+    }
 }
 
 /// The sentence the standing band opens with. It states the contract, because without it the
@@ -640,13 +720,14 @@ fn render_demoted_list(
 /// here would let a single memory spend the band on its description alone.
 fn standing_line(entry: &MemoryIndexEntry, now: std::time::SystemTime) -> String {
     format!(
-        "- **{}** ({}{}): {}\n",
+        "- **{}** ({}{}{}): {}\n",
         entry.name,
         crate::memory::render_age(entry.created, now),
         match entry.expires {
             Some(expires) => format!(", {}", crate::memory::render_expiry(expires, now)),
             None => String::new(),
         },
+        scope_note(entry),
         crate::entry::elide_description_for_index(&entry.description)
     )
 }
@@ -675,14 +756,25 @@ fn inline_overflow_remedy(tools: MemoryTools) -> &'static str {
     }
 }
 
-/// The diff's one-line form of the overflow, naming the demoted memories.
-fn render_inline_overflow_line(overflow: &InlineOverflow, tools: MemoryTools) -> String {
+/// The diff's one-line form of the overflow, naming the demoted memories. `supersedes_copies`
+/// appends the retraction of the copies the model was shown for entries this line demotes: the
+/// rule stands, but the window's text stops being its in-force presentation.
+fn render_inline_overflow_line(
+    overflow: &InlineOverflow,
+    tools: MemoryTools,
+    supersedes_copies: bool,
+) -> String {
     let demoted: Vec<&String> = overflow.demoted.iter().collect();
     format!(
-        "- {}, so {} {} shown by description only{}.",
+        "- {}, so {} {} shown by description only{}{}.",
         inline_overflow_lead(overflow),
         name_some_of(&demoted),
         if demoted.len() == 1 { "is" } else { "are" },
+        if supersedes_copies {
+            " (their rule copies above are superseded)"
+        } else {
+            ""
+        },
         inline_overflow_remedy(tools)
     )
 }
@@ -736,8 +828,40 @@ pub(super) const SKIP_REASON_MAX_CHARS: usize = 120;
 /// and the budget both assume.
 pub(super) const SKIP_NAME_MAX_CHARS: usize = 80;
 
-/// Only what moved since the model was last told, phrased so the new text supersedes the old.
+/// The diff line for a turn whose memory store read failed and has no last-known index to show.
+///
+/// Bounded like every other diff line: it says the state, not the reason (the store's error is in
+/// the log), and it does not name entries, which are exactly what is not known.
+const MEMORY_UNAVAILABLE_LINE: &str = "- The memory store could not be read just now; the notes in \
+     force are unknown, not empty, and none are treated as deleted.";
+
+/// The diff line that opens a restatement after the store is readable again. The section follows
+/// whole, because the previous snapshot held no records to diff against.
+const MEMORY_READABLE_AGAIN_LINE: &str =
+    "- The memory index is readable again; its section is restated.";
+
+/// The diff line for a turn whose store read failed but whose last known records stand in. The
+/// records are shown and marked as last known rather than fresh: the store may have moved since
+/// they were taken.
+const MEMORY_LAST_KNOWN_LINE: &str = "- The memory store could not be read just now; the memory \
+     index is its last known one, not a fresh read, and entries may have changed since.";
+
+/// The diff line for a turn whose store is readable again after showing last known records. Both
+/// sides hold records of this view, so the delta below says what moved; only the freshness changed
+/// on its own.
+const MEMORY_FRESH_AGAIN_LINE: &str =
+    "- The memory store is readable again; the memory index is a fresh read.";
+
+/// Only what moved since the model was last told, phrased so the new text supersedes the old, and
+/// the names whose bodies this delta cut and never sent.
 pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldSnapshot) -> String {
+    render_world_state_diff_tracked(current, previous).0
+}
+
+fn render_world_state_diff_tracked(
+    current: &WorldSnapshot,
+    previous: &WorldSnapshot,
+) -> (String, Vec<String>) {
     let mut lines: Vec<String> = Vec::new();
 
     type Facts = (Permission, bool, String);
@@ -927,23 +1051,66 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
     // section is restated under a line naming the project rather than announced memory by
     // memory: the model reads a new view, not a batch of edits to the old one. The tools, skills
     // and schedules below diff as on any turn.
+    let memory_state_changed = current.memories_state != previous.memories_state;
+    // A missing index is not an empty one. When either side is unknown, the entries below are not
+    // comparable: every name in the last-known view would look deleted, and everything in a later
+    // successful read would look newly saved, although neither happened. Last known and fresh are
+    // comparable: both hold this view's records, and the delta below is exactly what may have
+    // moved while reads failed.
+    let memory_delta_comparable = current.memories_state != MemoryIndexState::Unknown
+        && previous.memories_state != MemoryIndexState::Unknown;
     let mut restated_memories: Option<String> = None;
+    let section = |snapshot: &WorldSnapshot| {
+        render_memory_section(
+            &snapshot.memories,
+            snapshot.inline_overflow.as_ref(),
+            snapshot.memory_tools,
+            snapshot.project.as_deref(),
+            snapshot.memories_state,
+        )
+    };
     if current.project != previous.project {
         lines.push(match &current.project {
             Some(project) => format!("- Project is now '{project}'."),
             None => "- No project.".to_string(),
         });
-        if !current.memories.is_empty() {
-            restated_memories = Some(render_memory_section(
-                &current.memories,
-                current.inline_overflow.as_ref(),
-                current.memory_tools,
-                current.project.as_deref(),
-            ));
-        } else if !previous.memories.is_empty() {
-            // Said outright, since the names of the old view stand in the model's context until
-            // it is told they are gone, and the per-memory delta below is not drawn across a move.
-            lines.push("- No memories are in view.".to_string());
+        match current.memories_state {
+            MemoryIndexState::Unknown => lines.push(MEMORY_UNAVAILABLE_LINE.to_string()),
+            // The new view's records are shown even when they are only last known: which notes
+            // the new view holds is the question a move raises, and "unknown" would leave the old
+            // view's names standing uncorrected.
+            MemoryIndexState::LastKnown => {
+                lines.push(MEMORY_LAST_KNOWN_LINE.to_string());
+                restated_memories = Some(section(current));
+            }
+            MemoryIndexState::Read if previous.memories_state == MemoryIndexState::Unknown => {
+                lines.push(MEMORY_READABLE_AGAIN_LINE.to_string());
+                restated_memories = Some(section(current));
+            }
+            MemoryIndexState::Read if !current.memories.is_empty() => {
+                restated_memories = Some(section(current));
+            }
+            MemoryIndexState::Read if !previous.memories.is_empty() => {
+                // Said outright, since the names of the old view stand in the model's context until
+                // it is told they are gone, and the per-memory delta below is not drawn across a
+                // move.
+                lines.push("- No memories are in view.".to_string());
+            }
+            MemoryIndexState::Read => {}
+        }
+    } else if memory_state_changed {
+        match current.memories_state {
+            MemoryIndexState::Unknown => lines.push(MEMORY_UNAVAILABLE_LINE.to_string()),
+            // Comparable, so the delta below still draws what moved while reads failed; only the
+            // freshness changed on its own.
+            MemoryIndexState::LastKnown => lines.push(MEMORY_LAST_KNOWN_LINE.to_string()),
+            // The previous snapshot held no records to diff against, so the whole section is
+            // stated again rather than announcing the store's contents as fresh writes.
+            MemoryIndexState::Read if previous.memories_state == MemoryIndexState::Unknown => {
+                lines.push(MEMORY_READABLE_AGAIN_LINE.to_string());
+                restated_memories = Some(section(current));
+            }
+            MemoryIndexState::Read => lines.push(MEMORY_FRESH_AGAIN_LINE.to_string()),
         }
     }
     // Memories move whenever the agent writes one, which is often, so the diff carries the delta
@@ -978,12 +1145,18 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
         .inline_overflow
         .as_ref()
         .map_or(&[], |overflow| overflow.demoted.as_slice());
+    // Whether the last render put this entry's body in the window as standing rule text: the only
+    // kind of copy a retraction may claim. A body the budget demoted, or one on an expired row,
+    // was never standing text.
+    let carried_before = |before: &MemoryIndexEntry| {
+        before.inline_body.is_some() && !before.expired && !demoted_before.contains(&before.name)
+    };
     // Name alongside line, so an entry the budget cuts can still be named rather than counted,
     // and the bytes the budget charges the entry for: its line without the body.
-    let changed_memories: Vec<(String, String, usize)> = current
+    let changed_memories: Vec<(String, String, usize, bool)> = current
         .memories
         .iter()
-        .filter(|_| same_project)
+        .filter(|_| same_project && memory_delta_comparable)
         .filter(|entry| {
             // Compare only what the model was told, not `created`. Rewriting a memory with
             // identical content is noise to re-announce; the timestamp still rides in the
@@ -992,9 +1165,12 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
             // `inline_body` and `tags` are in the comparison because both are things the model was
             // told: an inline body is rendered in full, so editing one changes what is in
             // force, and the tag histogram is what stands in for everything the budget could not
-            // list. A field added to `MemoryIndexEntry` and left out here makes a pair of
-            // snapshots differ while rendering nothing, which
-            // `world_state_diff_never_advances_silently` exists to catch.
+            // list. `applies` is there because a scope can stop reaching this session with the
+            // stored text untouched (a permission drop, a lost target), and the body it carried
+            // then stops being a rule the model may follow. A field added to
+            // `MemoryIndexEntry` and left out here makes a pair of snapshots differ while
+            // rendering nothing, which `world_state_diff_never_advances_silently` exists to
+            // catch.
             previous_memories
                 .get(entry.name.as_str())
                 .is_none_or(|before| {
@@ -1006,6 +1182,8 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
                         || before.expires != entry.expires
                         || before.expired != entry.expired
                         || before.project != entry.project
+                        || before.scope != entry.scope
+                        || before.applies != entry.applies
                 })
         })
         // An expiry passing is announced on its own line below, as an expiry rather than an
@@ -1025,18 +1203,45 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
         // a tags-only edit emits a line byte-identical to the index entry already in context,
         // which is a change announcement carrying no change.
         .map(|entry| {
-            let (line, counted) = memory_change_line(
+            let before = previous_memories.get(entry.name.as_str());
+            // Reachability, not the scope string: the string is unchanged when a target goes out
+            // of reach, and that is precisely the case where the body it carried has to be
+            // retracted in words. "Supersedes the copy above" is claimed only where the band
+            // actually rendered that copy whole: a body the budget demoted, or one already
+            // expired, was never standing rule text in the window.
+            let scope_change = match before {
+                Some(before) if before.applies && !entry.applies => ScopeChange::Lost {
+                    supersedes_body: carried_before(before),
+                },
+                // Only where the stored scope did not move: if it did, the `[scope ...]` marker on
+                // the same line is what says which target the note now follows, and a clause
+                // about a target would claim one the row no longer names.
+                Some(before) if before.scope == entry.scope && !before.applies && entry.applies => {
+                    ScopeChange::Regained
+                }
+                _ => ScopeChange::None,
+            };
+            // The body leaves the window's standing text without a scope change behind it: a load
+            // demoted to search-only, or the body text removed from the row. The copy the model
+            // was shown has stopped being the rule it claims to be, so the line says so where it
+            // renders; the bounded retraction below covers it where this line is cut.
+            let supersedes_copy = scope_change == ScopeChange::None
+                && before.is_some_and(|before| carried_before(before))
+                && entry.inline_body.is_none();
+            let (line, counted, body_sent) = memory_change_line(
                 entry,
                 !demoted_now.contains(&entry.name),
                 mark_global && entry.project.is_empty(),
+                scope_change,
+                supersedes_copy,
             );
-            (entry.name.clone(), line, counted)
+            (entry.name.clone(), line, counted, body_sent)
         })
         .collect();
     let removed_memories: Vec<String> = previous
         .memories
         .iter()
-        .filter(|_| same_project)
+        .filter(|_| same_project && memory_delta_comparable)
         .filter(|entry| {
             !current
                 .memories
@@ -1049,7 +1254,7 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
     let expired_memories: Vec<String> = current
         .memories
         .iter()
-        .filter(|_| same_project)
+        .filter(|_| same_project && memory_delta_comparable)
         .filter(|entry| {
             entry.expired
                 && previous_memories
@@ -1059,28 +1264,141 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
         .map(tiered_name)
         .collect();
 
+    let (changed_rendered, mut bodies_sent) = budgeted_memory_entries(&changed_memories);
     if !changed_memories.is_empty() {
-        lines.push(format!(
-            "- Memories saved or updated: {}",
-            budgeted_memory_entries(&changed_memories)
-        ));
+        lines.push(format!("- Memories saved or updated: {changed_rendered}"));
+    }
+    // A rule copy the model was shown whole leaves the window's standing text on a route or
+    // project loss, an expiry, a load demotion to search-only, or a deletion (each of which is
+    // also the rule leaving force) and separately on a budget demotion, where the rule stands
+    // but its text can no longer be presented. The per-note lines name the ones they show, but a
+    // line the entry budget cut, or a name past the name cap, would leave a copy standing in the
+    // window with nothing retracting it. The retraction below is bounded on its own, outside
+    // those budgets, and keys on the target and the project tier the copies were carried under,
+    // so copies no line named are covered too; when even that cannot identify the affected copies
+    // precisely, the standing band is restated under an explicit supersession rule instead.
+    let mut retracted: Vec<(String, String)> = Vec::new();
+    let mut demoted_copies: Vec<String> = Vec::new();
+    // Transitions within one view. Not across a store read that found nothing: a failed read is
+    // no evidence that anything left force, and its empty records must not retract the world.
+    if same_project && memory_delta_comparable {
+        for entry in &current.memories {
+            let Some(before) = previous_memories.get(entry.name.as_str()) else {
+                continue;
+            };
+            if !carried_before(before) {
+                continue;
+            }
+            if entry.inline_body.is_none() || entry.expired {
+                retracted.push((copy_key(entry), tiered_name(entry)));
+            } else if demoted_now.contains(&entry.name) {
+                demoted_copies.push(tiered_name(entry));
+            }
+        }
+        for entry in &previous.memories {
+            if !current.memories.iter().any(|live| live.name == entry.name) && carried_before(entry)
+            {
+                retracted.push((copy_key(entry), tiered_name(entry)));
+            }
+        }
+    }
+    // A move between projects takes the old tier's rules out of force here whatever the new view
+    // reads like: the session left their project, so their copies stand in the window as
+    // instructions for one it is no longer on. Said even when the new view is unknown.
+    if current.project != previous.project
+        && let Some(old_project) = &previous.project
+    {
+        for entry in &previous.memories {
+            if &entry.project == old_project && carried_before(entry) {
+                retracted.push((copy_key(entry), tiered_name(entry)));
+            }
+        }
+    }
+    // A key under which nothing standing remains is named as a key: "every rule copy carried
+    // above for target `wsl:build`" says precisely which copies die without listing them, which
+    // is what covers the entries no line named.
+    let mut whole_keys: Vec<String> = Vec::new();
+    let mut partial: Vec<String> = Vec::new();
+    for (key, name) in &retracted {
+        let stands = current.memories.iter().any(|entry| {
+            copy_key(entry) == *key
+                && entry.inline_body.is_some()
+                && !entry.expired
+                && !demoted_now.contains(&entry.name)
+        });
+        if stands {
+            partial.push(name.clone());
+        } else if !whole_keys.contains(key) {
+            whole_keys.push(key.clone());
+        }
+    }
+    let fallback = whole_keys.len() > MEMORY_KEY_RULES_MAX
+        || partial.len() > MEMORY_NAMES_MAX
+        || demoted_copies.len() > MEMORY_NAMES_MAX;
+    if fallback {
+        // The copies cannot be named within their bounds, so the band speaks for itself: what it
+        // restates is in force, and everything else the model holds is dead text.
+        if !retracted.is_empty() || !demoted_copies.is_empty() {
+            lines.push(
+                "- The standing rules restated below are the rules in force now; every rule copy \
+                 carried earlier that is not restated below is superseded."
+                    .to_string(),
+            );
+        }
+        let standing: Vec<&MemoryIndexEntry> = current
+            .memories
+            .iter()
+            .filter(|entry| entry.inline_body.is_some() && !entry.expired)
+            .collect();
+        let band = render_standing_memories(
+            &standing,
+            current.inline_overflow.as_ref(),
+            current.memory_tools,
+            std::time::SystemTime::now(),
+        );
+        if !band.is_empty() {
+            lines.push(band);
+        }
+    } else {
+        for key in &whole_keys {
+            lines.push(format!(
+                "- Standing rules no longer in force here: every rule copy carried above for \
+                 {key} is superseded."
+            ));
+        }
+        if !partial.is_empty() {
+            lines.push(format!(
+                "- Standing rules no longer in force here; their rule copies above are \
+                 superseded: {}",
+                name_some_rendered(&partial)
+            ));
+        }
     }
     // The band's layout moves without any memory changing: an operator door can push a rule out
     // of the budget, and a cleanup can bring one back. Announced in both directions, because the
-    // snapshot advances either way.
-    if same_project && current.inline_overflow != previous.inline_overflow {
+    // snapshot advances either way. A demotion also retracts the copy the model was shown: the
+    // rule stands, but the window's text stops being its in-force presentation, and the model
+    // must read the entry before relying on the copy it holds.
+    if same_project
+        && memory_delta_comparable
+        && current.inline_overflow != previous.inline_overflow
+    {
         lines.push(match &current.inline_overflow {
-            Some(overflow) => render_inline_overflow_line(overflow, current.memory_tools),
+            Some(overflow) => render_inline_overflow_line(
+                overflow,
+                current.memory_tools,
+                !fallback && !demoted_copies.is_empty(),
+            ),
             None => "- Every inline memory fits the budget again.".to_string(),
         });
     }
     // A body coming back into the band is restated whole: the model has only ever seen its
     // description, and the next full render is a compaction away. One the line above restated
     // already is not repeated.
-    let recovered: Vec<(String, String, usize)> = current
+    let recovered: Vec<(String, String, usize, bool)> = current
         .memories
         .iter()
-        .filter(|_| same_project)
+        .filter(|_| same_project && memory_delta_comparable)
         .filter(|entry| {
             entry.inline_bytes() > 0
                 && demoted_before.contains(&entry.name)
@@ -1090,17 +1408,33 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
                     .any(|(name, ..)| *name == entry.name)
         })
         .map(|entry| {
-            let (line, counted) =
-                memory_change_line(entry, true, mark_global && entry.project.is_empty());
-            (entry.name.clone(), line, counted)
+            let (line, counted, body_sent) = memory_change_line(
+                entry,
+                true,
+                mark_global && entry.project.is_empty(),
+                ScopeChange::None,
+                false,
+            );
+            (entry.name.clone(), line, counted, body_sent)
         })
         .collect();
+    let (recovered_rendered, recovered_sent) = budgeted_memory_entries(&recovered);
+    bodies_sent.extend(recovered_sent);
     if !recovered.is_empty() {
         lines.push(format!(
-            "- Inline memories shown in full again: {}",
-            budgeted_memory_entries(&recovered)
+            "- Inline memories shown in full again: {recovered_rendered}"
         ));
     }
+    // The bodies this delta actually put in the window. A changed body whose line the entry
+    // budget cut was never communicated, and the told snapshot must not record it as if it were:
+    // a later retraction may only claim "the copy above" of a copy that is above, and a cut
+    // change re-announces on a later turn until it is shown.
+    let bodies_cut: Vec<String> = changed_memories
+        .iter()
+        .chain(recovered.iter())
+        .filter(|(name, _, _, carries)| *carries && !bodies_sent.contains(name))
+        .map(|(name, ..)| name.clone())
+        .collect();
     if !expired_memories.is_empty() {
         lines.push(format!(
             "- Memories expired, no longer in force: {}",
@@ -1226,7 +1560,7 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
     }
 
     if lines.is_empty() && server_blocks.is_empty() {
-        return String::new();
+        return (String::new(), bodies_cut);
     }
 
     let mut out = String::from(
@@ -1247,7 +1581,7 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
         out.push_str(&block);
         out.push('\n');
     }
-    out
+    (out, bodies_cut)
 }
 
 /// One deferred-tool line, matching the `[Tool discovery]` shape of the full render so the model
@@ -1313,9 +1647,43 @@ pub(super) fn join_names<'a>(names: impl Iterator<Item = &'a String>) -> String 
         .join(", ")
 }
 
+/// How a memory's scope reached this session between the last render and this one.
+///
+/// A separate question from what the stored `scope` string says. The string can be identical on
+/// both sides of a `Lost`: a target that stops being reachable takes its notes out of force
+/// without touching their rows, and the model has to be told, or the body it was shown stays in
+/// the window as an instruction the session is no longer on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScopeChange {
+    /// Nothing about reachability moved.
+    None,
+    /// The scope was in force and is not any more. `supersedes_body` is whether the previous
+    /// render put the body in the window whole, which is the only thing the "copy above" clause
+    /// may claim.
+    Lost { supersedes_body: bool },
+    /// The same scope reaches this session again, after having been withheld: the row did not
+    /// move, only the session's route to it.
+    Regained,
+}
+
+/// The key a rule copy is carried under: the target a scoped note follows, else the project tier
+/// it sits in. A route loss takes a target's copies whole and a project move takes a tier's
+/// copies whole, so a retraction keyed this way names what it covers without naming every note,
+/// which is what reaches copies no per-note line named.
+fn copy_key(entry: &MemoryIndexEntry) -> String {
+    if !entry.scope.is_empty() {
+        format!("target `{}`", entry.scope)
+    } else if entry.project.is_empty() {
+        "global notes".to_string()
+    } else {
+        format!("project '{}'", entry.project)
+    }
+}
+
 /// One memory's entry in a diff line: name, priority and description, then its tags and standing,
-/// and its whole body indented beneath when `with_body` and the band renders it. Also the bytes
-/// the diff's budget charges the entry for, which is the line without the body.
+/// and its whole body indented beneath when `with_body` and the band renders it. The bytes the
+/// diff's budget charges the entry for, which is the line without the body, and whether the body
+/// actually rode the line, are returned alongside it.
 ///
 /// The line carries what *changed*, not just that something did. A full `[Memory]` render only
 /// happens when there is no previous snapshot, so for the rest of a session this delta is the only
@@ -1328,7 +1696,9 @@ fn memory_change_line(
     entry: &MemoryIndexEntry,
     with_body: bool,
     mark_global: bool,
-) -> (String, usize) {
+    scope_change: ScopeChange,
+    supersedes_copy: bool,
+) -> (String, usize, bool) {
     // Elided like every other rendered description: descriptions are deliberately unbounded at
     // the write door, and the diff is the only channel after the first turn, so one long
     // description here would outweigh the budget the rest of the section is engineered around.
@@ -1341,8 +1711,49 @@ fn memory_change_line(
     if !entry.tags.is_empty() {
         line.push_str(&format!(" [{}]", entry.tags.join(", ")));
     }
+    if !entry.scope.is_empty() {
+        line.push_str(&format!(" [scope {}]", entry.scope));
+    }
     if mark_global {
         line.push_str(" (global)");
+    }
+    match scope_change {
+        ScopeChange::None => {}
+        // The scope names another machine, or one this session can no longer reach; saying which
+        // it is would be a guess. What the model needs is that the rule it holds has stopped
+        // applying, in the same breath as the name it belongs to.
+        ScopeChange::Lost {
+            supersedes_body: true,
+        } => line.push_str(
+            " (no longer in force here: its scope names a target this session cannot reach, so \
+             the copy above is superseded)",
+        ),
+        ScopeChange::Lost {
+            supersedes_body: false,
+        } => line.push_str(
+            " (no longer in force here: its scope names a target this session cannot reach)",
+        ),
+        // Said of the reachability only. Whether the body is sent with this line decides between
+        // "in force" and the honest weaker claim: a rule that cannot be shown its text here is
+        // merely reachable, and `memory_read` is where its text lives. Claiming it in force
+        // without the text is exactly the standing-rule lie the band exists to prevent.
+        ScopeChange::Regained => {
+            if with_body && entry.inline_body.is_some() {
+                line.push_str(
+                    " (in force here again: its scope names a target this session can reach now)",
+                );
+            } else {
+                line.push_str(
+                    " (reachable here again: its scope names a target this session can reach \
+                     now; `memory_read` for its text)",
+                );
+            }
+        }
+    }
+    // The body's copy stops being the rule it claims to be without a scope change behind it: a
+    // load demoted to search-only, or the text removed from the row.
+    if supersedes_copy {
+        line.push_str(" (its rule copy above is superseded)");
     }
     // Where the entry now stands: out of the index, past its date, or dated. A memory written as
     // expired is announced as such on the one line it gets.
@@ -1356,14 +1767,17 @@ fn memory_change_line(
         ));
     }
     let counted = line.len();
+    let mut body_sent = false;
     if with_body && let Some(body) = &entry.inline_body {
         line.push_str(&format!("\n  {}", body.replace('\n', "\n  ")));
+        body_sent = true;
     }
-    (line, counted)
+    (line, counted, body_sent)
 }
 
-/// `(name, line, counted)` entries joined for one diff line: as many as the budget takes, then the
-/// names of the rest.
+/// `(name, line, counted, body)` entries joined for one diff line: as many as the budget takes,
+/// then the names of the rest. The names whose bodies the shown lines carry come back alongside
+/// the rendered line, so the told snapshot can record what was actually communicated.
 ///
 /// Budgeted on the entry lines alone, against the index's own ceiling. The entry count is
 /// unbounded (a restore loop through `PUT /v1/memories/{name}` moves thousands of rows between two
@@ -1376,30 +1790,39 @@ fn memory_change_line(
 /// therefore predates the very writes being announced, so a hundred memories written between two
 /// turns would render some and tell the model the others were somewhere they were not. Names are
 /// what a `memory_read` needs, and they are short.
-fn budgeted_memory_entries(entries: &[(String, String, usize)]) -> String {
+fn budgeted_memory_entries(entries: &[(String, String, usize, bool)]) -> (String, Vec<String>) {
     let mut shown = 0;
     let mut bytes = 0;
-    for (.., counted) in entries {
+    for (_, _, counted, _) in entries {
         if shown > 0 && bytes + counted > MEMORY_INDEX_MAX_BYTES {
             break;
         }
         bytes += counted;
         shown += 1;
     }
+    let bodies_sent: Vec<String> = entries
+        .iter()
+        .take(shown)
+        .filter(|(_, _, _, body)| *body)
+        .map(|(name, ..)| name.clone())
+        .collect();
     let rendered = entries
         .iter()
         .take(shown)
-        .map(|(_, line, _)| line.as_str())
+        .map(|(_, line, ..)| line.as_str())
         .collect::<Vec<_>>()
         .join("; ");
     if shown < entries.len() {
         let cut: Vec<&String> = entries.iter().skip(shown).map(|(name, ..)| name).collect();
-        format!(
-            "{rendered}; and {}, not restated here; `memory_read` them",
-            name_some_of(&cut)
+        (
+            format!(
+                "{rendered}; and {}, not restated here; `memory_read` them",
+                name_some_of(&cut)
+            ),
+            bodies_sent,
         )
     } else {
-        rendered
+        (rendered, bodies_sent)
     }
 }
 
@@ -1415,6 +1838,12 @@ fn budgeted_memory_entries(entries: &[(String, String, usize)]) -> String {
 /// Forty is enough to act on and enough to recognize a bulk change for what it is. Past that the
 /// count is the information.
 pub(super) const MEMORY_NAMES_MAX: usize = 40;
+
+/// How many target and project keys the copy-retraction rule states before it stops listing them
+/// and restates the standing band under a blanket supersession rule instead. Keys are a handful
+/// per session in practice, and a rule that cannot name what it retracts must restate what still
+/// stands rather than wave at the rest.
+pub(super) const MEMORY_KEY_RULES_MAX: usize = 4;
 
 /// Name up to [`MEMORY_NAMES_MAX`] memories, then say how many are not named.
 ///

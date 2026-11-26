@@ -133,6 +133,13 @@ impl Tool for MemoryWriteTool {
                         "description": "Tier the memory lives in. A new memory takes the session's project, or global \
                                         when it has none; an existing one keeps its tier unless the other is \
                                         named, which moves it."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Where the fact applies: 'portable' (default), 'windows', or 'wsl:<distro>'. \
+                                        A target-specific note is still listed in the memory index everywhere, so it stays \
+                                        searchable, but its body is put in context as an instruction only in a session on \
+                                        that target. Omit to keep; pass \"\" to clear."
                     }
                 },
                 "required": ["name"]
@@ -232,6 +239,17 @@ impl Tool for MemoryWriteTool {
                 memory::parse_expiry(raw).map_err(|message| tool_error("memory_write", message))?,
             )),
         };
+        // Where the fact applies: `None` keeps a stored memory's scope, `""` clears it to
+        // portable, anything else names a target. Normalized here for the reason the source is:
+        // `portable` and `""` are one stored spelling, and a scope naming a target no session can
+        // be on is refused rather than stored as a note that is listed but never inlined.
+        let scope = match optional_str_allowing_empty(&input, "scope", "memory_write")? {
+            None => None,
+            Some(raw) => Some(
+                memory::normalize_scope(raw)
+                    .map_err(|message| tool_error("memory_write", message))?,
+            ),
+        };
         // The tier, as the store takes it: `None` keeps a stored memory's tier and creates in
         // the session's own, an empty project is the global tier. `project` names the session's,
         // and a session on none has no such tier to name.
@@ -317,6 +335,7 @@ impl Tool for MemoryWriteTool {
                 load,
                 references,
                 source,
+                scope,
                 expires_at,
                 verified,
             })

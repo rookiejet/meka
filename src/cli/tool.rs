@@ -157,6 +157,14 @@ impl ReferenceTools {
             crate::provider::PublishedProfile::unbound(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
         );
+        #[cfg(windows)]
+        let cells = {
+            let mut cells = cells;
+            let wsl = config.managed_wsl()?;
+            let needs_workspace = wsl.is_some() && config.managed_wsl_needs_workspace();
+            cells.set_managed_wsl(wsl.map(std::sync::Arc::new), needs_workspace);
+            cells
+        };
         let registry = ToolRegistry::build_default(
             &materials,
             &cells,
@@ -196,23 +204,17 @@ impl ReferenceTools {
             bool,
         ),
     ) -> crate::view::ConfiguredToolView {
-        let override_entry = self.filter.permission_overrides.get(&name).copied();
+        let permission =
+            crate::tools::effective_permission(&self.filter.permission_overrides, &name, required);
+        let overridden = self.filter.permission_overrides.contains_key(&name)
+            || (crate::subshell::is_tool(&name) && permission != required);
         let enabled = self.filter.admits(&name)
             && (self.agent_family_registered
                 || !crate::tools::subagent::AGENT_TOOL_NAMES.contains(&name.as_str()))
             && (self.web_fetch_registered || name != "web_fetch");
         crate::view::ConfiguredToolView {
-            tool: crate::view::ToolView::new(
-                name,
-                description,
-                override_entry.unwrap_or(required),
-                deferred,
-            ),
-            permission_source: if override_entry.is_some() {
-                "override"
-            } else {
-                "builtin"
-            },
+            tool: crate::view::ToolView::new(name, description, permission, deferred),
+            permission_source: if overridden { "override" } else { "builtin" },
             enabled,
         }
     }

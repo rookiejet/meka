@@ -88,6 +88,14 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # Cargo has no test target for a build script, so the ELF fixture harness is compiled and
+      # run directly. Without this step a regression in the payload checks passes every gate.
+      - name: Run the build script's fixture harness
+        shell: bash
+        run: |
+          rustc --edition 2024 --test build.rs -o "$RUNNER_TEMP/meka-build-tests.exe"
+          "$RUNNER_TEMP/meka-build-tests.exe"
+
       - name: Build documentation
         env:
           RUSTDOCFLAGS: "-D warnings"

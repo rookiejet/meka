@@ -875,7 +875,7 @@ fn part_of(item: &Item) -> Part {
                 Part::Other
             } else {
                 Part::Step(Some(match name.as_str() {
-                    "shell_execute" => StepKind::Command,
+                    "shell_execute" | "subshell_execute" => StepKind::Command,
                     "file_read" => StepKind::Read,
                     "web_fetch" => StepKind::Fetch,
                     name if name == "file_find" || name.ends_with("_search") => StepKind::Search,

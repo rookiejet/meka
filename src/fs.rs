@@ -7,7 +7,7 @@
 
 use std::{
     fs::{File, OpenOptions},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::error::{MekaError, Result};
@@ -85,6 +85,72 @@ pub(crate) fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentit
         (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
     ))
 }
+/// How many directory entries name this file. Windows keeps the count in the file's handle
+/// information and exposes no stable `Metadata` method for it; the number is what tells a staged
+/// or exported file apart from one another name can change.
+#[cfg(windows)]
+pub(crate) fn hard_link_count(path: &std::path::Path) -> std::io::Result<u32> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = std::fs::File::open(path)?;
+    // SAFETY: `BY_HANDLE_FILE_INFORMATION` is plain data with no niche, so an all-zero value is a
+    // valid one to hand out for filling.
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is borrowed from a live `File` for the duration of the call, and the
+    // pointer is to a stack local of exactly the type the call expects.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(information.nNumberOfLinks)
+}
+
+/// Meka's own config and data directories, canonicalized and existing only.
+///
+/// A workspace grant, a copy source or a known file may never name one of these: the config file
+/// and the credential store live there. Kept below `workspace` so a module that cannot reach the
+/// workspace layer can still ask the question.
+pub(crate) fn private_directories() -> Vec<PathBuf> {
+    let mut directories: Vec<PathBuf> = Vec::new();
+    for candidate in [
+        crate::paths::meka_config_dir(),
+        crate::paths::meka_data_dir(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Ok(directory) = std::fs::canonicalize(&candidate).map(strip_verbatim) else {
+            continue;
+        };
+        if directory.is_dir() && !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    directories
+}
+
+/// A canonical Windows path without its `\\?\` verbatim prefix, so a path the OS returned and a
+/// grant the operator wrote compare as the same directory. On other platforms it is the path
+/// itself.
+pub(crate) fn strip_verbatim(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut components = path.components();
+        if let Some(Component::Prefix(prefix)) = components.next()
+            && let Prefix::VerbatimDisk(letter) = prefix.kind()
+        {
+            let mut rebuilt = PathBuf::from(format!("{}:", letter as char));
+            rebuilt.extend(components);
+            return rebuilt;
+        }
+    }
+    path
+}
+
 /// How many times [`lock_path`] will re-take a lock whose resource was replaced underneath it.
 ///
 /// A retake costs one extra wait, and each one needs the resource to have been replaced while this

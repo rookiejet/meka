@@ -233,11 +233,7 @@ pub(crate) fn is_system_root(path: &Path) -> bool {
 /// so a symlinked home matches the path the kernel reports; deduplicated because an override can
 /// point both at one place.
 pub(crate) fn private_directories() -> Vec<PathBuf> {
-    let candidates = [
-        crate::paths::meka_config_dir(),
-        crate::paths::meka_data_dir(),
-    ];
-    private_directories_among(candidates.into_iter().flatten())
+    private_directories_among(crate::fs::private_directories())
 }
 
 /// [`private_directories`] over the given candidates, so the rule can be tested without the
@@ -1039,25 +1035,7 @@ pub(crate) static RUNTIME_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex:
 /// the tree's one answer to what shape a path is in, so everything that produces one goes through
 /// it; [`accept_cwd`] is where a working directory does.
 pub(crate) fn strip_verbatim(path: PathBuf) -> PathBuf {
-    #[cfg(windows)]
-    {
-        use std::path::{Component, Prefix};
-        let mut components = path.components();
-        if let Some(Component::Prefix(prefix)) = components.next()
-            && let Prefix::VerbatimDisk(letter) = prefix.kind()
-        {
-            // Rebuilt from the remaining components rather than by trimming the rendered string. A
-            // path is a sequence of `OsStr`s, not text: `to_string_lossy` would replace any
-            // unpaired surrogate in a Windows filename with U+FFFD, and comparing a boundary
-            // against a path that has silently changed is exactly the class of bug this function
-            // exists to fix. `VerbatimDisk` carries an ASCII drive letter by construction, so the
-            // designator is the one part that can safely be built as text.
-            let mut rebuilt = PathBuf::from(format!("{}:", letter as char));
-            rebuilt.extend(components);
-            return rebuilt;
-        }
-    }
-    path
+    crate::fs::strip_verbatim(path)
 }
 
 /// Whether a directory's path is valid Unicode, which a working directory's has to be. The session

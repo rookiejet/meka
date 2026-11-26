@@ -20,7 +20,7 @@
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::store::background::BackgroundTask;
+use crate::store::background::{BackgroundTask, StopReason};
 
 /// Live handles for the tasks *this process* started.
 ///
@@ -36,17 +36,56 @@ pub(crate) struct BackgroundTasks {
 struct TaskHandle {
     session_id: Uuid,
     cancellation: tokio_util::sync::CancellationToken,
-    /// `None` between reserving the slot and spawning the work. Canceling in that window still
-    /// works, because the token exists from the start; only joining has to wait.
-    join: Option<tokio::task::JoinHandle<()>>,
-    /// The status a [`BackgroundTasks::cancel_all`] signaled this task with, which its outcome
-    /// reports in place of the failure its interruption reads as: the stop's own record may have
-    /// come before the task's row existed.
-    stopped_as: Option<crate::store::background::TaskStatus>,
+    /// Flipped once the work is over, and readable any number of times, by any number of waiters:
+    /// a wait must not consume the thing that says the task is done, or a second wait (after a
+    /// first one was cut short by a timeout, or alongside it) would return as if it were.
+    ///
+    /// The sender is dropped with the handle, which a waiter reads as done too: the entry is what
+    /// a stop reaches, so its removal means there is nothing left here to wait for.
+    completion: tokio::sync::watch::Sender<bool>,
+    /// The stop this task was claimed by: the status its outcome reports in place of the failure
+    /// an interruption reads as, and who asked for it. Set the moment a stop claims the task and
+    /// before the token is fired, so a start that claims afterwards sees the stop even though the
+    /// signal has only just been sent. First claim wins: a repeat stop re-fires the token but
+    /// cannot reword an end already chosen.
+    ///
+    /// The reason is `None` for a stop that reached this owner through the durable record alone
+    /// (`deliver_durable_stops`), whose requester is another process's to know.
+    stopped: Option<Stopped>,
+}
+
+/// A stop's live claim on a task; see [`TaskHandle::stopped`].
+type Stopped = (
+    crate::store::background::TaskStatus,
+    Option<crate::store::background::StopReason>,
+);
+
+/// One observation of a task's completion, taken from [`BackgroundTasks::completion`].
+///
+/// Separate from the handle so it can outlive the wait that took it: what it observes is a
+/// `watch` channel, and subscribing is what repeats, not waiting on a taken join.
+pub(crate) struct TaskCompletion(tokio::sync::watch::Receiver<bool>);
+
+impl TaskCompletion {
+    /// Wait until the work is over. Repeatable, in that another observation can be taken and
+    /// waited on for the same task; a `watch` receiver is not a queue and nothing is consumed.
+    pub(crate) async fn wait(mut self) {
+        loop {
+            if *self.0.borrow_and_update() {
+                return;
+            }
+            if self.0.changed().await.is_err() {
+                // The sender is gone, so its handle was dropped: nothing is left to wait for.
+                return;
+            }
+        }
+    }
 }
 
 impl BackgroundTasks {
-    /// Claim a slot for `session_id`, or refuse because the ceiling is full.
+    /// Claim a slot for `session_id`, or refuse because the ceiling is full. The cancellation
+    /// token and the completion signal are both created here, so a stop or a wait works in the
+    /// window before the work is spawned as well as after.
     ///
     /// Check and insert happen under one lock, which is the whole point. Several background calls
     /// in a single assistant message are dispatched concurrently by `execute_tool_calls`, so a
@@ -60,46 +99,98 @@ impl BackgroundTasks {
         max_tasks: usize,
     ) -> bool {
         let mut guard = self.inner.lock().await;
-        let running = guard
+        let mut running = guard
             .values()
             .filter(|handle| handle.session_id == session_id)
             .count();
+        // Work a release left settling still counts against the session's ceiling: it is as much
+        // in flight as anything in this registry, and undercounting would let a session overspawn.
+        for registry in released_registries(session_id) {
+            running += registry
+                .inner
+                .lock()
+                .await
+                .values()
+                .filter(|handle| handle.session_id == session_id)
+                .count();
+        }
         if running >= max_tasks {
             return false;
         }
+        let (completion, _) = tokio::sync::watch::channel(false);
         guard.insert(id, TaskHandle {
             session_id,
             cancellation,
-            join: None,
-            stopped_as: None,
+            completion,
+            stopped: None,
         });
         true
     }
 
-    /// The status task `id`'s work records: `completed` when it succeeded, else the status a stop
-    /// signaled it with, else `failed`. A task stopped while it was starting has no row for the
-    /// stop to record on, so its own outcome is the one place that can say why it ended.
-    pub(crate) async fn outcome_status(
+    /// What task `id`'s work records: the status and the stop reason behind it. A success is
+    /// `completed` with no reason; a failure reports the stop that claimed the task if one did
+    /// (its status in place of the failure the interruption reads as), else `failed`. A task
+    /// stopped while it was starting has no row for a stop to record on, so its own outcome is the
+    /// one place that can say why it ended.
+    pub(crate) async fn outcome_end(
         &self,
         id: &str,
         is_error: bool,
-    ) -> crate::store::background::TaskStatus {
+    ) -> (
+        crate::store::background::TaskStatus,
+        Option<crate::store::background::StopReason>,
+    ) {
+        use crate::store::background::TaskStatus;
         if !is_error {
-            return crate::store::background::TaskStatus::Completed;
+            return (TaskStatus::Completed, None);
         }
+        match self
+            .inner
+            .lock()
+            .await
+            .get(id)
+            .and_then(|handle| handle.stopped)
+        {
+            Some((status, reason)) => (status, reason),
+            None => (TaskStatus::Failed, None),
+        }
+    }
+
+    /// Attach the spawned work to a slot already reserved by [`Self::try_reserve`].
+    ///
+    /// The join is watched by a supervisor rather than held for a waiter to take, so the
+    /// completion outlives the first wait: a wait that is cut short, or one that never comes,
+    /// leaves the same signal for the next.
+    pub(crate) async fn attach(&self, id: &str, join: tokio::task::JoinHandle<()>) {
+        let Some(completion) = self
+            .inner
+            .lock()
+            .await
+            .get(id)
+            .map(|handle| handle.completion.clone())
+        else {
+            // The slot is gone (a start nothing admitted, or work that already forgot itself), so
+            // nothing here will wait for this: drop the handle and let the work finish on its own.
+            return;
+        };
+        tokio::spawn(async move {
+            if let Err(error) = join.await {
+                tracing::warn!("background task ended abnormally: {error}");
+            }
+            completion.send_replace(true);
+        });
+    }
+
+    /// An observation of task `id`'s completion, or `None` when this process does not hold it.
+    ///
+    /// Several may be outstanding at once, and another may be taken after one has been waited on:
+    /// the signal is a `watch`, not a join handle, so observing it cannot take it from anyone else.
+    pub(crate) async fn completion(&self, id: &str) -> Option<TaskCompletion> {
         self.inner
             .lock()
             .await
             .get(id)
-            .and_then(|handle| handle.stopped_as)
-            .unwrap_or(crate::store::background::TaskStatus::Failed)
-    }
-
-    /// Attach the spawned work to a slot already reserved by [`Self::try_reserve`].
-    pub(crate) async fn attach(&self, id: &str, join: tokio::task::JoinHandle<()>) {
-        if let Some(handle) = self.inner.lock().await.get_mut(id) {
-            handle.join = Some(join);
-        }
+            .map(|handle| TaskCompletion(handle.completion.subscribe()))
     }
 
     /// Drop a task's handle: on the way out of the work itself, and on the failure path between
@@ -111,8 +202,9 @@ impl BackgroundTasks {
 
     /// How many tasks this process is running that nothing has told to stop, across sessions,
     /// since the screen that asks cannot name one for the same reason [`Self::cancel_all`] cannot.
-    /// One told to stop is on its way out, its row already saying how it ended, so the screen's
-    /// move to another session does not wait for it and its survivor line does not count it.
+    /// One told to stop is on its way out (its row already `stopping`, its outcome to be written
+    /// by the work that accepted the stop) so the screen's move to another session does not wait
+    /// for it and its survivor line does not count it.
     pub(crate) async fn unstopped_count_all(&self) -> usize {
         self.inner
             .lock()
@@ -122,34 +214,78 @@ impl BackgroundTasks {
             .count()
     }
 
-    /// How many of `session_id`'s tasks are running here. Backs the `max_tasks` ceiling.
+    /// How many of `session_id`'s tasks are running here, work a release left settling included.
+    /// Backs the `max_tasks` ceiling: the ceiling is about how much the session has in flight in
+    /// this process, not about which registry remembers it.
     pub(crate) async fn running_count(&self, session_id: Uuid) -> usize {
-        self.inner
-            .lock()
-            .await
-            .values()
-            .filter(|handle| handle.session_id == session_id)
-            .count()
-    }
-
-    /// Signal one task to stop. `false` when it isn't ours, which is the honest answer for a task
-    /// whose process is gone: the row will be swept, not canceled.
-    pub(crate) async fn cancel(&self, id: &str) -> bool {
-        match self.inner.lock().await.get(id) {
-            Some(handle) => {
-                handle.cancellation.cancel();
-                true
-            }
-            None => false,
+        let mut running = self.live_ids(session_id).await.len();
+        for registry in released_registries(session_id) {
+            running += registry.live_ids(session_id).await.len();
         }
+        running
     }
 
-    /// Stop every task this process runs, recording each still running as stopped with `status`
-    /// first, so what the agent hears says why rather than the `failed` its own interruption would
-    /// write; how many were signaled. Every one is signaled, a task still starting whose row has
-    /// not landed included, since nothing else would stop it, and its outcome reports `status`
-    /// ([`Self::outcome_status`]). One whose outcome landed first keeps it. A record that cannot be
-    /// made stops them all the same: stopping is what was asked, and only the word the agent hears
+    /// Claim one task's stop at the registry gate and fire its token: the whole live half of a
+    /// stop, done under the lock and before anything awaits, so a start that claims afterwards
+    /// sees the stop even though the signal has only just been sent, and the signal cannot be lost
+    /// to a requesting future that disappears at the next await. `false` when this process holds
+    /// no such task, which is the honest answer for one whose process is gone: its row is swept,
+    /// not canceled.
+    ///
+    /// The first claim wins the recorded status and reason; the token is re-fired regardless, so a
+    /// retry re-signals an open `stopping` task rather than trusting a record that may never have
+    /// reached its owner. A `None` reason is a stop that arrived through the durable record alone,
+    /// whose requester is another process's to know.
+    ///
+    /// `session_id` scopes the walk of released registries: task ids are unique in production, but
+    /// a session's registry is the only place its ids can live, and keeping the walk to the one
+    /// session is what keeps two sessions' work from answering for each other.
+    pub(crate) async fn claim_stop(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        reason: Option<StopReason>,
+    ) -> bool {
+        if Self::claim_stop_here(self, id, reason).await {
+            return true;
+        }
+        // A release whose work is still settling keeps its registry here; the task the caller
+        // names may be in one of those rather than in this one.
+        for registry in released_registries(session_id) {
+            if Self::claim_stop_here(&registry, id, reason).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// [`Self::claim_stop`] for this registry alone: what the released-registry walk above calls
+    /// on each of them, without recursing into the walk again.
+    async fn claim_stop_here(&self, id: &str, reason: Option<StopReason>) -> bool {
+        let claim = match reason {
+            Some(reason) => (reason.status(), Some(reason)),
+            None => (crate::store::background::TaskStatus::Canceled, None),
+        };
+        let mut guard = self.inner.lock().await;
+        let Some(handle) = guard.get_mut(id) else {
+            return false;
+        };
+        handle.stopped.get_or_insert(claim);
+        handle.cancellation.cancel();
+        drop(guard);
+        true
+    }
+
+    /// Stop every task this process runs, recording the request for each, returning how many were
+    /// signaled.
+    ///
+    /// The claim under the registry's lock comes first and the durable record second, without the
+    /// lock held across it: the signal is delivered even if this future disappears before the
+    /// record lands, and a record that lands without one is re-signaled by the next stop request.
+    /// Every task in the registry is signaled, a task still starting whose row has not landed
+    /// included, since nothing else would stop it, and its outcome reports `status`
+    /// ([`Self::outcome_end`]). One whose outcome already landed keeps it. A request that cannot
+    /// be recorded stops them all the same: stopping is what was asked, and only the recorded word
     /// is lost.
     pub(crate) async fn stop_all(
         &self,
@@ -157,13 +293,14 @@ impl BackgroundTasks {
         status: crate::store::background::TaskStatus,
     ) -> usize {
         let ids: Vec<String> = self.inner.lock().await.keys().cloned().collect();
-        if let Err(error) = store.stop_background_tasks(ids, status).await {
+        let signaled = self.cancel_all(status).await;
+        if let Err(error) = store.request_stop_background_tasks(ids).await {
             tracing::warn!(
                 "failed to record background tasks as {status}; stopping them anyway: {error}",
                 status = status.name()
             );
         }
-        self.cancel_all(status).await
+        signaled
     }
 
     /// Signal every task this process is running, each left `status` for its outcome to report,
@@ -172,10 +309,224 @@ impl BackgroundTasks {
     pub(crate) async fn cancel_all(&self, status: crate::store::background::TaskStatus) -> usize {
         let mut guard = self.inner.lock().await;
         for handle in guard.values_mut() {
-            handle.stopped_as.get_or_insert(status);
+            handle
+                .stopped
+                .get_or_insert((status, Some(StopReason::matching(status))));
             handle.cancellation.cancel();
         }
         guard.len()
+    }
+
+    /// The one stop path every surface converges on: claim the live stop and signal the owner in
+    /// this process, record the durable acceptance, and answer honestly which of the two
+    /// happened.
+    ///
+    /// The claim is under the registry's lock before any await ([`Self::claim_stop`]), so a start
+    /// that claims after it cannot win, and the signal is delivered even if this future disappears
+    /// before the record lands. The record is the retryable acceptance: a row left `stopping` is
+    /// what a later request re-signals against, which is why a repeat request on one signals again
+    /// rather than reporting success from a state where a prior attempt never reached its owner.
+    ///
+    /// A stop with no live owner in this process records pending intent at most and says so in the
+    /// answer; it never claims a terminal outcome for the work, because a missing in-process
+    /// handle is not evidence of anything having ended. Only the work's own result or the
+    /// owner-loss sweep ends a row.
+    pub(crate) async fn request_stop(
+        &self,
+        store: &crate::store::background::BackgroundStore,
+        session_id: Uuid,
+        id: &str,
+        reason: StopReason,
+    ) -> crate::error::Result<StopReport> {
+        let signaled = self.claim_stop(session_id, id, Some(reason)).await;
+        let moved = !store
+            .request_stop_background_tasks(vec![id.to_string()])
+            .await?
+            .is_empty();
+        if moved {
+            return Ok(stop_report(signaled, true, false));
+        }
+        // The move takes only a `running` row; what it left untouched says why.
+        match store.background_task_by_id(id).await? {
+            // A prior request's acceptance is already recorded, so this one re-signaled it.
+            Some(row) if row.status == crate::store::background::TaskStatus::Stopping => {
+                Ok(stop_report(signaled, true, true))
+            }
+            // Its own outcome won and stays.
+            Some(row) if row.status.is_terminal() => Ok(StopReport::AlreadyEnded),
+            // The row has not landed yet (a reservation still starting), or a launch landed it
+            // after the move: only the first of those is live here, and only it was signaled.
+            None if signaled => Ok(stop_report(signaled, false, false)),
+            None => Ok(StopReport::AlreadyEnded),
+            Some(_) => Ok(stop_report(signaled, false, false)),
+        }
+    }
+
+    /// [`Self::request_stop`] for everything still open in a session: the `task_cancel` all-case
+    /// and the screens' stop-everything. Rows already `stopping` are included, so their owners are
+    /// re-signaled rather than told a prior request succeeded, and each id answers with its own
+    /// [`StopReport`].
+    pub(crate) async fn request_stop_session(
+        &self,
+        store: &crate::store::background::BackgroundStore,
+        session_id: Uuid,
+        reason: StopReason,
+    ) -> crate::error::Result<Vec<(String, StopReport)>> {
+        let open = store.list_running_background_tasks(session_id).await?;
+        if open.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut claimed = Vec::with_capacity(open.len());
+        for task in &open {
+            let signaled = self.claim_stop(session_id, &task.id, Some(reason)).await;
+            claimed.push((task.id.clone(), task.status, signaled));
+        }
+        let moved = store
+            .request_stop_background_tasks(claimed.iter().map(|(id, ..)| id.clone()).collect())
+            .await?;
+        // The listing is enough to classify: `moved` covers what this request recorded, and a row
+        // that was `stopping` already carries a prior request's acceptance. A row that slipped to
+        // terminal between the two reads is answered from the claim, which is all that is left to
+        // say about it.
+        Ok(claimed
+            .into_iter()
+            .map(|(id, was, signaled)| {
+                let recorded_now = moved.contains(&id);
+                let repeated =
+                    !recorded_now && was == crate::store::background::TaskStatus::Stopping;
+                (
+                    id,
+                    stop_report(signaled, recorded_now || repeated, repeated),
+                )
+            })
+            .collect())
+    }
+
+    /// Claim `id`'s start against stop intent: the atomic half of a launch, for a caller that
+    /// spawns work into a task it reserved with [`Self::try_reserve`].
+    ///
+    /// * Order it after the reservation and after the task's durable row lands, before the launch.
+    ///   The reservation is what a stop signals; this claim decides whether the launch may use it
+    ///   at all.
+    /// * [`StartClaim::StopWon`] means a stop intent owns the task and the work must not start. The
+    ///   task's completion is recorded here (the stop's status and reason, and the fact that
+    ///   nothing ran) so the requester gets the report it was promised; the caller only skips the
+    ///   launch. A natural terminal write that already won keeps its outcome. Nothing is recorded
+    ///   when no reservation exists here: a launch goes through a reservation so a stop has
+    ///   something to signal, and starting without one would make the work unownable.
+    /// * [`StartClaim::StartWon`] means the claim beat every stop claim: a stop landing after this
+    ///   point fires the token and its claim is already in place for the work's outcome, so the
+    ///   caller launches and supervises the work against the token, checking it immediately after
+    ///   the launch.
+    ///
+    /// Two serialization points, in order: the registry gate, where a stop claimed before this
+    /// claim cannot be overtaken, and the row's guarded write
+    /// ([`crate::store::background::BackgroundStore::claim_task_start`], whose only rival is
+    /// [`crate::store::background::BackgroundStore::request_stop_background_tasks`]). What no
+    /// in-process claim can close is a stop recorded by *another process* landing after the row's
+    /// claim: the launch then supervises a durable stop it cannot see, which is what
+    /// [`Self::deliver_durable_stops`] exists to settle.
+    pub(crate) async fn claim_start(
+        &self,
+        store: &crate::store::background::BackgroundStore,
+        id: &str,
+    ) -> crate::error::Result<StartClaim> {
+        let claimed = {
+            let guard = self.inner.lock().await;
+            match guard.get(id) {
+                // Nothing reserved this task here: see the doc on what that means.
+                None => return Ok(StartClaim::StopWon),
+                Some(handle) if handle.stopped.is_none() && !handle.cancellation.is_cancelled() => {
+                    None
+                }
+                Some(handle) => Some(
+                    handle
+                        .stopped
+                        .unwrap_or((crate::store::background::TaskStatus::Canceled, None)),
+                ),
+            }
+        };
+        if let Some(stopped) = claimed {
+            return self.refuse_start(store, id, Some(stopped)).await;
+        }
+        if !store.claim_task_start(id).await? {
+            // The row's claim lost to a stop recorded outside this registry's claim: another
+            // process's, or one this process recorded before it held this handle. What the
+            // registry learned meanwhile is what the completion record reports.
+            let stopped = self
+                .inner
+                .lock()
+                .await
+                .get(id)
+                .and_then(|handle| handle.stopped);
+            return self.refuse_start(store, id, stopped).await;
+        }
+        Ok(StartClaim::StartWon)
+    }
+
+    /// Record the completion of a start [`Self::claim_start`] refused. The requester of the stop
+    /// is owed the report of what it prevented, so the row keeps the outcome of the run that never
+    /// began, and keeps it past the caller's withdraw, which only takes rows no outcome was
+    /// written on. The reservation's wait is released here as well, so nothing is left waiting on
+    /// work that will never attach; the caller drops the slot with [`Self::forget`], next to
+    /// whatever else it withdraws.
+    async fn refuse_start(
+        &self,
+        store: &crate::store::background::BackgroundStore,
+        id: &str,
+        stopped: Option<Stopped>,
+    ) -> crate::error::Result<StartClaim> {
+        let (status, reason) =
+            stopped.unwrap_or((crate::store::background::TaskStatus::Canceled, None));
+        if let Some(completion) = self
+            .inner
+            .lock()
+            .await
+            .get(id)
+            .map(|handle| handle.completion.clone())
+        {
+            completion.send_replace(true);
+        }
+        store
+            .finish_background_task_observed(
+                id,
+                status,
+                None,
+                None,
+                crate::store::background::Teardown {
+                    confirmed: true,
+                    started: false,
+                    route: crate::store::background::RouteEvidence::Unrecorded,
+                    reason,
+                },
+            )
+            .await?;
+        Ok(StartClaim::StopWon)
+    }
+
+    /// Re-signal the stops a durable record claims but a signal may never have reached: every open
+    /// `stopping` row of the session whose owner is live in this process has its token fired
+    /// again. Returns how many were (re-)signaled.
+    ///
+    /// The explicit recovery half of a stop. A request recorded by another process (or one whose
+    /// future died between its record and its signal) leaves a `stopping` row its owner may never
+    /// have heard about; a host that calls this on a timer lets that stop land after all. Rows
+    /// whose owners are gone are left alone: the sweep reconciles those as owner loss, which is
+    /// the only thing that can.
+    pub(crate) async fn deliver_durable_stops(
+        &self,
+        store: &crate::store::background::BackgroundStore,
+        session_id: Uuid,
+    ) -> crate::error::Result<usize> {
+        let mut delivered = 0;
+        for task in store.list_running_background_tasks(session_id).await? {
+            if task.status == crate::store::background::TaskStatus::Stopping
+                && self.claim_stop(session_id, &task.id, None).await
+            {
+                delivered += 1;
+            }
+        }
+        Ok(delivered)
     }
 
     /// Wait for every task this process is running, for a host that is about to exit.
@@ -189,66 +540,254 @@ impl BackgroundTasks {
     /// Callers should bound this: canceling asks, and a task that does not answer must not hold
     /// the terminal.
     pub(crate) async fn wait_all(&self) {
-        let joins = self.take_joins(|_| true).await;
-        for (id, join) in joins {
-            if let Err(error) = join.await {
-                tracing::warn!("background task ended abnormally: {error}");
-            }
-            self.forget(&id).await;
-        }
+        self.wait_for(|_| true).await;
     }
 
-    /// The join handles of the tasks `wanted` selects, leaving their entries registered: a wait
-    /// that is cut short must leave `cancel_all` something to reach, and the joined entries are
-    /// removed once each join has returned.
-    async fn take_joins(
-        &self,
-        wanted: impl Fn(&TaskHandle) -> bool,
-    ) -> Vec<(String, tokio::task::JoinHandle<()>)> {
-        let mut guard = self.inner.lock().await;
-        let ids: Vec<String> = guard
-            .iter()
-            .filter(|(_, handle)| wanted(handle))
-            .map(|(id, _)| id.clone())
-            .collect();
-        let joins = ids
-            .into_iter()
-            .filter_map(|id| {
-                guard
-                    .get_mut(&id)
-                    .and_then(|handle| handle.join.take())
-                    .map(|join| (id, join))
-            })
-            .collect();
-        drop(guard);
-        joins
+    /// Wait for the tasks `wanted` selects, removing each entry once its work is over.
+    ///
+    /// The entry stays registered for the whole wait, so a Ctrl+C during it still has something
+    /// for `cancel_all` to reach. What is observed is the completion signal every reservation
+    /// holds from the start, not a join handle taken from it: a reservation whose work is not
+    /// attached yet is waited for rather than skipped, and a wait that is cut short consumes
+    /// nothing, so the next one sees the same tasks.
+    async fn wait_for(&self, wanted: impl Fn(&TaskHandle) -> bool) {
+        let ids: Vec<String> = {
+            let guard = self.inner.lock().await;
+            guard
+                .iter()
+                .filter(|(_, handle)| wanted(handle))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let mut waiting = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(completion) = self.completion(&id).await {
+                waiting.push((id, completion));
+            }
+        }
+        for (id, completion) in waiting {
+            completion.wait().await;
+            self.forget(&id).await;
+        }
     }
 
     /// Wait for this session's tasks to finish, for a host with nowhere to deliver an outcome
     /// later. `--oneshot` is the case: the process exits with the turn, so a background call there
     /// has to degrade into a slow synchronous one rather than a promise nothing will keep.
     ///
-    /// The handles stay registered while the wait runs, each task removing its own on the way
-    /// out: a wait that takes them out first leaves a Ctrl+C during it with nothing for
-    /// `cancel_all` to reach, and the work runs on untracked.
+    /// Includes work a release left settling in this process: a host waiting for a session's tasks
+    /// waits for all of them, whatever registry they were reserved in.
     pub(crate) async fn wait_for_session(&self, session_id: Uuid) {
-        let joins = self
-            .take_joins(|handle| handle.session_id == session_id)
+        self.wait_for(|handle| handle.session_id == session_id)
             .await;
-        for (id, join) in joins {
-            // A panicking task has already written its own `failed` outcome via the dispatch
-            // wrapper, so there is nothing to report here beyond not hanging on it.
-            if let Err(error) = join.await {
-                tracing::warn!("background task ended abnormally: {error}");
-            }
-            self.forget(&id).await;
-        }
-        // A wait that was cut short took the handles with it, so a second wait, after a cancel,
-        // has none to join; the entry every task removes on its way out is what it waits on.
-        while self.running_count(session_id).await > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for registry in released_registries(session_id) {
+            registry
+                .wait_for(|handle| handle.session_id == session_id)
+                .await;
         }
     }
+
+    /// The ids of this registry's live tasks of `session_id`, for the sweep that must not retire
+    /// rows whose owners can still report.
+    async fn live_ids(&self, session_id: Uuid) -> Vec<String> {
+        self.inner
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, handle)| handle.session_id == session_id)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+}
+
+/// What a stop request established; see [`BackgroundTasks::request_stop`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopReport {
+    /// The task had already ended (or no row ever landed and nothing is live here): its own
+    /// outcome won and stays. Nothing was signaled and nothing recorded.
+    AlreadyEnded,
+    /// The stop reached the live owner in this process. `recorded` says the durable acceptance is
+    /// in place; `repeated` says it already was, so this request re-signaled an open `stopping`
+    /// task a prior request may never have reached.
+    Signaled { recorded: bool, repeated: bool },
+    /// No live owner in this process to signal. `recorded` says the row now records the pending
+    /// stop; nothing here claims how the work ended, and the row stays open and undeliverable
+    /// until the work reports or the owner-loss sweep reconciles it.
+    NotSignaled { recorded: bool, repeated: bool },
+}
+
+/// The report for one stop from the three facts a request establishes: whether a live owner in
+/// this process was signaled, whether a durable acceptance is recorded, and whether one was
+/// already recorded before this request.
+fn stop_report(signaled: bool, recorded: bool, repeated: bool) -> StopReport {
+    if signaled {
+        StopReport::Signaled { recorded, repeated }
+    } else {
+        StopReport::NotSignaled { recorded, repeated }
+    }
+}
+
+/// Stop a session's task named by id prefix (or every open one when the prefix is `None`)
+/// through the one stop path, for a surface that holds the live registry: the screens'
+/// `/task cancel`. Answers one report per task, in the request's order.
+///
+/// The prefix rules are [`crate::store::background::BackgroundStore::resolve_background_task`]'s:
+/// an unusable or unknown prefix is a usage error, and so is one naming a task that already ended:
+/// the user said stop and nothing needed it. A task already `stopping` is stopped again rather
+/// than answered for: its record is not proof the signal ever reached its owner.
+pub(crate) async fn stop_by_prefix(
+    tasks: &BackgroundTasks,
+    store: &crate::store::Store,
+    session_id: Uuid,
+    id_prefix: Option<&str>,
+    reason: StopReason,
+) -> crate::error::Result<Vec<(String, StopReport)>> {
+    let background = store.background_store();
+    let Some(id_prefix) = id_prefix else {
+        return tasks
+            .request_stop_session(&background, session_id, reason)
+            .await;
+    };
+    let Some(task) = background
+        .resolve_background_task(session_id, id_prefix)
+        .await?
+    else {
+        return Err(crate::error::MekaError::Usage(format!(
+            "no background task matching '{id_prefix}'"
+        )));
+    };
+    if task.status.is_terminal() {
+        return Err(crate::error::MekaError::Usage(format!(
+            "task {} already {}",
+            task.short_id(),
+            task.status.name()
+        )));
+    }
+    let report = tasks
+        .request_stop(&background, session_id, &task.id, reason)
+        .await?;
+    Ok(vec![(task.id, report)])
+}
+
+/// What a launch's start claim established; see [`BackgroundTasks::claim_start`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartClaim {
+    /// A stop intent owns the task: the work must not start. The task's completion is recorded.
+    StopWon,
+    /// The start claimed the task; a stop landing later is supervised against the token.
+    StartWon,
+}
+
+/// Work a release left running past its grace, still owned by this process: the live registry the
+/// work is registered in, and the session's file lock.
+///
+/// The lock is the cross-process proof that rows still `running` belong here. A release that
+/// cannot wait for its work therefore cannot let the lock go: the next opener would sweep rows
+/// whose work is live in this very process and report their teardowns as unconfirmed while they
+/// are still writing. Ownership moves here instead, and the lock is let go only once the work has
+/// settled or the process dies, either of which is proof the owners can no longer report.
+struct ReleasedWork {
+    /// The session's file lock while this entry holds it. `None` once a reopen in this process
+    /// adopted it into its own entry, which then owns the release.
+    lock: Option<crate::fs::FileLock>,
+    /// Registries of release cycles whose work has not settled yet.
+    registries: Vec<BackgroundTasks>,
+}
+
+/// The released work of every session this process still owns.
+///
+/// `std::sync::Mutex` for the same reason [`crate::store::SessionLockSlot`] is one: every access
+/// is a move in or out with nothing awaited in between.
+fn released_work() -> &'static std::sync::Mutex<std::collections::HashMap<Uuid, ReleasedWork>> {
+    static RELEASED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Uuid, ReleasedWork>>,
+    > = std::sync::OnceLock::new();
+    RELEASED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Hand a release's unfinished work to this process's cleanup: `tasks` keeps settling here (still
+/// signaled, waited for and spared by the sweep) and `lock` is held until it does. Called by a
+/// release whose bounded wait ran out; [`settle_released_work`] is its end.
+pub(crate) fn retire_released_work(
+    session_id: Uuid,
+    lock: Option<crate::fs::FileLock>,
+    tasks: BackgroundTasks,
+) {
+    let mut released = crate::sync::lock(released_work());
+    let entry = released.entry(session_id).or_insert_with(|| ReleasedWork {
+        lock: None,
+        registries: Vec::new(),
+    });
+    if lock.is_some() {
+        if entry.lock.is_some() {
+            // Unreachable in practice: a second lock for the session cannot exist while the first
+            // is held. Kept rather than replaced, so the held one is never dropped by accident.
+            tracing::warn!("session {session_id} retired twice with a lock; keeping the first");
+        } else {
+            entry.lock = lock;
+        }
+    }
+    entry.registries.push(tasks);
+    drop(released);
+}
+
+/// The cleanup half of [`retire_released_work`]: `registry`'s work has settled, so it is out, and
+/// the lock is let go once no registry is left to hold it for. A reopen that adopted the lock
+/// meanwhile owns the release, and this only drops the registry.
+pub(crate) fn settle_released_work(session_id: Uuid, registry: &BackgroundTasks) {
+    let lock = {
+        let mut released = crate::sync::lock(released_work());
+        let Some(entry) = released.get_mut(&session_id) else {
+            return;
+        };
+        entry
+            .registries
+            .retain(|other| !std::sync::Arc::ptr_eq(&other.inner, &registry.inner));
+        if entry.registries.is_empty() {
+            released
+                .remove(&session_id)
+                .and_then(|settled| settled.lock)
+        } else {
+            None
+        }
+    };
+    if lock.is_some() {
+        tracing::info!(
+            "released background work for session {session_id} settled; its lock is let go"
+        );
+    }
+}
+
+/// Adopt the lock of a session this process released but still owns: a reopen calls this before
+/// locking anew, because a `flock` is per open file description and a lock this process already
+/// holds cannot be taken again. The work left behind stays where it is: the reopener must still
+/// signal, wait for and sweep around it.
+pub(crate) fn take_released_lock(session_id: Uuid) -> Option<crate::fs::FileLock> {
+    let mut released = crate::sync::lock(released_work());
+    let entry = released.get_mut(&session_id)?;
+    let lock = entry.lock.take();
+    if entry.registries.is_empty() {
+        released.remove(&session_id);
+    }
+    lock
+}
+
+/// The registries of `session_id`'s released work still settling in this process.
+fn released_registries(session_id: Uuid) -> Vec<BackgroundTasks> {
+    crate::sync::lock(released_work())
+        .get(&session_id)
+        .map(|entry| entry.registries.clone())
+        .unwrap_or_default()
+}
+
+/// The ids of `session_id`'s live tasks in this process's released work: what the sweep must spare
+/// alongside this registry's own, because those rows' owners are still here and may still report.
+pub(crate) async fn released_live_ids(session_id: Uuid) -> Vec<String> {
+    let mut live = Vec::new();
+    for registry in released_registries(session_id) {
+        live.extend(registry.live_ids(session_id).await);
+    }
+    live
 }
 
 /// Ceiling on outcome text carried inline in the delivered turn. Past this the full output goes to
@@ -580,7 +1119,11 @@ mod tests {
         }
         assert_eq!(tasks.unstopped_count_all().await, 2);
 
-        assert!(tasks.cancel("one").await);
+        assert!(
+            tasks
+                .claim_stop(session_id, "one", Some(StopReason::UserRequest))
+                .await
+        );
         assert_eq!(tasks.unstopped_count_all().await, 1);
         assert_eq!(
             tasks.running_count(session_id).await,
@@ -699,13 +1242,13 @@ mod tests {
         );
     }
 
-    /// A stop records its word for every task still running before it signals them, so the work,
-    /// which records its own interruption as a failure, finds the row already terminal. A second
-    /// connection holds the write lock for a while as the stop begins: a stop that records first
-    /// waits on it and cannot have signaled inside that while, where one that signaled first would
-    /// have.
+    /// The stop's signal is delivered at the claim, before and independently of its durable
+    /// record: a record stuck behind another connection's write lock must not leave work running
+    /// while a stop was asked for and answered for. The record is the retryable acceptance, not a
+    /// gate the signal waits at, and when it lands, the work's own result still ends the row with
+    /// the stop's status and reason, not the failure the interruption reads as.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_stop_records_its_word_before_the_work_records_a_failure() {
+    async fn a_stop_signals_even_while_its_durable_record_waits_for_the_database() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("meka.db");
         let store = crate::store::Store::open(Some(&path), &Default::default())
@@ -756,14 +1299,156 @@ mod tests {
         );
 
         assert!(
-            !holder.join().expect("the holder"),
-            "the signal waited for the record"
+            holder.join().expect("the holder"),
+            "the signal goes out at the claim and does not wait for the record"
         );
         let recorded = background
             .list_background_tasks(session_id)
             .await
             .expect("tasks");
+        assert_eq!(
+            recorded[0].status,
+            TaskStatus::Stopping,
+            "a request is not an outcome, so the row is still open"
+        );
+        assert!(
+            recorded[0].finished_at.is_none(),
+            "and nothing has ended it yet"
+        );
+
+        // The work notices the stop, reports its interruption, and that result ends the row with
+        // the stop's status and reason.
+        let (status, reason) = tasks.outcome_end(&row.id, true).await;
+        assert_eq!(status, TaskStatus::Interrupted);
+        assert_eq!(reason, Some(StopReason::HostRelease));
+        background
+            .finish_background_task(&row.id, status, Some("interrupted".to_string()), None)
+            .await
+            .expect("finish");
+        let recorded = background
+            .list_background_tasks(session_id)
+            .await
+            .expect("tasks");
         assert_eq!(recorded[0].status, TaskStatus::Interrupted);
+    }
+
+    /// A reservation is part of what a wait waits for, even before its work is attached: the join
+    /// used to be the only thing a wait could hold, so a stop that came in this window was waited
+    /// for by nobody and the wait returned while the work it had just signaled ran on.
+    #[tokio::test]
+    async fn a_wait_covers_a_reservation_whose_work_is_not_attached_yet() {
+        let tasks = BackgroundTasks::default();
+        let session_id = Uuid::new_v4();
+        assert!(
+            tasks
+                .try_reserve(
+                    "a".to_string(),
+                    session_id,
+                    tokio_util::sync::CancellationToken::new(),
+                    4,
+                )
+                .await
+        );
+
+        let waiting = tokio::spawn({
+            let tasks = tasks.clone();
+            async move { tasks.wait_all().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "the reservation is not work that is already over"
+        );
+
+        tasks.attach("a", tokio::spawn(async {})).await;
+        waiting.await.expect("join");
+        assert_eq!(
+            tasks.running_count(session_id).await,
+            0,
+            "the wait ends with the registry it watched"
+        );
+    }
+
+    /// A wait that is cut short must leave the completion for the next one. A join handle is taken
+    /// by whoever waits first, so a host's bounded wait used to consume it: the second wait found
+    /// nothing to join and returned before the work it had signaled had run.
+    #[tokio::test]
+    async fn a_wait_that_is_cut_short_does_not_take_the_completion_with_it() {
+        let tasks = BackgroundTasks::default();
+        let session_id = Uuid::new_v4();
+        let token = tokio_util::sync::CancellationToken::new();
+        let cleaned_up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(
+            tasks
+                .try_reserve("a".to_string(), session_id, token.clone(), 4)
+                .await
+        );
+        tasks
+            .attach(
+                "a",
+                tokio::spawn({
+                    let cleaned_up = std::sync::Arc::clone(&cleaned_up);
+                    async move {
+                        token.cancelled().await;
+                        tokio::task::yield_now().await;
+                        cleaned_up.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                }),
+            )
+            .await;
+
+        let cut_short =
+            tokio::time::timeout(std::time::Duration::from_millis(20), tasks.wait_all()).await;
+        assert!(
+            cut_short.is_err(),
+            "the first wait runs out before the stop"
+        );
+
+        assert_eq!(tasks.cancel_all(TaskStatus::Canceled).await, 1);
+        tasks.wait_all().await;
+        assert!(
+            cleaned_up.load(std::sync::atomic::Ordering::Acquire),
+            "the second wait must observe the work the first one stopped waiting for"
+        );
+        assert_eq!(tasks.running_count(session_id).await, 0);
+    }
+
+    /// Completion is observable more than once and by more than one waiter: what a wait holds is a
+    /// subscription, so a second `completion` sees the same end as the first, however late it is
+    /// asked for.
+    #[tokio::test]
+    async fn a_completion_can_be_observed_more_than_once() {
+        let tasks = BackgroundTasks::default();
+        let session_id = Uuid::new_v4();
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(
+            tasks
+                .try_reserve("a".to_string(), session_id, token.clone(), 4)
+                .await
+        );
+        let first = tasks.completion("a").await.expect("reserved");
+        let second = tasks.completion("a").await.expect("reserved");
+        tasks
+            .attach(
+                "a",
+                tokio::spawn(async move {
+                    token.cancelled().await;
+                }),
+            )
+            .await;
+
+        let waiting = tokio::spawn(async move { second.wait().await });
+        assert!(
+            tasks
+                .claim_stop(session_id, "a", Some(StopReason::UserRequest))
+                .await
+        );
+        first.wait().await;
+        waiting.await.expect("join");
+        assert!(
+            tasks.completion("missing").await.is_none(),
+            "a task this process does not hold has no completion to observe"
+        );
     }
 
     /// A stop that lands while a task's row is still being written records nothing for it, so the
@@ -798,7 +1483,9 @@ mod tests {
         assert!(token.is_cancelled());
 
         background.start_background_task(&row).await.expect("start");
-        let status = tasks.outcome_status(&row.id, true).await;
+        let (status, reason) = tasks.outcome_end(&row.id, true).await;
+        assert_eq!(status, TaskStatus::Interrupted);
+        assert_eq!(reason, Some(StopReason::HostRelease));
         background
             .finish_background_task(&row.id, status, Some("interrupted".to_string()), None)
             .await
@@ -809,13 +1496,197 @@ mod tests {
             .expect("tasks");
         assert_eq!(recorded[0].status, TaskStatus::Interrupted);
         assert_eq!(
-            tasks.outcome_status(&row.id, false).await,
-            TaskStatus::Completed
+            tasks.outcome_end(&row.id, false).await,
+            (TaskStatus::Completed, None)
         );
         assert_eq!(
-            tasks.outcome_status("unstopped", true).await,
-            TaskStatus::Failed
+            tasks.outcome_end("unstopped", true).await,
+            (TaskStatus::Failed, None)
         );
+    }
+
+    /// The start claim is the primitive a launch stands in for, and a stop landing in its window
+    /// takes one of two honest orders: the claim wins and the launched work reports the stop's own
+    /// status when it ends, or the stop wins and the launch runs nothing at all, its completion
+    /// recorded then and there, so the requester of the stop is owed no report that cannot come.
+    #[tokio::test]
+    async fn a_stand_in_launch_claims_its_start_against_a_stop_in_the_window() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store =
+            crate::store::Store::open(Some(&temp.path().join("meka.db")), &Default::default())
+                .await
+                .expect("open");
+        let session_id = store
+            .create_session(None, "p".to_string())
+            .await
+            .expect("session");
+        let background = store.background_store();
+        let tasks = BackgroundTasks::default();
+
+        // The order where the launch claims first: it runs, and the stop it loses to is what its
+        // result reports.
+        let row = BackgroundTask {
+            id: Uuid::new_v4().to_string(),
+            session_id,
+            status: TaskStatus::Running,
+            finished_at: None,
+            ..task(TaskStatus::Running, None)
+        };
+        background.start_background_task(&row).await.expect("start");
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(
+            tasks
+                .try_reserve(row.id.clone(), session_id, token.clone(), 4)
+                .await
+        );
+        assert!(matches!(
+            tasks
+                .claim_start(&background, &row.id)
+                .await
+                .expect("claim"),
+            StartClaim::StartWon
+        ));
+        assert!(
+            tasks
+                .claim_stop(session_id, &row.id, Some(StopReason::UserRequest))
+                .await
+        );
+        assert!(token.is_cancelled(), "the launched work is signaled");
+        assert_eq!(
+            tasks.outcome_end(&row.id, true).await,
+            (TaskStatus::Canceled, Some(StopReason::UserRequest))
+        );
+
+        // The order where the stop claims first: the launch must run nothing, and the completion
+        // the stop's requester was promised is already recorded, including that nothing ran.
+        let row = BackgroundTask {
+            id: Uuid::new_v4().to_string(),
+            session_id,
+            status: TaskStatus::Running,
+            finished_at: None,
+            ..task(TaskStatus::Running, None)
+        };
+        background.start_background_task(&row).await.expect("start");
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(
+            tasks
+                .try_reserve(row.id.clone(), session_id, token.clone(), 4)
+                .await
+        );
+        assert!(
+            tasks
+                .claim_stop(session_id, &row.id, Some(StopReason::AgentRequest))
+                .await
+        );
+        assert!(matches!(
+            tasks
+                .claim_start(&background, &row.id)
+                .await
+                .expect("claim"),
+            StartClaim::StopWon
+        ));
+        let recorded = background
+            .list_background_tasks(session_id)
+            .await
+            .expect("tasks");
+        let refused = recorded
+            .iter()
+            .find(|found| found.id == row.id)
+            .expect("the completion record the refusal writes");
+        assert_eq!(refused.status, TaskStatus::Canceled);
+        assert!(
+            refused
+                .outcome
+                .as_deref()
+                .unwrap_or_default()
+                .contains("before the work began"),
+            "{:?}",
+            refused.outcome
+        );
+    }
+
+    /// A repeat stop on a task left `stopping` signals its owner again rather than reporting the
+    /// first request's success: the record that landed says a request was accepted, not that its
+    /// signal ever reached the owner, and a retry that trusted it would leave work running behind
+    /// a request reported as done.
+    #[tokio::test]
+    async fn a_repeat_stop_re_signals_the_owner_of_an_open_stopping_task() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store =
+            crate::store::Store::open(Some(&temp.path().join("meka.db")), &Default::default())
+                .await
+                .expect("open");
+        let session_id = store
+            .create_session(None, "p".to_string())
+            .await
+            .expect("session");
+        let background = store.background_store();
+        let tasks = BackgroundTasks::default();
+        let row = BackgroundTask {
+            id: Uuid::new_v4().to_string(),
+            session_id,
+            status: TaskStatus::Running,
+            finished_at: None,
+            ..task(TaskStatus::Running, None)
+        };
+        background.start_background_task(&row).await.expect("start");
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(
+            tasks
+                .try_reserve(row.id.clone(), session_id, token.clone(), 4)
+                .await
+        );
+
+        // A durable request whose signal never went out: the requesting future died in between,
+        // which is exactly the state a record alone leaves behind.
+        assert_eq!(
+            background
+                .request_stop_background_tasks(vec![row.id.clone()])
+                .await
+                .expect("record"),
+            vec![row.id.clone()]
+        );
+        assert!(!token.is_cancelled(), "and nothing signaled it");
+
+        let report = tasks
+            .request_stop(&background, session_id, &row.id, StopReason::UserRequest)
+            .await
+            .expect("stop");
+        assert!(token.is_cancelled(), "the retry delivers the signal");
+        assert!(
+            matches!(report, StopReport::Signaled { repeated: true, .. }),
+            "{report:?}"
+        );
+        tasks.forget(&row.id).await;
+
+        // And the recovery a host runs on its own finds the same thing to do.
+        let row = BackgroundTask {
+            id: Uuid::new_v4().to_string(),
+            session_id,
+            status: TaskStatus::Running,
+            finished_at: None,
+            ..task(TaskStatus::Running, None)
+        };
+        background.start_background_task(&row).await.expect("start");
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(
+            tasks
+                .try_reserve(row.id.clone(), session_id, token.clone(), 4)
+                .await
+        );
+        background
+            .request_stop_background_tasks(vec![row.id.clone()])
+            .await
+            .expect("record");
+        assert!(!token.is_cancelled());
+        assert_eq!(
+            tasks
+                .deliver_durable_stops(&background, session_id)
+                .await
+                .expect("recover"),
+            1
+        );
+        assert!(token.is_cancelled(), "the recovery signals the owner");
     }
 
     /// The ceiling is per session, so one session filling it must not starve another.
@@ -835,6 +1706,7 @@ mod tests {
     fn status_round_trips_through_its_string() {
         for status in [
             TaskStatus::Running,
+            TaskStatus::Stopping,
             TaskStatus::Completed,
             TaskStatus::Failed,
             TaskStatus::Canceled,
@@ -843,6 +1715,26 @@ mod tests {
             assert_eq!(status.name().parse::<TaskStatus>(), Ok(status));
         }
         assert!("wedged".parse::<TaskStatus>().is_err());
+    }
+
+    /// An open status is not terminal: a `stopping` row is out of every delivery pool and still
+    /// counted as running, and a stop request has to be distinguished from the `running` it came
+    /// from or the row would read as if nothing had been asked of it.
+    #[test]
+    fn a_stop_request_is_open_and_only_a_terminal_status_wakes_a_host() {
+        assert!(!TaskStatus::Stopping.is_terminal());
+        assert!(!TaskStatus::Running.is_terminal());
+        assert!(!TaskStatus::Stopping.wakes_a_host());
+        for status in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Interrupted,
+        ] {
+            assert!(status.is_terminal());
+            assert!(status.wakes_a_host());
+        }
+        assert!(TaskStatus::Canceled.is_terminal());
+        assert!(!TaskStatus::Canceled.wakes_a_host());
     }
 
     #[test]
@@ -977,7 +1869,6 @@ mod tests {
     #[test]
     fn only_a_cancellation_waits_for_a_turn_that_was_happening_anyway() {
         for status in [
-            TaskStatus::Running,
             TaskStatus::Completed,
             TaskStatus::Failed,
             TaskStatus::Interrupted,
@@ -991,6 +1882,10 @@ mod tests {
         assert!(
             !TaskStatus::Canceled.wakes_a_host(),
             "whoever canceled it already knows, and a stop command must not start a turn"
+        );
+        assert!(
+            !TaskStatus::Stopping.wakes_a_host(),
+            "a request is not an outcome, so there is nothing to deliver yet"
         );
     }
 
