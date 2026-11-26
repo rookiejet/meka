@@ -680,14 +680,14 @@ mod tests {
         assert_eq!(row.outcome.as_deref(), Some("42 passed"));
     }
 
-    /// A shell task stopped locally may have been routed into WSL, and the stop here cannot tell
-    /// whether it was, so the delivered outcome must not name a route the run never recorded. It
-    /// carries the hedge true of every route instead; per-route evidence speaks only where the run
-    /// recorded one.
+    /// A shell task stopped locally may have been routed over SSH or into WSL, and the stop here
+    /// cannot tell which, so the delivered outcome must not name a route the run never recorded,
+    /// which is exactly how a WSL command came to inherit an SSH caveat. It carries the hedge true
+    /// of every route instead; per-route evidence speaks only where the run recorded one.
     #[tokio::test]
     async fn a_cancelled_shell_task_hedges_about_a_route_it_never_recorded() {
         let (context, session_id) = context().await;
-        let task = seed(&context, session_id, "make all").await;
+        let task = seed(&context, session_id, "ssh build-host make").await;
         let store = context.store.clone();
         let tasks = context.tasks.clone();
         let token = CancellationToken::new();
@@ -739,7 +739,7 @@ mod tests {
             "{outcome}"
         );
         assert!(
-            !outcome.contains("guest command"),
+            !outcome.contains("remote command") && !outcome.contains("guest command"),
             "no route was recorded, so no route may be named: {outcome}"
         );
         let rendered = crate::background::render_outcomes(&delivered);

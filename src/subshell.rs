@@ -1,8 +1,8 @@
 //! Managed subshell grants and the wire shared by its host and guest.
 
 // The request and mount wire is compiled where an end of it exists: the Windows host and the
-// Linux guest. Other platforms build the wire without using it, so it reads as unused there
-// rather than being dead.
+// Linux guest. Other platforms build only the SSH target types, so the rest reads as unused
+// there rather than being dead.
 #![cfg_attr(
     not(any(windows, target_os = "linux")),
     allow(
@@ -2155,6 +2155,650 @@ impl Handles {
 // Session teardown is not a scratch teardown. A workspace is the guest's, which expires it after
 // its lease, so nothing here reaches into the guest's filesystem: a session that ended without
 // closing its handles leaves them to that reaper.
+
+/// A named SSH target pinned to one host key. The target address is itself the scope; the SSH
+/// transport runs at `unrestricted` only, because a remote login is not a boundary this process
+/// can enforce.
+#[derive(Debug, Clone)]
+pub(crate) struct SshTarget {
+    pub(crate) name: String,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) user: String,
+    pub(crate) key: String,
+    pub(crate) host_key: String,
+    pub(crate) certificate: Option<String>,
+}
+
+impl SshTarget {
+    /// Build an SSH target from validated connection details. The pinned host key is the server's
+    /// identity proof and is required: without it `ssh` would trust whatever key the network
+    /// offered the first time.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a flat constructor for a config-derived struct"
+    )]
+    pub(crate) fn new(
+        name: &str,
+        host: &str,
+        port: u16,
+        user: &str,
+        key: &str,
+        host_key: String,
+        certificate: Option<String>,
+    ) -> Result<Self> {
+        ensure!(
+            !name.is_empty()
+                && name.len() <= 64
+                && name.trim() == name
+                && !name.starts_with('-')
+                && !name
+                    .chars()
+                    .any(|c| c.is_control() || matches!(c, '"' | '/' | '\\' | ' ' | '\t')),
+            "invalid SSH target name {name:?}"
+        );
+        ensure!(
+            !host.is_empty()
+                && host.trim() == host
+                && !host.starts_with('-')
+                && !host
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '@' | '/' | '\\')),
+            "invalid SSH host for target {name:?}"
+        );
+        ensure!(port > 0, "invalid SSH port for target {name:?}");
+        ensure!(
+            !user.is_empty()
+                && user.trim() == user
+                && !user.starts_with('-')
+                && !user.chars().any(|c| {
+                    c.is_control() || c.is_whitespace() || matches!(c, '@' | ':' | '/' | '\\')
+                }),
+            "invalid SSH user for target {name:?}"
+        );
+        ensure!(!key.is_empty(), "SSH target {name:?} requires a key path");
+        ensure!(
+            !key.chars().any(char::is_control),
+            "SSH target {name:?} has a malformed key path"
+        );
+        let (kind, encoded) = host_key.split_once(' ').ok_or_else(|| {
+            anyhow::anyhow!("SSH target {name:?} has an unrecognized host_key format")
+        })?;
+        ensure!(
+            matches!(
+                kind,
+                "ssh-ed25519"
+                    | "ssh-rsa"
+                    | "ecdsa-sha2-nistp256"
+                    | "ecdsa-sha2-nistp384"
+                    | "ecdsa-sha2-nistp521"
+                    | "sk-ssh-ed25519@openssh.com"
+                    | "sk-ecdsa-sha2-nistp256@openssh.com"
+            ) && encoded.len() >= 16
+                && encoded.len() <= 8 * crate::text::KIB
+                && encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')),
+            "SSH target {name:?} has an unrecognized host_key format"
+        );
+        if let Some(certificate) = &certificate {
+            ensure!(
+                !certificate.is_empty() && !certificate.chars().any(char::is_control),
+                "SSH target {name:?} has a malformed certificate path"
+            );
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            host: host.to_owned(),
+            port,
+            user: user.to_owned(),
+            key: key.to_owned(),
+            host_key,
+            certificate,
+        })
+    }
+
+    /// The least permission this target can run at. A remote login reaches a machine this process
+    /// has no boundary on, so there is only one answer.
+    pub(crate) fn minimum_permission(&self) -> crate::permission::Permission {
+        crate::permission::Permission::Unrestricted
+    }
+
+    /// Resolve one credential path and require it to be a readable file. `what` names the
+    /// credential in the refusal, which also says why the check exists.
+    fn credential(&self, path: &str, what: &str) -> Result<std::path::PathBuf> {
+        let resolved = crate::paths::expand_user_path(path).ok_or_else(|| {
+            anyhow::anyhow!(
+                "SSH target {:?} has a {what} path this process cannot resolve: {path:?}",
+                self.name
+            )
+        })?;
+        let readable = std::fs::File::open(&resolved)
+            .is_ok_and(|file| file.metadata().is_ok_and(|metadata| metadata.is_file()));
+        ensure!(
+            readable,
+            "SSH target {:?} cannot read its {what} {}; a target without a usable credential is \
+             refused rather than left to OpenSSH's default identities",
+            self.name,
+            resolved.display()
+        );
+        Ok(resolved)
+    }
+
+    /// The `ssh` arguments for one command and the pinned-host-key file they read.
+    ///
+    /// The file is created per call holding the target's one pinned key and is handed to `ssh` as
+    /// both the user and the global known-hosts database. `-F none` keeps every ambient config out,
+    /// and forwarding, agent use and local commands are off. The caller keeps the returned file
+    /// alive until `ssh` has read it and then drops it.
+    ///
+    /// The identity travels as an `IdentityFile` option, never as `-i`. The client drops a `-i`
+    /// file it cannot open while parsing the option and then sees no identity at all, whereupon it
+    /// installs the user's default identity files even under `IdentitiesOnly=yes`; the option form
+    /// keeps the configured path in the list whatever the file looks like when the client loads it,
+    /// so the configured key is the only identity offered. A credential that is missing or
+    /// unreadable is still refused before the client runs, so a target never quietly authenticates
+    /// as somebody else or not at all. `PreferredAuthentications=publickey` with the other
+    /// mechanisms off makes the configured key the only method the client may try, and
+    /// `CertificateFile` is pinned to the configured certificate or to `none` so a companion
+    /// certificate is never discovered beside the key.
+    pub(crate) fn ssh_args(&self, command: &str) -> Result<(Vec<String>, KnownHostsFile)> {
+        let key = self.credential(&self.key, "key")?;
+        let certificate = self
+            .certificate
+            .as_deref()
+            .map(|path| self.credential(path, "certificate"))
+            .transpose()?;
+        let host = if self.port == 22 {
+            self.host.clone()
+        } else {
+            format!("[{}]:{}", self.host, self.port)
+        };
+        let known_hosts = KnownHostsFile::create(&format!("{host} {}\n", self.host_key))?;
+        let mut args = vec![
+            "-F".to_owned(),
+            "none".to_owned(),
+            "-p".to_owned(),
+            self.port.to_string(),
+            "-o".to_owned(),
+            ssh_path_option("IdentityFile", &key, PathExpansion::Tokens)?,
+            "-o".to_owned(),
+            // One authentication mechanism: the configured key. OpenSSH falls back to the user's
+            // default identity files and to an agent when a key cannot be used, and a cleared
+            // `HOME` does not stop it from consulting the account database.
+            // `PreferredAuthentications` is what refuses every other method, rather than relying
+            // on an absent credential.
+            "PreferredAuthentications=publickey".to_owned(),
+            "-o".to_owned(),
+            "PubkeyAuthentication=yes".to_owned(),
+            "-o".to_owned(),
+            "PasswordAuthentication=no".to_owned(),
+            "-o".to_owned(),
+            "KbdInteractiveAuthentication=no".to_owned(),
+            "-o".to_owned(),
+            "HostbasedAuthentication=no".to_owned(),
+            "-o".to_owned(),
+            "IdentitiesOnly=yes".to_owned(),
+            "-o".to_owned(),
+            "BatchMode=yes".to_owned(),
+            "-o".to_owned(),
+            "StrictHostKeyChecking=yes".to_owned(),
+            "-o".to_owned(),
+            ssh_path_option(
+                "UserKnownHostsFile",
+                known_hosts.path(),
+                PathExpansion::Tilde,
+            )?,
+            "-o".to_owned(),
+            ssh_path_option(
+                "GlobalKnownHostsFile",
+                known_hosts.path(),
+                PathExpansion::Tilde,
+            )?,
+            "-o".to_owned(),
+            "CheckHostIP=no".to_owned(),
+            "-o".to_owned(),
+            "UpdateHostKeys=no".to_owned(),
+            "-o".to_owned(),
+            "ForwardAgent=no".to_owned(),
+            "-o".to_owned(),
+            "ForwardX11=no".to_owned(),
+            "-o".to_owned(),
+            "ForwardX11Trusted=no".to_owned(),
+            "-o".to_owned(),
+            "ClearAllForwardings=yes".to_owned(),
+            "-o".to_owned(),
+            "PermitLocalCommand=no".to_owned(),
+            "-o".to_owned(),
+            "IdentityAgent=none".to_owned(),
+        ];
+        match certificate {
+            Some(certificate) => {
+                args.push("-o".to_owned());
+                args.push(ssh_path_option(
+                    "CertificateFile",
+                    &certificate,
+                    PathExpansion::Tokens,
+                )?);
+            }
+            None => {
+                // `CertificateFile none` is OpenSSH's own way to load no certificate. Without it,
+                // a `<key>-cert.pub` beside the configured key would be offered even though the
+                // target stated only the key, which is an identity the operator did not name.
+                args.push("-o".to_owned());
+                args.push("CertificateFile=none".to_owned());
+            }
+        }
+        args.push("--".to_owned());
+        args.push(format!("{}@{}", self.user, self.host));
+        args.push(command.to_owned());
+        Ok((args, known_hosts))
+    }
+}
+
+/// How the OpenSSH client rewrites a path before it opens it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathExpansion {
+    /// Identity and certificate paths: a leading tilde, `%` tokens and `${VARIABLE}` environment
+    /// expansion when the client loads them.
+    Tokens,
+    /// Known-hosts paths: a leading tilde and nothing else.
+    Tilde,
+}
+
+/// One `-o Name=<path>` argument, with the path double-quoted so OpenSSH's config parser keeps it
+/// one value.
+///
+/// The parser's own layers are the reason for the shape. An unquoted value ends at the first
+/// space, which turns `CertificateFile` naming a path with spaces into a credential the client
+/// never finds, and a quoted value ends at the next double quote with no escape to hide one, so a
+/// path holding a quote cannot be represented and is refused rather than truncated. Whichever way
+/// the path is spelled, it has to reach the client exactly as configured: a tilde would be
+/// expanded to somebody's home directory, and the client's token expansion would turn `%u` into a
+/// user name and `${VARIABLE}` into an environment value or a fatal error. A percent therefore
+/// travels doubled for the paths that are token-expanded and as written for the paths that are
+/// not. The argv layer under all of this is `std::process::Command`'s own quoting and is not
+/// visible here.
+fn ssh_path_option(name: &str, path: &std::path::Path, expansion: PathExpansion) -> Result<String> {
+    let value = path.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "an SSH path this process cannot pass to OpenSSH unchanged must be a Unicode path: \
+             {path:?}"
+        )
+    })?;
+    ensure!(
+        !value.starts_with('~'),
+        "an SSH path must not start with `~`: OpenSSH would expand it to another directory: \
+         {value:?}"
+    );
+    ensure!(
+        !value.contains('"'),
+        "an SSH path must not contain a double quote: OpenSSH's config parser cannot hold one \
+         inside a quoted value: {value:?}"
+    );
+    ensure!(
+        !value.chars().any(char::is_control),
+        "an SSH path must not contain control characters: {value:?}"
+    );
+    let value = match expansion {
+        PathExpansion::Tokens => {
+            ensure!(
+                !value.contains("${"),
+                "an SSH credential path must not contain `${{`: OpenSSH would read an environment \
+                 variable into it: {value:?}"
+            );
+            value.replace('%', "%%")
+        }
+        PathExpansion::Tilde => value.to_owned(),
+    };
+    Ok(format!("{name}=\"{value}\""))
+}
+
+/// The pinned host key written to a private file for one `ssh` call.
+///
+/// The file lives in a fresh directory of its own rather than directly in the temporary
+/// directory, so another account cannot pre-create or replace the name between the write and the
+/// client's read. The directory is owner-only on Unix and inherits the user's temporary-directory
+/// ACL on Windows; both are removed when the call ends.
+pub(crate) struct KnownHostsFile {
+    directory: PathBuf,
+    path: PathBuf,
+}
+
+impl KnownHostsFile {
+    fn create(entry: &str) -> Result<Self> {
+        let temp = std::env::temp_dir();
+        for _ in 0..8 {
+            let directory = temp.join(format!(
+                "meka-known-hosts-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            #[cfg(unix)]
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(not(unix))]
+            let builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "cannot create a private known-hosts directory: {error}"
+                    ));
+                }
+            }
+            let path = directory.join("known_hosts");
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = match options.open(&path) {
+                Ok(file) => file,
+                Err(error) => {
+                    let _ = std::fs::remove_dir_all(&directory);
+                    return Err(anyhow::anyhow!("cannot create a known-hosts file: {error}"));
+                }
+            };
+            use std::io::Write;
+            if let Err(error) = file.write_all(entry.as_bytes()) {
+                let _ = std::fs::remove_dir_all(&directory);
+                return Err(anyhow::anyhow!("cannot write a known-hosts file: {error}"));
+            }
+            return Ok(Self { directory, path });
+        }
+        Err(anyhow::anyhow!(
+            "cannot create a private known-hosts directory"
+        ))
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for KnownHostsFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+#[cfg(test)]
+mod ssh_tests {
+    use super::*;
+
+    /// A credential file that exists for the life of the test process. `ssh_args` opens what it is
+    /// given, so the fixtures have to be real files.
+    fn credential(name: &str, contents: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("meka-ssh-{name}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn target() -> (SshTarget, std::path::PathBuf) {
+        let key = credential("key", "not a real key");
+        let target = SshTarget::new(
+            "build",
+            "build.example",
+            2222,
+            "deploy",
+            &key.display().to_string(),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest".to_string(),
+            None,
+        )
+        .unwrap();
+        (target, key)
+    }
+
+    #[test]
+    fn ssh_arguments_pin_the_host_key_and_keep_ambient_config_out() {
+        let (target, key) = target();
+        let (args, known_hosts) = target.ssh_args("printf hello").unwrap();
+        let entry = std::fs::read_to_string(known_hosts.path()).unwrap();
+        assert_eq!(
+            entry,
+            "[build.example]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest\n"
+        );
+        assert_eq!(args.iter().filter(|arg| *arg == "-F").count(), 1);
+        assert!(args.windows(2).any(|pair| pair == ["-F", "none"]));
+        assert!(args.windows(2).any(|pair| pair == ["-p", "2222"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-o"
+                    && pair[1] == format!("IdentityFile=\"{}\"", key.display())),
+            "the identity travels as an option value, never as `-i`: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "-i"),
+            "a positional `-i` identity is dropped when unreadable and falls back to the user's \
+             default identities: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with("UserKnownHostsFile="))
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with("GlobalKnownHostsFile="))
+        );
+        assert!(args.iter().any(|arg| arg == "StrictHostKeyChecking=yes"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "PreferredAuthentications=publickey")
+        );
+        for refused in [
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+            "HostbasedAuthentication=no",
+            "PubkeyAuthentication=yes",
+            "CertificateFile=none",
+        ] {
+            assert!(args.iter().any(|arg| arg == refused), "{refused}: {args:?}");
+        }
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("HostKey=")),
+            "no option may stand in for the pinned file: {args:?}"
+        );
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(args[separator + 1], "deploy@build.example");
+        assert_eq!(args[separator + 2], "printf hello");
+        assert_eq!(args.last().unwrap(), "printf hello");
+        let path = known_hosts.path().to_path_buf();
+        drop(known_hosts);
+        assert!(!path.exists(), "the one-call known-hosts file is removed");
+    }
+
+    #[test]
+    fn ssh_targets_refuse_an_unpinned_or_malformed_identity() {
+        let build = |host: &str, user: &str, key: String| {
+            SshTarget::new("build", host, 22, user, "/k", key, None)
+        };
+        for (host, user, key) in [
+            ("-oProxyCommand=x", "deploy", "ssh-ed25519 AAAA".to_string()),
+            ("host name", "deploy", "ssh-ed25519 AAAA".to_string()),
+            ("example", "-root", "ssh-ed25519 AAAA".to_string()),
+            ("example", "deploy", "host key".to_string()),
+            (
+                "example",
+                "deploy",
+                "ssh-ed25519 AAAA\nssh-rsa AAAA".to_string(),
+            ),
+            ("example", "deploy", "ssh-ed25519 AAAA".to_string()),
+        ] {
+            assert!(build(host, user, key).is_err(), "{host} {user}");
+        }
+        let certificate_path = credential("cert", "not a real certificate");
+        let certificate = SshTarget::new(
+            "build",
+            "example",
+            22,
+            "deploy",
+            &credential("key", "not a real key").display().to_string(),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest".to_string(),
+            Some(certificate_path.display().to_string()),
+        )
+        .unwrap();
+        let (args, _known_hosts) = certificate.ssh_args("true").unwrap();
+        assert!(
+            args.iter()
+                .any(|arg| *arg == format!("CertificateFile=\"{}\"", certificate_path.display())),
+            "{args:?}"
+        );
+    }
+
+    /// A credential the client cannot read is refused before it runs: OpenSSH would otherwise fall
+    /// back to the user's default identities, which this call deliberately does not provide.
+    #[test]
+    fn ssh_arguments_refuse_a_missing_credential() {
+        let missing = std::env::temp_dir().join("meka-ssh-does-not-exist");
+        let target = SshTarget::new(
+            "build",
+            "example",
+            22,
+            "deploy",
+            &missing.display().to_string(),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest".to_string(),
+            None,
+        )
+        .unwrap();
+        let error = target.ssh_args("true").err().expect("a missing key");
+        assert!(
+            error.to_string().contains("cannot read its key")
+                && error.to_string().contains("default identities"),
+            "{error}"
+        );
+
+        let target = SshTarget::new(
+            "build",
+            "example",
+            22,
+            "deploy",
+            &credential("key", "not a real key").display().to_string(),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest".to_string(),
+            Some(missing.display().to_string()),
+        )
+        .unwrap();
+        let error = target
+            .ssh_args("true")
+            .err()
+            .expect("a missing certificate");
+        assert!(
+            error.to_string().contains("cannot read its certificate"),
+            "{error}"
+        );
+    }
+
+    /// A credential path with spaces travels as one option value: OpenSSH's config parser ends an
+    /// unquoted value at the first space, which would leave it reading a different file.
+    #[test]
+    fn ssh_arguments_quote_credential_paths_with_spaces() {
+        let directory =
+            std::env::temp_dir().join(format!("meka ssh {}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let key = directory.join("id with space");
+        std::fs::write(&key, "not a real key").unwrap();
+        let certificate = directory.join("cert with space.pub");
+        std::fs::write(&certificate, "not a real certificate").unwrap();
+        let target = SshTarget::new(
+            "build",
+            "example",
+            22,
+            "deploy",
+            &key.display().to_string(),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest".to_string(),
+            Some(certificate.display().to_string()),
+        )
+        .unwrap();
+        let (args, _known_hosts) = target.ssh_args("true").unwrap();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-o"
+                    && pair[1] == format!("IdentityFile=\"{}\"", key.display())),
+            "the key stays one argument: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with("UserKnownHostsFile=\"")),
+            "{args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|arg| *arg == format!("CertificateFile=\"{}\"", certificate.display())),
+            "{args:?}"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// One path survives both layers of the option value: the config parser keeps it one value,
+    /// and the client's own token expansion leaves the configured name standing. A path the two
+    /// layers cannot represent exactly is refused rather than passed along and read as some other
+    /// file.
+    #[test]
+    fn ssh_option_paths_survive_the_client_s_config_and_expansion_layers() {
+        let path = std::path::Path::new(r"C:\tmp dir\100%u\$x\id");
+        assert_eq!(
+            ssh_path_option("IdentityFile", path, PathExpansion::Tokens).unwrap(),
+            r#"IdentityFile="C:\tmp dir\100%%u\$x\id""#,
+            "token expansion must not see the percent in the path"
+        );
+        assert_eq!(
+            ssh_path_option("UserKnownHostsFile", path, PathExpansion::Tilde).unwrap(),
+            r#"UserKnownHostsFile="C:\tmp dir\100%u\$x\id""#,
+            "known-hosts paths are not token-expanded and travel as written"
+        );
+        let braced = std::path::Path::new(r"C:\tmp\${USER}\id");
+        assert!(
+            ssh_path_option("IdentityFile", braced, PathExpansion::Tokens).is_err(),
+            "an environment variable cannot be kept out of a token-expanded path"
+        );
+        assert_eq!(
+            ssh_path_option("GlobalKnownHostsFile", braced, PathExpansion::Tilde).unwrap(),
+            r#"GlobalKnownHostsFile="C:\tmp\${USER}\id""#,
+            "known-hosts paths see no environment expansion"
+        );
+        for refused in [
+            std::path::Path::new("C:\\tmp\\id\"with\"quote"),
+            std::path::Path::new("~/id"),
+            std::path::Path::new("~user/id"),
+            std::path::Path::new("C:\\tmp\t\\id"),
+        ] {
+            for expansion in [PathExpansion::Tokens, PathExpansion::Tilde] {
+                assert!(
+                    ssh_path_option("IdentityFile", refused, expansion).is_err(),
+                    "{refused:?} must be refused"
+                );
+            }
+        }
+    }
+
+    /// A path this process cannot spell in Unicode cannot be passed to the client unchanged, and
+    /// the lossy conversion a display would show is not the path the client would open.
+    #[test]
+    fn ssh_option_paths_refuse_a_non_unicode_path() {
+        #[cfg(unix)]
+        let path = {
+            use std::os::unix::ffi::OsStringExt;
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![0x2f, 0xff, 0x69, 0x64]))
+        };
+        #[cfg(windows)]
+        let path = {
+            use std::os::windows::ffi::OsStringExt;
+            std::path::PathBuf::from(std::ffi::OsString::from_wide(&[
+                0x43, 0x3a, 0x5c, 0xd800, 0x5c, 0x69, 0x64,
+            ]))
+        };
+        for expansion in [PathExpansion::Tokens, PathExpansion::Tilde] {
+            assert!(ssh_path_option("IdentityFile", &path, expansion).is_err());
+        }
+    }
+}
 
 #[cfg(test)]
 #[cfg(windows)]

@@ -136,7 +136,7 @@ impl Tool for MemoryWriteTool {
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Where the fact applies: 'portable' (default), 'windows', or 'wsl:<distro>'. \
+                        "description": "Where the fact applies: 'portable' (default), 'windows', 'wsl:<distro>', or 'ssh:<target>'. \
                                         A target-specific note is still listed in the memory index everywhere, so it stays \
                                         searchable, but its body is put in context as an instruction only in a session on \
                                         that target. Omit to keep; pass \"\" to clear."

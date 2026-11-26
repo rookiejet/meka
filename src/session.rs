@@ -252,6 +252,8 @@ pub(crate) struct SessionCells {
     /// two are set together from the configuration that resolved one.
     #[cfg(windows)]
     pub(crate) wsl_needs_workspace: bool,
+    /// Named SSH targets from `[shell.ssh]`.
+    pub(crate) ssh_targets: std::collections::BTreeMap<String, Arc<crate::subshell::SshTarget>>,
     pub(crate) cwd: crate::workspace::SharedCwd,
     pub(crate) roots: crate::workspace::SharedRoots,
     /// Directories the session may read but not write, beyond its roots: what a parent's
@@ -297,13 +299,13 @@ pub(crate) struct SessionCells {
 }
 
 /// The memory scope keys a session with these targets can satisfy, in this order:
-/// [`crate::memory::SCOPE_WINDOWS`] on a Windows host, then `wsl:<distro>` when a WSL target is
-/// configured.
+/// [`crate::memory::SCOPE_WINDOWS`] on a Windows host, `wsl:<distro>` when a WSL target is
+/// configured, then one `ssh:<name>` per SSH target.
 ///
 /// A free function rather than only a method so the rules can be stated and tested without a
 /// whole session behind them; [`SessionCells::active_memory_scopes`] is the method and the only
 /// caller.
-fn scope_keys(wsl: Option<&str>) -> Vec<String> {
+fn scope_keys<'a>(wsl: Option<&str>, ssh: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut scopes: Vec<String> = Vec::new();
     #[cfg(windows)]
     {
@@ -316,6 +318,7 @@ fn scope_keys(wsl: Option<&str>) -> Vec<String> {
     // can be opened, and the Linux build has no WSL target to name.
     #[cfg(not(windows))]
     let _ = wsl;
+    scopes.extend(ssh.map(|name| format!("ssh:{name}")));
     scopes
 }
 
@@ -335,6 +338,7 @@ impl SessionCells {
             wsl: None,
             #[cfg(windows)]
             wsl_needs_workspace: false,
+            ssh_targets: std::collections::BTreeMap::new(),
             cwd,
             roots,
             read_only_roots: crate::workspace::SharedRoots::default(),
@@ -370,25 +374,29 @@ impl SessionCells {
         self.wsl_needs_workspace = needs_workspace;
     }
 
-    /// The scope keys this session can actually be on: `windows` on a Windows host and
-    /// `wsl:<distro>` when the session may open the configured WSL target.
+    /// The scope keys this session can actually be on: `windows` on a Windows host,
+    /// `wsl:<distro>` when the session may open the configured WSL target, and `ssh:<name>` for
+    /// each SSH target its tools and level admit.
     ///
     /// This is the set [`crate::memory::scope_applies`] compares a memory's `scope` against. A
     /// configured target is not enough: a target a worker's scope denies, one whose tool floor
-    /// an operator raised past the session's level, and one whose own grants need more than the
-    /// session's level can each hold a target's configuration without being able to reach it,
-    /// and a note for that target must not read as a standing instruction there.
+    /// an operator raised past the session's level, one whose own grants need more than the
+    /// session's level, and one whose transport the session's networking refuses can each hold a
+    /// target's configuration without being able to reach it, and a note for that target must
+    /// not read as a standing instruction there.
     ///
     /// `shell` is `shell_execute`'s requirement as the model's real tool catalog states it
-    /// (overrides included), `None` when the catalog does not carry the tool at all. The one-shot
-    /// WSL call is a `shell_execute` route. `level` is the session's permission. The answer is
-    /// what actual dispatch would admit, asked of the same pure rules it uses
-    /// (`Permission::allows` for the confined built-in, `Target::request`'s floors), never a
-    /// guest probe.
+    /// (overrides included), `None` when the catalog does not carry the tool at all. Both guest
+    /// routes go through it: the one-shot WSL call and every SSH call are `shell_execute` routes.
+    /// `level` is the session's permission, `network` the setting the SSH transport reads. The
+    /// answer is what actual dispatch would admit, asked of the same pure rules it uses
+    /// (`Permission::allows` for the confined built-in, `Target::request`'s floors, and each
+    /// target's `SshTarget::minimum_permission`), never a network or guest probe.
     pub(crate) fn active_memory_scopes(
         &self,
         shell: Option<crate::permission::Permission>,
         level: crate::permission::Permission,
+        network: crate::config::Network,
     ) -> Vec<String> {
         // Dispatch's rule for a confined built-in (`crate::tools::admit_tool_call` asks
         // `Permission::allows`), not strict containment: a tool the dispatcher would run at this
@@ -411,13 +419,24 @@ impl SessionCells {
                 .map(crate::subshell::Target::distribution)
         })
         .flatten();
-        // Silenced rather than removed for the reason `scope_keys` gives: the rule exists for the
-        // Windows build, where a guest can be opened, and the Linux build has no target to reach.
-        #[cfg(not(windows))]
-        let _ = shell_reaches;
         #[cfg(not(windows))]
         let wsl = None;
-        scope_keys(wsl)
+        // SSH is the one transport that runs at `unrestricted` alone, and only when the session
+        // admits a host network: the client dials the target's own address, which a remote-only
+        // setting cannot constrain. The level floor is each target's own
+        // (`SshTarget::minimum_permission`, what dispatch reads at launch), tested strictly
+        // because this transport has no boundary a lower level could apply.
+        let reachable = shell_reaches && network == crate::config::Network::Host;
+        let ssh: Vec<&str> = if reachable {
+            self.ssh_targets
+                .iter()
+                .filter(|(_, target)| target.minimum_permission().is_within(level))
+                .map(|(name, _)| name.as_str())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        scope_keys(wsl, ssh.into_iter())
     }
 
     /// What is in context as far as Meka knows: the last measurement plus what tools have reserved
@@ -1781,7 +1800,8 @@ mod tests {
     }
 
     /// The active memory scopes are the session's actual targets, not the configuration's: the
-    /// host it runs on. A note scoped to it applies, and so does a portable note.
+    /// host it runs on and each SSH target it holds. A note scoped to one of them applies; a note
+    /// scoped to a target this session does not have does not.
     #[test]
     fn a_session_names_the_targets_a_memory_scope_can_match() {
         let cells = SessionCells::for_test(
@@ -1796,23 +1816,112 @@ mod tests {
         let bare = cells.active_memory_scopes(
             Some(crate::permission::Permission::Read),
             crate::permission::Permission::Read,
+            crate::config::Network::Host,
+        );
+        assert!(
+            !bare.iter().any(|scope| scope.starts_with("ssh:")),
+            "no SSH target is configured: {bare:?}"
         );
         #[cfg(windows)]
         assert_eq!(bare, [crate::memory::SCOPE_WINDOWS.to_string()]);
         #[cfg(not(windows))]
         assert!(bare.is_empty(), "{bare:?}");
-        assert!(crate::memory::scope_applies("", &bare), "portable applies");
+
+        // A configured target named `build` is one an `ssh:build` note applies to, and only it.
+        let target = crate::subshell::SshTarget::new(
+            "build",
+            "build.example",
+            22,
+            "deploy",
+            "/home/deploy/.ssh/id_ed25519",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest".to_string(),
+            None,
+        )
+        .expect("a target");
+        let mut cells = cells;
+        cells
+            .ssh_targets
+            .insert("build".to_string(), Arc::new(target));
+        let active = cells.active_memory_scopes(
+            Some(crate::permission::Permission::Read),
+            crate::permission::Permission::Unrestricted,
+            crate::config::Network::Host,
+        );
+        assert_eq!(
+            active
+                .iter()
+                .filter(|scope| scope.as_str() == "ssh:build")
+                .count(),
+            1,
+            "{active:?}"
+        );
+
+        // Reachability is part of the question: a configured target a session cannot open is not
+        // a target its notes apply to. `None` is a tool the model does not hold at all, and a
+        // requirement above the level is an operator's floor or the managed family's own.
+        for (shell, level, network) in [
+            (
+                None,
+                crate::permission::Permission::Unrestricted,
+                crate::config::Network::Host,
+            ),
+            (
+                Some(crate::permission::Permission::Unrestricted),
+                crate::permission::Permission::Workspace,
+                crate::config::Network::Host,
+            ),
+            (
+                Some(crate::permission::Permission::Read),
+                crate::permission::Permission::Workspace,
+                crate::config::Network::Host,
+            ),
+            (
+                Some(crate::permission::Permission::Read),
+                crate::permission::Permission::Unrestricted,
+                crate::config::Network::None,
+            ),
+            // `remote` refuses the route as well: the client dials the target's own address, so
+            // the setting cannot keep the connection off this machine.
+            (
+                Some(crate::permission::Permission::Read),
+                crate::permission::Permission::Unrestricted,
+                crate::config::Network::Remote,
+            ),
+        ] {
+            let withheld = cells.active_memory_scopes(shell, level, network);
+            assert!(
+                !crate::memory::scope_applies("ssh:build", &withheld),
+                "an unreachable target must not apply: {withheld:?}"
+            );
+        }
+        assert!(crate::memory::scope_applies("ssh:build", &active));
+        assert!(!crate::memory::scope_applies("ssh:prod", &active));
+        assert!(
+            crate::memory::scope_applies("", &active),
+            "portable applies"
+        );
     }
 
-    /// The route set answers with the doors actual dispatch reads, over every level and tool
-    /// floor: the tool gate is `crate::tools::admit_tool_call`'s own rule for a confined
-    /// built-in, and the WSL route carries `Target::request`'s unconditional read floor and its
-    /// Windows-backed workspace floor.
-    #[cfg(windows)]
+    /// The route set answers with the doors actual dispatch reads, over every level, tool floor
+    /// and network setting: the tool gate is `crate::tools::admit_tool_call`'s own rule for a
+    /// confined built-in, the WSL route carries `Target::request`'s unconditional read floor and
+    /// its Windows-backed workspace floor, and SSH keeps its strict `unrestricted`/host rule
+    /// through each target's `SshTarget::minimum_permission`.
     #[test]
     fn the_route_set_matches_what_dispatch_would_admit() {
         use crate::permission::Permission;
 
+        let target = crate::subshell::SshTarget::new(
+            "build",
+            "build.example",
+            22,
+            "deploy",
+            "/home/deploy/.ssh/id_ed25519",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest".to_string(),
+            None,
+        )
+        .expect("a target");
+        let minimum = target.minimum_permission();
         let mut cells = SessionCells::for_test(
             crate::permission::SharedPermission::new(
                 Permission::Unrestricted,
@@ -1822,9 +1931,14 @@ mod tests {
             crate::workspace::roots_for_test(),
             Arc::new(crate::frontend::SilentFrontend),
         );
+        cells
+            .ssh_targets
+            .insert("build".to_string(), Arc::new(target));
         // A managed target whose grants are all Windows-backed, the shape whose identity proof
         // needs `workspace`.
+        #[cfg(windows)]
         let native = tempfile::tempdir().expect("a temporary directory");
+        #[cfg(windows)]
         let wsl_scope = {
             let wsl_target = crate::subshell::Target::from_grants(
                 "Test Linux",
@@ -1846,30 +1960,47 @@ mod tests {
             Some(Permission::Unrestricted),
         ] {
             for level in Permission::ALL {
-                let active = cells.active_memory_scopes(required, level);
-                // The dispatcher's own gate for the confined built-in, asked unattended:
-                // approvals and a probe change what a person sees, not what a hint may
-                // promise.
-                let tool_runs = required.is_some_and(|required| {
-                    matches!(
-                        crate::tools::admit_tool_call(
-                            "shell_execute",
-                            required,
-                            level,
-                            false,
-                            false
-                        ),
-                        crate::tools::Admission::Run
-                    )
-                });
-                let wsl_runs = tool_runs
-                    && Permission::Read.is_within(level)
-                    && Permission::Workspace.is_within(level);
-                assert_eq!(
-                    crate::memory::scope_applies(&wsl_scope, &active),
-                    wsl_runs,
-                    "wsl at level {level}, tool {required:?}"
-                );
+                for network in [
+                    crate::config::Network::Host,
+                    crate::config::Network::Remote,
+                    crate::config::Network::None,
+                ] {
+                    let active = cells.active_memory_scopes(required, level, network);
+                    // The dispatcher's own gate for the confined built-in, asked unattended:
+                    // approvals and a probe change what a person sees, not what a hint may
+                    // promise.
+                    let tool_runs = required.is_some_and(|required| {
+                        matches!(
+                            crate::tools::admit_tool_call(
+                                "shell_execute",
+                                required,
+                                level,
+                                false,
+                                false
+                            ),
+                            crate::tools::Admission::Run
+                        )
+                    });
+                    let ssh_runs = tool_runs
+                        && network == crate::config::Network::Host
+                        && minimum.is_within(level);
+                    assert_eq!(
+                        crate::memory::scope_applies("ssh:build", &active),
+                        ssh_runs,
+                        "ssh:build at level {level}, tool {required:?}, network {network:?}"
+                    );
+                    #[cfg(windows)]
+                    {
+                        let wsl_runs = tool_runs
+                            && Permission::Read.is_within(level)
+                            && Permission::Workspace.is_within(level);
+                        assert_eq!(
+                            crate::memory::scope_applies(&wsl_scope, &active),
+                            wsl_runs,
+                            "wsl at level {level}, tool {required:?}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1898,7 +2029,9 @@ mod tests {
             Arc::new(crate::frontend::SilentFrontend),
         );
         let scope = format!("wsl:{DISTRIBUTION}");
-        let at = |cells: &SessionCells, shell, level| cells.active_memory_scopes(shell, level);
+        let at = |cells: &SessionCells, shell, level| {
+            cells.active_memory_scopes(shell, level, crate::config::Network::Host)
+        };
 
         // A target whose only grants are native Windows directories.
         let native = tempfile::tempdir().expect("a temporary directory");

@@ -908,6 +908,12 @@ pub(crate) async fn build_session_agent(
         let needs_workspace = wsl.is_some() && shared.config.managed_wsl_needs_workspace();
         cells.set_managed_wsl(wsl.map(Arc::new), needs_workspace);
     }
+    cells.ssh_targets = shared
+        .config
+        .session_ssh()?
+        .into_iter()
+        .map(|(name, target)| (name, Arc::new(target)))
+        .collect();
     cells.context_tokens = context_tokens;
     cells.context_overhead = context_overhead;
     cells.project = crate::session::SharedProject::new(project);

@@ -15,13 +15,57 @@ keeps its current behavior.
 | `readable` | Optional additional read-only grants, mounted at `/references/0`, `/references/1`, etc. |
 | `read_only` | Optional. Mount everything read-only. |
 
+## `shell_execute` with `ssh`
+
+When `[shell.ssh]` configures named targets, `shell_execute` takes an optional `ssh` parameter to
+route a command through one. A remote login is not a boundary this process can enforce, so the
+route requires `unrestricted` permission and a session whose `[permissions].network` is `host`.
+A remote-only setting cannot be enforced here: the local client dials whatever address the target
+names, including one on this machine, so `remote` and `none` both refuse the route. It is not
+offered by `meka serve`, whose sessions are built per request, and a scoped
+sub-agent does not inherit the targets; a bare worker holds the parent's directories. The target
+address is the scope.
+
+Each call runs an absolute `ssh` binary with `-F none`, so no ambient SSH configuration applies.
+The configured key is the only identity (`IdentitiesOnly=yes`, `IdentityAgent=none`,
+`BatchMode=yes`, so a passphrase prompt cannot hang the call), and the server must present the
+key pinned by `host_key`: `StrictHostKeyChecking=yes` reads a private, per-call known-hosts file
+holding that one entry. Forwarding, X11, the agent and local commands are off. A certificate
+configured for the target is a client credential for `key`, not proof of the server's identity.
+
+| `ssh` parameter | Description |
+|---|---|
+| `target` | Required, the name of the SSH target from `[shell.ssh]`. |
+| `working_directory` | Optional, an absolute path on the remote host; the command runs as `cd -- /absolute/path || exit 1` followed by the command, so a directory that cannot be entered ends the call before any later line runs. Not a sandbox boundary. |
+
+The configured key, and the certificate when one is set, must be readable files before the
+client starts. OpenSSH falls back to the user's default identities when a configured key cannot
+be used, even with `-F none`, `IdentitiesOnly=yes` and `IdentityAgent=none`, and the call runs
+without an ambient `HOME` for it to find them in; a missing credential is therefore a refusal,
+never a quiet login as somebody else. Public-key authentication is the only method the client may
+try, and `CertificateFile` is the configured certificate or `none`, so a companion certificate
+beside the key is not discovered. The launch is serialized with permission changes: it holds
+the level's setter lock across the check and the launch, checks the session's snapshot token and
+the ceiling under that lock, refuses to start if a downgrade ended that authority, and does not
+spawn a client for a call already stopped, so a login cannot slip between the check and the
+client.
+
+Output streams under the same capture bound and deadline as the native shell. A timeout,
+cancellation or a lowered permission stops the local `ssh` client, and `ssh` closes its channel,
+but nothing confirms that the remote job ended: the remote state is unknown and the command may
+keep running on the target. Start a cleanup command as a new call where that matters. An exit
+status is reported when the client saw the remote shell exit. Status 255 is the client's own
+failure code and is also what a remote command exiting 255 returns, so the call reports that
+the two cannot be told apart rather than presenting it as a confirmed remote exit; any other
+transport failure is reported as a failed call.
+
 ## `subshell_open` / `subshell_execute` / `subshell_export` / `subshell_close`
 
 Run POSIX shell commands on a configured WSL 2 distribution from a top-level Windows session.
 These tools do not change what PowerShell, Windows file tools, or a raw `wsl.exe` invocation can
 access. They are available to sub-agents under the parent's ceiling: a sub-agent may narrow its
 level, directories, and network access, never widen them. A scoped sub-agent does not inherit
-the WSL target; a bare worker holds the parent's directories. They are not available to
+the WSL or SSH targets; a bare worker holds the parent's directories. They are not available to
 schedule gates or HTTP sessions.
 
 ### Setup and scope

@@ -1326,6 +1326,9 @@ pub(crate) struct ShellConfig {
         allow(dead_code, reason = "a shared config parses on every platform")
     )]
     pub(crate) wsl: Option<WslTargetConfig>,
+    /// Named SSH targets. Each target pins its server's host key and runs only at
+    /// `unrestricted`.
+    pub(crate) ssh: Option<std::collections::BTreeMap<String, SshTargetConfig>>,
 }
 
 /// A managed WSL distro and its optional override for the installed runner path.
@@ -1342,6 +1345,31 @@ pub(crate) struct WslTargetConfig {
         allow(dead_code, reason = "a shared config parses on every platform")
     )]
     pub(crate) runner: Option<String>,
+}
+
+/// A named SSH target. The target address is itself the scope, and the transport runs at
+/// `unrestricted` only. The server's identity is pinned by `host_key`; `certificate` supplies a
+/// client certificate for the key, not proof of the server.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(
+    dead_code,
+    reason = "config parsing is complete; execution paths use these fields"
+)]
+pub(crate) struct SshTargetConfig {
+    /// Host name or IP address.
+    pub(crate) host: String,
+    /// SSH port. Default: 22.
+    pub(crate) port: Option<u16>,
+    /// Remote user name.
+    pub(crate) user: String,
+    /// Path to the SSH private key file.
+    pub(crate) key: String,
+    /// Pinned host key in OpenSSH format: `<type> <base64>`, e.g.
+    /// `ssh-ed25519 AAAAC3Nza...`. Required: it is the only proof of the server's identity.
+    pub(crate) host_key: String,
+    /// Path to a client certificate for `key`. Optional, and not a substitute for `host_key`.
+    pub(crate) certificate: Option<String>,
 }
 
 /// Where `jailbrokerd` listens unless `[shell].jailbroker_socket` names another path.
@@ -2612,6 +2640,8 @@ pub(crate) struct ResolvedConfig {
     pub(crate) jailbroker_socket: std::path::PathBuf,
     #[cfg(windows)]
     pub(crate) wsl_target: Option<WslTargetConfig>,
+    /// Named SSH targets from `[shell.ssh]`.
+    pub(crate) ssh_targets: Option<std::collections::BTreeMap<String, SshTargetConfig>>,
     /// Resolved `[session].retention`. `None`, the default, disables the session sweep.
     pub(crate) retention: Option<std::time::Duration>,
     /// Resolved `[session].turn_retention`. `None`, the default, keeps every turn for the life of
@@ -3769,6 +3799,7 @@ impl ResolvedConfig {
             jailbroker_socket,
             #[cfg(windows)]
             wsl_target: file_shell.wsl,
+            ssh_targets: file_shell.ssh,
             retention: file_session.retention,
             turn_retention: file_session.turn_retention,
             auto_compact: file_session.auto_compact.unwrap_or(true),
@@ -3955,6 +3986,43 @@ impl ResolvedConfig {
         .map_err(|error| MekaError::Config(error.to_string()))
     }
 
+    /// Resolve the named SSH targets from `[shell.ssh]`. Each target pins its host key.
+    pub(crate) fn managed_ssh(
+        &self,
+    ) -> crate::error::Result<std::collections::BTreeMap<String, crate::subshell::SshTarget>> {
+        use crate::error::MekaError;
+        let mut result = std::collections::BTreeMap::new();
+        let Some(targets) = self.ssh_targets.as_ref() else {
+            return Ok(result);
+        };
+        for (name, config) in targets {
+            let target = crate::subshell::SshTarget::new(
+                name,
+                &config.host,
+                config.port.unwrap_or(22),
+                &config.user,
+                &config.key,
+                config.host_key.clone(),
+                config.certificate.clone(),
+            )
+            .map_err(|error| MekaError::Config(error.to_string()))?;
+            result.insert(name.to_owned(), target);
+        }
+        Ok(result)
+    }
+
+    /// The SSH targets a session may actually reach. `meka serve` builds a session per request
+    /// from a client that did not launch this process, so the process's SSH targets stay out of
+    /// reach there; the configuration is still validated, and `meka tool list` still shows them.
+    pub(crate) fn session_ssh(
+        &self,
+    ) -> crate::error::Result<std::collections::BTreeMap<String, crate::subshell::SshTarget>> {
+        if self.request.profile_named_per_session {
+            return Ok(std::collections::BTreeMap::new());
+        }
+        self.managed_ssh()
+    }
+
     pub(crate) fn validate(&self) -> crate::error::Result<()> {
         // Profile-selection failure (none / ambiguous / unknown name) is reported first with its
         // specific guidance. Ahead of the provider check: with an unparsed config there are no
@@ -3965,6 +4033,7 @@ impl ResolvedConfig {
         }
         #[cfg(windows)]
         self.managed_wsl()?;
+        self.managed_ssh()?;
         self.validate_default_profile()?;
         validate_fallback_chains(&self.accounts, &self.profiles, self.session_context_window)
             .map_err(crate::error::MekaError::Config)?;

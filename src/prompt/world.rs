@@ -1315,7 +1315,7 @@ fn render_world_state_diff_tracked(
         }
     }
     // A key under which nothing standing remains is named as a key: "every rule copy carried
-    // above for target `wsl:build`" says precisely which copies die without listing them, which
+    // above for target `ssh:build`" says precisely which copies die without listing them, which
     // is what covers the entries no line named.
     let mut whole_keys: Vec<String> = Vec::new();
     let mut partial: Vec<String> = Vec::new();

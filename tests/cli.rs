@@ -1467,7 +1467,6 @@ fn windows_wsl_uses_the_bundle_only_when_the_installed_runner_is_absent() {
 
 /// The tool results one scripted session recorded, as the text the model read, in the order the
 /// rounds produced them.
-#[cfg(windows)]
 fn tool_results(install: &Install) -> Vec<String> {
     let connection = store(install);
     let mut statement = connection
@@ -2024,7 +2023,6 @@ fn windows_wsl_stages_a_scratch_workspace_and_deletes_it_on_close() {
 
 /// The recorded tool results as the store holds them, the metadata and the error flags included:
 /// what a screen draws of the calls, which the plain text of the results does not carry.
-#[cfg(windows)]
 fn raw_tool_results(install: &Install) -> String {
     let connection = store(install);
     let mut statement = connection
@@ -6816,5 +6814,389 @@ fn mcp_logout_refuses_a_name_nothing_holds() {
     assert!(
         !output.status.success() && stderr.contains("no MCP server named 'nosuchserver'"),
         "{stderr}"
+    );
+}
+
+/// The SSH probe target the live battery below runs against, read from the environment so no
+/// test hard-codes a host, an account or a credential: the probes are opt-in beside a real server.
+struct SshProbe {
+    host: String,
+    port: u16,
+    user: String,
+    key: String,
+    host_key: String,
+}
+
+impl SshProbe {
+    fn from_env() -> Self {
+        Self {
+            host: std::env::var("MEKA_TEST_SSH_HOST").expect("set MEKA_TEST_SSH_HOST"),
+            port: std::env::var("MEKA_TEST_SSH_PORT")
+                .ok()
+                .and_then(|port| port.parse().ok())
+                .unwrap_or(22),
+            user: std::env::var("MEKA_TEST_SSH_USER").expect("set MEKA_TEST_SSH_USER"),
+            key: std::env::var("MEKA_TEST_SSH_KEY").expect("set MEKA_TEST_SSH_KEY"),
+            host_key: std::env::var("MEKA_TEST_SSH_HOST_KEY").expect("set MEKA_TEST_SSH_HOST_KEY"),
+        }
+    }
+
+    /// The `[shell.ssh.<name>]` table for this target and its own key pin.
+    fn table(&self, name: &str) -> String {
+        self.table_with(name, &self.key, &self.host_key)
+    }
+
+    /// The `[shell.ssh.<name>]` table with the key path and the host key pin swapped out, for
+    /// the probes that feed the target a credential it cannot use.
+    fn table_with(&self, name: &str, key: &str, host_key: &str) -> String {
+        format!(
+            "[shell.ssh.{name}]\nhost = {:?}\nport = {}\nuser = {:?}\nkey = {:?}\nhost_key = \
+             {:?}\n",
+            self.host, self.port, self.user, key, host_key
+        )
+    }
+}
+
+/// The config an SSH probe needs: the mock profile plus the level and the network the transport
+/// admits. `network` is a parameter because one probe refuses exactly the narrower setting.
+fn ssh_capable_config(network: &str) -> String {
+    format!(
+        "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \"anthropic-messages\"\n\n\
+         [profiles.mock]\naccount = \"mock\"\nmodel = \"claude-sonnet-4-5\"\n\n[permissions]\n\
+         default = \"unrestricted\"\nenabled = [\"read\", \"workspace\", \"unrestricted\"]\n\
+         network = {network:?}\n"
+    )
+}
+
+/// The happy path against a real SSH server: both streams come back with the separator the
+/// result puts between them, the working directory is placed before the command, and the remote
+/// exit code is the call's own.
+#[test]
+#[ignore = "requires a reachable SSH test target and MEKA_TEST_SSH_* set"]
+fn ssh_route_runs_the_remote_command_with_both_streams_and_its_exit_code() {
+    let probe = SshProbe::from_env();
+    let install = Install::new();
+    install.write_config(&format!(
+        "{}{}",
+        ssh_capable_config("host"),
+        probe.table("probe")
+    ));
+    let script = serde_json::json!([
+        [
+            {"type":"tool_use_start", "id":"run", "name":"shell_execute"},
+            {"type":"tool_use_end", "input":{
+                "command":"printf 'to stdout\\n'; printf 'to stderr\\n' >&2; printf 'pwd=%s\\n' \"$(pwd)\"; exit 37",
+                "ssh":{"target":"probe","working_directory":"/tmp"}}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [{"type":"text", "text":"done"}, {"type":"message_end", "stop_reason":"end_turn"}]
+    ]);
+    let output = run_scripted_from(&install, install.root(), &script.to_string(), &[
+        "--permission",
+        "unrestricted",
+        "--oneshot",
+        "-p",
+        "Run the command",
+    ]);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let results = tool_results(&install);
+    assert!(
+        results[0].contains("to stdout")
+            && results[0].contains("--- stderr ---")
+            && results[0].contains("to stderr")
+            && results[0].contains("pwd=/tmp"),
+        "{}",
+        results[0]
+    );
+    assert!(results[0].contains("Exit code: 37"), "{}", results[0]);
+    let raw = raw_tool_results(&install);
+    assert!(raw.contains("\"exit_code\":37"), "{raw}");
+}
+
+/// A working directory the remote cannot enter stops the command before it runs: the sentinel
+/// the command would have printed never appears, and the exit code is the failed `cd`'s own.
+#[test]
+#[ignore = "requires a reachable SSH test target and MEKA_TEST_SSH_* set"]
+fn ssh_route_stops_at_a_failed_working_directory_before_the_command() {
+    let probe = SshProbe::from_env();
+    let install = Install::new();
+    install.write_config(&format!(
+        "{}{}",
+        ssh_capable_config("host"),
+        probe.table("probe")
+    ));
+    let script = serde_json::json!([
+        [
+            {"type":"tool_use_start", "id":"run", "name":"shell_execute"},
+            {"type":"tool_use_end", "input":{
+                "command":"printf SHOULD-NOT-RUN",
+                "ssh":{"target":"probe","working_directory":"/nonexistent-meka-probe"}}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [{"type":"text", "text":"done"}, {"type":"message_end", "stop_reason":"end_turn"}]
+    ]);
+    let output = run_scripted_from(&install, install.root(), &script.to_string(), &[
+        "--permission",
+        "unrestricted",
+        "--oneshot",
+        "-p",
+        "Run the command",
+    ]);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let results = tool_results(&install);
+    assert!(
+        !results[0].contains("SHOULD-NOT-RUN"),
+        "the command must not have run: {}",
+        results[0]
+    );
+    assert!(results[0].contains("Exit code: 1"), "{}", results[0]);
+}
+
+/// Status 255 from the client establishes nothing about the remote command, and the record says
+/// so rather than presenting it as the command's exit.
+#[test]
+#[ignore = "requires a reachable SSH test target and MEKA_TEST_SSH_* set"]
+fn ssh_route_reports_255_as_an_unconfirmed_remote_status() {
+    let probe = SshProbe::from_env();
+    let install = Install::new();
+    install.write_config(&format!(
+        "{}{}",
+        ssh_capable_config("host"),
+        probe.table("probe")
+    ));
+    let script = serde_json::json!([
+        [
+            {"type":"tool_use_start", "id":"run", "name":"shell_execute"},
+            {"type":"tool_use_end", "input":{
+                "command":"exit 255",
+                "ssh":{"target":"probe"}}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [{"type":"text", "text":"done"}, {"type":"message_end", "stop_reason":"end_turn"}]
+    ]);
+    let output = run_scripted_from(&install, install.root(), &script.to_string(), &[
+        "--permission",
+        "unrestricted",
+        "--oneshot",
+        "-p",
+        "Run the command",
+    ]);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let results = tool_results(&install);
+    assert!(
+        results[0].contains("The SSH client exited 255")
+            && results[0].contains("no remote exit status was confirmed"),
+        "{}",
+        results[0]
+    );
+}
+
+/// A timeout stops the local client, says the remote command's state is unknown, and keeps the
+/// output the drains collected before the stop.
+#[test]
+#[ignore = "requires a reachable SSH test target and MEKA_TEST_SSH_* set"]
+fn ssh_route_timeout_stops_the_client_and_keeps_the_output() {
+    let probe = SshProbe::from_env();
+    let install = Install::new();
+    install.write_config(&format!(
+        "{}{}",
+        ssh_capable_config("host"),
+        probe.table("probe")
+    ));
+    let script = serde_json::json!([
+        [
+            {"type":"tool_use_start", "id":"run", "name":"shell_execute"},
+            {"type":"tool_use_end", "input":{
+                "command":"while :; do printf x; sleep 0.2; done",
+                "timeout_ms":3000,
+                "ssh":{"target":"probe"}}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [{"type":"text", "text":"done"}, {"type":"message_end", "stop_reason":"end_turn"}]
+    ]);
+    let output = run_scripted_from(&install, install.root(), &script.to_string(), &[
+        "--permission",
+        "unrestricted",
+        "--oneshot",
+        "-p",
+        "Run the command",
+    ]);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let results = tool_results(&install);
+    assert!(
+        results[0].contains("SSH call timed out after 3000ms")
+            && results[0].contains("the remote command's state is unknown"),
+        "{}",
+        results[0]
+    );
+    assert!(
+        results[0].contains("xxx"),
+        "the output the drains kept survives the stop: {}",
+        results[0]
+    );
+}
+
+/// A target whose key cannot be read is refused before the client runs, rather than left to fall
+/// back on whatever identities the account happens to hold.
+#[test]
+#[ignore = "requires a reachable SSH test target and MEKA_TEST_SSH_* set"]
+fn ssh_route_refuses_a_target_whose_key_cannot_be_read() {
+    let probe = SshProbe::from_env();
+    let missing = std::path::Path::new(&probe.key)
+        .with_file_name("missing-probe-key")
+        .to_string_lossy()
+        .into_owned();
+    let install = Install::new();
+    install.write_config(&format!(
+        "{}{}",
+        ssh_capable_config("host"),
+        probe.table_with("probe", &missing, &probe.host_key)
+    ));
+    let script = serde_json::json!([
+        [
+            {"type":"tool_use_start", "id":"run", "name":"shell_execute"},
+            {"type":"tool_use_end", "input":{
+                "command":"printf SHOULD-NOT-RUN",
+                "ssh":{"target":"probe"}}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [{"type":"text", "text":"done"}, {"type":"message_end", "stop_reason":"end_turn"}]
+    ]);
+    let output = run_scripted_from(&install, install.root(), &script.to_string(), &[
+        "--permission",
+        "unrestricted",
+        "--oneshot",
+        "-p",
+        "Run the command",
+    ]);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let results = tool_results(&install);
+    assert!(
+        results[0].contains("cannot read its key")
+            && results[0].contains("refused rather than left to OpenSSH"),
+        "{}",
+        results[0]
+    );
+    assert!(!results[0].contains("SHOULD-NOT-RUN"), "{}", results[0]);
+}
+
+/// A host key pin that does not match the server refuses the connection: the pinned identity is
+/// the proof, and a wrong one fails closed at the exchange.
+#[test]
+#[ignore = "requires a reachable SSH test target and MEKA_TEST_SSH_* set"]
+fn ssh_route_refuses_a_host_key_that_does_not_match_the_pin() {
+    let probe = SshProbe::from_env();
+    // The probe key's own public half pinned as the host key: a shape the config accepts and no
+    // server can match.
+    let public =
+        std::fs::read_to_string(format!("{}.pub", probe.key)).expect("the probe key's public half");
+    let wrong_pin = public
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let install = Install::new();
+    install.write_config(&format!(
+        "{}{}",
+        ssh_capable_config("host"),
+        probe.table_with("probe", &probe.key, &wrong_pin)
+    ));
+    let script = serde_json::json!([
+        [
+            {"type":"tool_use_start", "id":"run", "name":"shell_execute"},
+            {"type":"tool_use_end", "input":{
+                "command":"printf SHOULD-NOT-RUN",
+                "ssh":{"target":"probe"}}},
+            {"type":"message_end", "stop_reason":"tool_use"}
+        ],
+        [{"type":"text", "text":"done"}, {"type":"message_end", "stop_reason":"end_turn"}]
+    ]);
+    let output = run_scripted_from(&install, install.root(), &script.to_string(), &[
+        "--permission",
+        "unrestricted",
+        "--oneshot",
+        "-p",
+        "Run the command",
+    ]);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let results = tool_results(&install);
+    assert!(
+        results[0].contains("Host key verification failed")
+            && results[0].contains("The SSH client exited 255"),
+        "{}",
+        results[0]
+    );
+    assert!(!results[0].contains("SHOULD-NOT-RUN"), "{}", results[0]);
+}
+
+/// The route's prerequisites, each refused before any client runs: an unknown target, a level
+/// below the transport's minimum, a network setting that cannot reach the target's address, and
+/// a working directory that is not a remote absolute path.
+#[test]
+#[ignore = "requires MEKA_TEST_SSH_* set (no connection is made)"]
+fn ssh_route_refuses_the_prerequisites_it_never_had() {
+    let probe = SshProbe::from_env();
+    let run = |config: &str, input: serde_json::Value, level: &str| -> Vec<String> {
+        let install = Install::new();
+        install.write_config(config);
+        let script = serde_json::json!([
+            [
+                {"type":"tool_use_start", "id":"run", "name":"shell_execute"},
+                {"type":"tool_use_end", "input":input},
+                {"type":"message_end", "stop_reason":"tool_use"}
+            ],
+            [{"type":"text", "text":"done"}, {"type":"message_end", "stop_reason":"end_turn"}]
+        ]);
+        let output = run_scripted_from(&install, install.root(), &script.to_string(), &[
+            "--permission",
+            level,
+            "--oneshot",
+            "-p",
+            "Run the command",
+        ]);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        tool_results(&install)
+    };
+    let admitted = format!("{}{}", ssh_capable_config("host"), probe.table("probe"));
+    let unknown = run(
+        &admitted,
+        serde_json::json!({"command":"printf hi","ssh":{"target":"nope"}}),
+        "unrestricted",
+    );
+    assert!(
+        unknown[0].contains("unknown SSH target \"nope\""),
+        "{}",
+        unknown[0]
+    );
+    let low = run(
+        &admitted,
+        serde_json::json!({"command":"printf hi","ssh":{"target":"probe"}}),
+        "workspace",
+    );
+    assert!(
+        low[0].contains("requires `unrestricted` permission; the session is at `workspace`"),
+        "{}",
+        low[0]
+    );
+    let narrow = run(
+        &format!("{}{}", ssh_capable_config("remote"), probe.table("probe")),
+        serde_json::json!({"command":"printf hi","ssh":{"target":"probe"}}),
+        "unrestricted",
+    );
+    assert!(
+        narrow[0].contains("needs `[permissions].network = \"host\"`")
+            && narrow[0].contains("`remote` cannot be enforced"),
+        "{}",
+        narrow[0]
+    );
+    let relative = run(
+        &admitted,
+        serde_json::json!({"command":"printf hi","ssh":{"target":"probe","working_directory":"relative/path"}}),
+        "unrestricted",
+    );
+    assert!(
+        relative[0].contains("an SSH working directory must be an absolute remote path"),
+        "{}",
+        relative[0]
     );
 }

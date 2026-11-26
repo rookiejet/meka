@@ -256,6 +256,9 @@ pub(crate) struct ExecuteCommandTool {
     /// call, never a general-purpose endpoint. `None` keeps the native shell only.
     #[cfg(windows)]
     pub(crate) wsl_target: Option<Arc<crate::subshell::Target>>,
+    /// Named SSH targets this shell may reach, when configured. The SSH transport requires
+    /// `unrestricted`.
+    pub(crate) ssh_targets: std::collections::BTreeMap<String, Arc<crate::subshell::SshTarget>>,
     /// The process's workspace-ACE ledger on Windows.
     ///
     /// A handle on the one `process_grants()` singleton, not a per-tool ledger. It reads as a
@@ -387,6 +390,20 @@ impl Tool for ExecuteCommandTool {
                 }),
             );
         }
+        if !self.ssh_targets.is_empty() {
+            properties.insert(
+                "ssh".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Route this command through a named SSH target. The transport requires unrestricted permission and `[permissions].network = \"host\"`: the local client dials whatever address the target names, so a remote-only setting cannot be enforced for it. The command is interpreted by the remote login shell, not by this host's shell.",
+                    "properties": {
+                        "target": {"type": "string", "enum": self.ssh_targets.keys().cloned().collect::<Vec<_>>(), "description": "The name of the SSH target from [shell.ssh]."},
+                        "working_directory": {"type": "string", "description": "An absolute path on the remote host for command placement. Not a sandbox boundary."}
+                    },
+                    "required": ["target"]
+                }),
+            );
+        }
         ToolDefinition {
             name: "shell_execute".to_string(),
             description: {
@@ -431,9 +448,9 @@ impl Tool for ExecuteCommandTool {
         // backend can run: the dispatcher's gate must let the call reach `refusal_at_level`, which
         // judges the route it names and refuses a native command that has nothing to confine it.
         #[cfg(windows)]
-        let routed = self.wsl_target.is_some();
+        let routed = self.wsl_target.is_some() || !self.ssh_targets.is_empty();
         #[cfg(not(windows))]
-        let routed = false;
+        let routed = !self.ssh_targets.is_empty();
         if native || routed {
             Permission::Read
         } else {
@@ -443,8 +460,8 @@ impl Tool for ExecuteCommandTool {
 
     /// The level and the configuration decide whether anything can confine a command; the command
     /// itself and the user's answer do not. A routed call is judged by its route: a WSL target
-    /// confines itself, and it does not depend on a native sandbox backend the route does not
-    /// use.
+    /// confines itself, an SSH target runs only at `unrestricted`, and neither depends on a native
+    /// sandbox backend the route does not use.
     async fn refusal_at_level(
         &self,
         level: Permission,
@@ -509,6 +526,9 @@ impl crate::tools::Detachable for ExecuteCommandTool {
                     "the managed WSL route is available on Windows only",
                 ));
             }
+            Some(SubshellRoute::Ssh(ssh)) => {
+                return self.start_ssh(command, timeout, &serde_json::Value::Object(ssh.clone()));
+            }
             None => {}
         }
         let permission = self.site.permission.get();
@@ -534,19 +554,25 @@ impl crate::tools::Detachable for ExecuteCommandTool {
 
 /// The route a `shell_execute` call selected. `Wsl` exists only where a WSL target can run, but it
 /// is a distinct route on every platform so the refusal for naming it elsewhere has one home.
-enum SubshellRoute {
+enum SubshellRoute<'a> {
     #[allow(dead_code, reason = "the route only runs on Windows")]
     Wsl,
+    Ssh(&'a serde_json::Map<String, serde_json::Value>),
 }
 
 impl ExecuteCommandTool {
-    /// The route a `shell_execute` input selects. A selector that cannot run here is refused
-    /// rather than silently ignored: a command must not fall through to the native shell because
-    /// its route is unsupported here.
-    fn selected_route(input: &serde_json::Value) -> Result<Option<SubshellRoute>> {
+    /// The route a `shell_execute` input selects. `wsl` and `ssh` are mutually exclusive, and a
+    /// selector that cannot run here is refused rather than silently ignored: a command must not
+    /// fall through to the native shell because its route was misspelled or unsupported.
+    fn selected_route(input: &serde_json::Value) -> Result<Option<SubshellRoute<'_>>> {
         let wsl = super::util::optional_object(input, "wsl", "shell_execute")?;
-        match wsl {
-            Some(_) => {
+        let ssh = super::util::optional_object(input, "ssh", "shell_execute")?;
+        match (wsl, ssh) {
+            (Some(_), Some(_)) => Err(subshell_error(
+                "shell_execute",
+                "`wsl` and `ssh` select different routes; pass at most one",
+            )),
+            (Some(_), None) => {
                 #[cfg(windows)]
                 {
                     Ok(Some(SubshellRoute::Wsl))
@@ -559,13 +585,14 @@ impl ExecuteCommandTool {
                     ))
                 }
             }
-            None => Ok(None),
+            (None, Some(ssh)) => Ok(Some(SubshellRoute::Ssh(ssh))),
+            (None, None) => Ok(None),
         }
     }
 
     /// The refusal a routed call meets from its own target, before anything is launched. A route
     /// answers to what it runs, not to the native backend the call does not use.
-    fn route_refusal(&self, level: Permission, route: SubshellRoute) -> Option<ToolOutput> {
+    fn route_refusal(&self, level: Permission, route: SubshellRoute<'_>) -> Option<ToolOutput> {
         match route {
             SubshellRoute::Wsl => {
                 #[cfg(windows)]
@@ -592,6 +619,42 @@ impl ExecuteCommandTool {
                     "shell_execute",
                     "the `wsl` route is only available on Windows",
                 )))
+            }
+            SubshellRoute::Ssh(ssh) => {
+                let refusal = (|| -> Result<()> {
+                    let name = require_str(
+                        &serde_json::Value::Object(ssh.clone()),
+                        "target",
+                        "shell_execute",
+                    )?;
+                    let target = self.ssh_targets.get(&name).ok_or_else(|| {
+                        subshell_error("shell_execute", format!("unknown SSH target {name:?}"))
+                    })?;
+                    let minimum = target.minimum_permission();
+                    if !minimum.is_within(level) {
+                        return Err(subshell_error(
+                            "shell_execute",
+                            format!(
+                                "SSH target {name:?} requires `{}` permission; the session is at \
+                                 `{level}`",
+                                minimum.name()
+                            ),
+                        ));
+                    }
+                    if self.site.network != crate::config::Network::Host {
+                        return Err(subshell_error(
+                            "shell_execute",
+                            format!(
+                                "SSH target {name:?} needs `[permissions].network = \"host\"`; \
+                                 `{}` cannot be enforced for a client that dials the target's \
+                                 address",
+                                self.site.network
+                            ),
+                        ));
+                    }
+                    Ok(())
+                })();
+                refusal.err().map(|error| ToolOutput::from_error(&error))
             }
         }
     }
@@ -693,6 +756,158 @@ impl ExecuteCommandTool {
                         format!("failed to wait for the WSL launcher: {error}"),
                     ),
                 })
+            },
+        ))
+    }
+
+    /// Route a command through a named SSH target. A remote login reaches a machine this process
+    /// has no boundary on, so the transport runs only at `unrestricted`, and only when the
+    /// session's network setting permits a remote connection. The target address is the scope.
+    fn start_ssh(
+        &self,
+        command: String,
+        timeout: std::time::Duration,
+        ssh: &serde_json::Value,
+    ) -> Result<crate::tools::Started> {
+        if let Some(fields) = ssh.as_object() {
+            for field in fields.keys() {
+                if !matches!(field.as_str(), "target" | "working_directory") {
+                    return Err(subshell_error(
+                        "shell_execute",
+                        format!(
+                            "unknown `ssh` parameter {field:?}; the route takes `target` and \
+                             `working_directory` only"
+                        ),
+                    ));
+                }
+            }
+        }
+        let target_name = require_str(ssh, "target", "shell_execute")?;
+        let target = self.ssh_targets.get(&target_name).ok_or_else(|| {
+            subshell_error(
+                "shell_execute",
+                format!("unknown SSH target {target_name:?}"),
+            )
+        })?;
+        if self.site.network != crate::config::Network::Host {
+            return Err(subshell_error(
+                "shell_execute",
+                format!(
+                    "SSH target {target_name:?} needs `[permissions].network = \"host\"`; `{}` \
+                     cannot be enforced for a client that dials the target's address",
+                    self.site.network
+                ),
+            ));
+        }
+        let lease = self.site.permission.lease();
+        let minimum = target.minimum_permission();
+        if !minimum.is_within(lease.level) {
+            return Err(subshell_error(
+                "shell_execute",
+                format!(
+                    "SSH target {target_name:?} requires `{}` permission; the session is at `{}`",
+                    minimum.name(),
+                    lease.level
+                ),
+            ));
+        }
+        let working_directory =
+            super::util::optional_str(ssh, "working_directory", "shell_execute")?;
+        let full_command = match working_directory {
+            Some(working_directory) => {
+                if !working_directory.starts_with('/')
+                    || working_directory.chars().any(char::is_control)
+                {
+                    return Err(subshell_error(
+                        "shell_execute",
+                        format!(
+                            "an SSH working directory must be an absolute remote path: \
+                             {working_directory:?}"
+                        ),
+                    ));
+                }
+                format!(
+                    "cd -- {} || exit 1\n{command}",
+                    shell_quote(working_directory)
+                )
+            }
+            None => command,
+        };
+        let (args, known_hosts) = target
+            .ssh_args(&full_command)
+            .map_err(|error| subshell_error("shell_execute", error))?;
+        let binary = ssh_binary()?;
+        let label = target.name.clone();
+        Ok(crate::tools::Started::running(
+            None,
+            move |context| async move {
+                // The pinned key file lives until `ssh` has read it.
+                let _known_hosts = known_hosts;
+                // The level that admitted the call can fall before this run reaches the spawn,
+                // and a downgrade followed by a raise must not revive the lease either. A stop
+                // accepted before the run reaches this point is settled in the same step: with
+                // the same locks a downgrade takes held, there is no window in which a stopped
+                // call still starts a client. Checking outside the gate and spawning inside it
+                // would leave exactly that window.
+                enum Launch {
+                    NotStarted,
+                    Spawned(Box<std::io::Result<crate::process::Tree>>),
+                }
+                let launched = lease.with_current_authority(minimum, || {
+                    if context.cancellation.is_cancelled() {
+                        return Launch::NotStarted;
+                    }
+                    let mut process = tokio::process::Command::new(&binary);
+                    process
+                        .args(&args)
+                        .stdin(std::process::Stdio::null())
+                        // Both streams are pipes: what the remote command prints comes back
+                        // through the same collector as a native command, so it is bounded,
+                        // relayed to a live view, and never written to Meka's own stdout (which
+                        // in ACP carries the protocol).
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped());
+                    ssh_environment(&mut process);
+                    Launch::Spawned(Box::new(crate::process::spawn_tree(&mut process)))
+                });
+                let Some(launched) = launched else {
+                    if let Some(observation) = &context.teardown {
+                        observation.note(true);
+                    }
+                    return Err(subshell_error(
+                        "shell_execute",
+                        format!(
+                            "permission was lowered; the SSH call to {label:?} was not started"
+                        ),
+                    ));
+                };
+                let Launch::Spawned(spawned) = launched else {
+                    if let Some(observation) = &context.teardown {
+                        observation.note(true);
+                    }
+                    return Err(subshell_error(
+                        "shell_execute",
+                        format!("the SSH call to {label:?} was stopped before ssh was started"),
+                    ));
+                };
+                let child = (*spawned).map_err(|error| {
+                    subshell_error(
+                        "shell_execute",
+                        format!("failed to start {}: {error}", binary.display()),
+                    )
+                })?;
+                // The route observes both stop authorities itself, so a cancellation or a
+                // revocation ends the client through the collector and the result still holds
+                // what it printed. Neither says anything about the remote command.
+                run_ssh_command_tree(child, timeout, &context, &lease)
+                    .await
+                    .map_err(|failure| match failure {
+                        CommandTreeError::Interrupted => MekaError::Interrupted,
+                        CommandTreeError::Wait(error) => subshell_error(
+                            "shell_execute",
+                            format!("failed to wait for ssh: {error}"),
+                        ),
+                    })
             },
         ))
     }
@@ -1101,6 +1316,54 @@ const SUBSHELL_EXECUTE: &str = "subshell_execute";
 const SUBSHELL_EXPORT: &str = "subshell_export";
 #[cfg(windows)]
 const SUBSHELL_CLOSE: &str = "subshell_close";
+
+/// One word quoted for a POSIX shell, so the remote shell reads it as a single literal argument.
+fn shell_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
+/// The OpenSSH client this process runs: the one the platform installs, found by absolute path so
+/// a `PATH` entry cannot substitute another program for it.
+fn ssh_binary() -> Result<std::path::PathBuf> {
+    #[cfg(windows)]
+    let candidate = crate::sandbox::wsl_host::system_directory()
+        .map_err(|error| {
+            subshell_error("shell_execute", format!("cannot locate Windows: {error}"))
+        })?
+        .join("OpenSSH")
+        .join("ssh.exe");
+    #[cfg(not(windows))]
+    let candidate = std::path::PathBuf::from("/usr/bin/ssh");
+    if candidate.is_file() {
+        Ok(candidate)
+    } else {
+        Err(subshell_error(
+            "shell_execute",
+            format!(
+                "OpenSSH client not found at {}; install the OpenSSH client to use an SSH target",
+                candidate.display()
+            ),
+        ))
+    }
+}
+
+/// The minimal environment `ssh` runs with. The caller clears everything first: an ambient
+/// `SSH_*`, `HOME` or config path could otherwise change what the pinned call does. What is kept
+/// is what the client cannot start without: the system roots Windows loads from, and the machine
+/// root OpenSSH resolves its program data under, without which the client exits 255 without a
+/// word.
+fn ssh_environment(process: &mut tokio::process::Command) {
+    process.env_clear();
+    #[cfg(windows)]
+    for name in ["SystemRoot", "WINDIR", "ProgramData"] {
+        if let Some(value) = std::env::var_os(name) {
+            process.env(name, value);
+        }
+    }
+    #[cfg(unix)]
+    process.env("HOME", std::env::temp_dir());
+    process.env("LANG", "C");
+}
 
 fn subshell_error(tool_name: &str, message: impl std::fmt::Display) -> MekaError {
     MekaError::ToolExecution {
@@ -4277,10 +4540,13 @@ enum CommandTreeError {
 }
 
 /// Which program the command under the collector is: a local command, whose exit status is the
-/// call's outcome; or a WSL launcher, whose end says nothing about the guest namespace behind it.
+/// call's outcome; the SSH client, whose status 255 is its own failure rather than a remote exit
+/// and whose termination leaves the remote side unaccounted for; or a WSL launcher, whose end says
+/// nothing about the guest namespace behind it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CommandRoute {
     Native,
+    Ssh,
     #[cfg_attr(
         not(windows),
         allow(dead_code, reason = "only the Windows host starts a WSL launcher")
@@ -4300,6 +4566,26 @@ async fn run_command_tree(
         context,
         CommandRoute::Native,
         None,
+        None,
+    )
+    .await
+}
+
+/// [`run_command_tree`] for the SSH client. The client's own failures and the remote command's
+/// outcome share a wait and a capture, but not a meaning, so the result says which one it saw.
+async fn run_ssh_command_tree(
+    child: crate::process::Tree,
+    timeout: std::time::Duration,
+    context: &crate::tools::ToolContext,
+    lease: &crate::permission::PermissionLease,
+) -> std::result::Result<ToolOutput, CommandTreeError> {
+    run_command_tree_route(
+        child,
+        None,
+        timeout,
+        context,
+        CommandRoute::Ssh,
+        Some(lease),
         None,
     )
     .await
@@ -4503,14 +4789,20 @@ async fn run_command_tree_route(
     match (route, finished.ended) {
         (_, crate::process::Ended::Stopped) => {
             if let Some(observation) = &context.teardown {
-                // A local command or launcher reaped is the only thing this end observed.
+                // A local client or launcher reaped is the only thing this end observed. The SSH
+                // client's remote command is beyond it.
                 observation.note(route == CommandRoute::Native && finished.local_exit.is_some());
             }
             match (route, stopped_by) {
                 (_, Some(StopCause::Turn)) | (_, None) => Err(CommandTreeError::Interrupted),
+                (CommandRoute::Ssh, Some(StopCause::Lease)) => Ok(killed_command_output(
+                    &drained,
+                    &ssh_stopped_reason("Permission was lowered; the SSH call was stopped"),
+                )),
                 (CommandRoute::Native, Some(StopCause::Lease | StopCause::Handle)) => {
                     Err(CommandTreeError::Interrupted)
                 }
+                (CommandRoute::Ssh, Some(StopCause::Handle)) => Err(CommandTreeError::Interrupted),
                 (CommandRoute::Wsl, Some(StopCause::Lease | StopCause::Handle)) => {
                     Err(CommandTreeError::Wait(std::io::Error::other(
                         "a managed WSL run must end through its own result path",
@@ -4518,6 +4810,14 @@ async fn run_command_tree_route(
                 }
             }
         }
+        (CommandRoute::Ssh, crate::process::Ended::OutputBound) => Ok(killed_command_output(
+            &drained,
+            &ssh_stopped_reason(&output_bound_reason()),
+        )),
+        (CommandRoute::Ssh, crate::process::Ended::TimedOut) => Ok(killed_command_output(
+            &drained,
+            &ssh_timed_out_reason(timeout, &budget),
+        )),
         (CommandRoute::Native, crate::process::Ended::OutputBound) => {
             Ok(killed_command_output(&drained, &output_bound_reason()))
         }
@@ -4525,6 +4825,11 @@ async fn run_command_tree_route(
             &drained,
             &timed_out_reason(timeout, &budget),
         )),
+        (CommandRoute::Ssh, crate::process::Ended::Exited(status))
+            if status.code() == Some(255) =>
+        {
+            Ok(led_by_reason(&drained, ssh_client_failure_reason()))
+        }
         (
             CommandRoute::Wsl,
             crate::process::Ended::OutputBound | crate::process::Ended::TimedOut,
@@ -4861,6 +5166,35 @@ async fn wsl_route_result(
             Ok(killed_command_output(&drained, &reason(&lead)))
         }
     }
+}
+
+/// Why an SSH call ended before the client reported an exit, with the one fact the local kill
+/// cannot establish: what the remote command is doing now.
+fn ssh_stopped_reason(reason: &str) -> String {
+    format!("{reason}\nThe local SSH client was stopped; the remote command's state is unknown")
+}
+
+fn ssh_timed_out_reason(
+    timeout: std::time::Duration,
+    budget: &crate::process::OutputBudget,
+) -> String {
+    let mut reason = format!(
+        "SSH call timed out after {}ms; the local client was stopped, so the remote command's \
+         state is unknown",
+        timeout.as_millis()
+    );
+    if budget.is_exhausted() {
+        reason.push('\n');
+        reason.push_str(&output_cut_note());
+    }
+    reason
+}
+
+/// What status 255 from `ssh` establishes. The client uses it for its own failures, and a remote
+/// command that exits 255 reports the same number, so the outcome is not a confirmed remote exit.
+fn ssh_client_failure_reason() -> &'static str {
+    "The SSH client exited 255: the client failed, or the remote command exited 255. Meka cannot \
+     tell which, so no remote exit status was confirmed"
 }
 
 /// The result of a command that ran to its end: its exit status with what the drains collected.
@@ -5989,6 +6323,7 @@ mod tests {
         ExecuteCommandTool {
             #[cfg(windows)]
             wsl_target: None,
+            ssh_targets: Default::default(),
             #[cfg(windows)]
             windows_grants: std::sync::Arc::new(crate::sandbox::windows::WindowsGrants::default()),
             scope: crate::workspace::WriteScope::unconfined(),
@@ -6316,6 +6651,7 @@ mod tests {
                 crate::sandbox::SandboxCapability::Landlock { abi_version: 9 },
             ),
             sandbox_enabled: true,
+            ssh_targets: Default::default(),
             site: crate::session::ToolSite::for_test()
                 .with_permission(crate::permission::SharedPermission::new(
                     Permission::Read,
@@ -6622,6 +6958,7 @@ mod tests {
         let tool = ExecuteCommandTool {
             #[cfg(windows)]
             wsl_target: None,
+            ssh_targets: Default::default(),
             #[cfg(windows)]
             windows_grants: std::sync::Arc::clone(crate::sandbox::windows::process_grants()),
             scope: crate::workspace::WriteScope::confined(vec![]),
@@ -6668,6 +7005,7 @@ mod tests {
         let tool = ExecuteCommandTool {
             #[cfg(windows)]
             wsl_target: None,
+            ssh_targets: Default::default(),
             #[cfg(windows)]
             windows_grants: std::sync::Arc::new(crate::sandbox::windows::WindowsGrants::default()),
             scope: crate::workspace::WriteScope::unconfined(),
@@ -6737,6 +7075,7 @@ mod tests {
         let tool = ExecuteCommandTool {
             #[cfg(windows)]
             wsl_target: None,
+            ssh_targets: Default::default(),
             #[cfg(windows)]
             windows_grants: std::sync::Arc::new(crate::sandbox::windows::WindowsGrants::default()),
             scope: crate::workspace::WriteScope::unconfined(),
@@ -6876,6 +7215,7 @@ mod tests {
             ExecuteCommandTool {
                 #[cfg(windows)]
                 wsl_target: None,
+                ssh_targets: Default::default(),
                 scope: crate::workspace::WriteScope::unconfined(),
                 windows_grants: std::sync::Arc::new(
                     crate::sandbox::windows::WindowsGrants::default(),

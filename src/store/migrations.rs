@@ -5208,9 +5208,9 @@ fn memories_carry_load_references_source_verification_and_expiry(
     Ok(())
 }
 
-/// Where a memory's fact applies: a Windows host, a particular WSL distro, or portable. The
-/// column is empty for portable, which is every memory written before this migration and the
-/// default for new ones.
+/// Where a memory's fact applies: a Windows host, a particular WSL distro, a configured SSH
+/// target, or portable. The column is empty for portable, which is every memory written before
+/// this migration and the default for new ones.
 fn memories_carry_scope(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
     if !table_has_column(transaction, "memories", "scope")? {
         transaction

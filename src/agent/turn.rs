@@ -1126,7 +1126,9 @@ impl Agent {
             .iter()
             .find(|(name, ..)| name == "shell_execute")
             .map(|(_, _, required, _)| *required);
-        let active_scopes = self.cells.active_memory_scopes(shell, permission);
+        let active_scopes = self
+            .cells
+            .active_memory_scopes(shell, permission, self.cells.network);
         prompt::WorldSnapshot::new_scoped(
             &catalog,
             &skills,
