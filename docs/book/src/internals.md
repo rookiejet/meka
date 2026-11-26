@@ -520,6 +520,29 @@ on its root ext filesystem. The tests create and remove isolated guest workspace
 cargo test --locked --test cli windows_wsl_ -- --ignored
 ```
 
+## SSH targets
+
+`[shell.ssh]` names targets for `shell_execute`'s `ssh` route. Validation requires a
+`host_key` in OpenSSH public-key form and refuses a target without one; a `certificate` is a
+client credential for `key`, never proof of the server. `ResolvedConfig::session_ssh` withholds
+the targets from `meka serve` sessions, which are built per request by a client that did not
+launch the process. The route is registered for a session only when the targets resolve, and it
+is `unrestricted` only because the remote host is not a boundary this process enforces; a
+session whose network setting is anything other than `host` refuses it too, since the client
+dials the target's own address and a remote-only setting cannot be enforced for it.
+
+Each call writes the target's one pinned key into a fresh known-hosts file inside a private
+per-call directory — `0700`/`0600` on Unix and an inherited user ACL on Windows — runs an
+absolute `ssh` binary with `-F none -i <key> -o IdentitiesOnly=yes -o BatchMode=yes -o
+StrictHostKeyChecking=yes` and that file as both known-hosts databases, and removes the
+directory after `ssh` has read it. A key or certificate that is missing or unreadable is refused
+before the client starts, because OpenSSH would otherwise fall back to the account's default
+identities. Forwarding, X11, agent use and local commands are off. The command is one argument,
+sent after `--` and `user@host`; a configured working directory becomes a quoted
+`cd -- <dir> || exit 1` before it. Both output streams are piped through the ordinary capture
+path, and status 255 is reported as a client failure that a remote command exiting 255 cannot be
+told apart from.
+
 ## What each host offers
 
 The hosts do not offer the same operations, and the gaps are recorded here rather than filled.

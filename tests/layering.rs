@@ -417,6 +417,15 @@ const TEMP_DIRECTORY_USERS: &[(&str, &str)] = &[
         "src/store.rs",
         "an in-memory store, which only tests open, needs a lock directory somewhere",
     ),
+    (
+        "src/subshell.rs",
+        "the one-call SSH known-hosts file is born in a directory of its own and removed with the call",
+    ),
+    (
+        "src/tools/shell.rs",
+        "an SSH client runs without an ambient `HOME`; a private one keeps OpenSSH from finding the \
+         account's default identities",
+    ),
 ];
 
 /// Below `unrestricted`, the Meka process writes to its store and nothing else. Production code

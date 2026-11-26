@@ -49,7 +49,7 @@ pub(crate) struct Memory {
     pub(crate) project: String,
     pub(crate) description: String,
     /// Where the fact applies, separate from where it was observed: a Windows host, a particular
-    /// WSL distro, or `portable` across targets. Empty means portable.
+    /// WSL distro, a configured SSH target, or `portable` across targets. Empty means portable.
     /// Target-specific notes are searchable by target and do not automatically become inline
     /// instructions in unrelated sessions.
     pub(crate) scope: String,
@@ -387,16 +387,16 @@ pub(crate) const SCOPE_PORTABLE: &str = "portable";
 /// The scope of a fact that holds on the Windows host.
 pub(crate) const SCOPE_WINDOWS: &str = "windows";
 
-/// Longest the name after a `wsl:` prefix may be, sized for a distribution name. Past this it is
-/// a sentence, not a key.
+/// Longest the name after a `wsl:` or `ssh:` prefix may be, sized for a distribution name or an
+/// entry of `[shell.ssh]`. Past this it is a sentence, not a key.
 pub(crate) const MAX_SCOPE_NAME_CHARS: usize = 64;
 
 /// Validate a scope on its way to the store, normalizing the one spelling that is a synonym.
 ///
 /// The vocabulary is closed and small: `""` (portable, the fact holds on every target),
 /// `portable`, which normalizes to `""` so a store holds one spelling of every fact, `windows`
-/// for the host, and `wsl:<distro>` for one WSL distribution. A name is 1 to
-/// [`MAX_SCOPE_NAME_CHARS`] characters, trimmed, without control
+/// for the host, `wsl:<distro>` for one WSL distribution and `ssh:<target>` for one entry of
+/// `[shell.ssh]`. A name is 1 to [`MAX_SCOPE_NAME_CHARS`] characters, trimmed, without control
 /// characters, quotes, slashes or backslashes, and not starting with `-`: the same shape a target
 /// name may take, so every configured target can be spelled rather than only the ones that happen
 /// to look like identifiers. A WSL distribution named `Ubuntu 22.04` is a target like any other.
@@ -415,9 +415,12 @@ pub(crate) fn normalize_scope(raw: &str) -> Result<String, String> {
     }
     let name = if let Some(name) = scope.strip_prefix("wsl:") {
         name
+    } else if let Some(name) = scope.strip_prefix("ssh:") {
+        name
     } else {
         return Err(format!(
-            "unknown scope '{}'; use 'portable' (or \"\"), 'windows' or 'wsl:<distro>'",
+            "unknown scope '{}'; use 'portable' (or \"\"), 'windows', 'wsl:<distro>' or \
+             'ssh:<target>'",
             crate::text::sanitize_text(scope)
         ));
     };
@@ -443,8 +446,8 @@ pub(crate) fn normalize_scope(raw: &str) -> Result<String, String> {
 ///
 /// The empty scope is portable and applies everywhere; a target-specific one applies only where
 /// the session is actually on that target. Deliberately a question about the *session's* targets
-/// rather than about where the fact was observed: a note can be written on Windows about a WSL
-/// distribution, and it belongs to that distribution.
+/// rather than about where the fact was observed: a note can be written on Windows about an SSH
+/// host, and it belongs to the host.
 ///
 /// The comparison is the raw stored key against the raw route keys a session reports, byte for
 /// byte. A stored spelling [`normalize_scope`] would rewrite or refuse is never applicable:
@@ -712,8 +715,8 @@ pub(crate) struct MemoryFrontmatter {
     /// The project the memory belongs to, emitted only for a project memory, so a file without the
     /// key is a global memory and an export that never carried the key reads back unchanged.
     pub(crate) project: Option<String>,
-    /// Where the fact applies, emitted only when set: a Windows host or a particular WSL distro.
-    /// `portable` is the default and is not emitted.
+    /// Where the fact applies, emitted only when set: a Windows host, a particular WSL distro,
+    /// a configured SSH target. `portable` is the default and is not emitted.
     pub(crate) scope: Option<String>,
     pub(crate) priority: u8,
     pub(crate) load: Load,
@@ -914,7 +917,7 @@ pub(crate) struct ImportedMemory {
     pub(crate) project: String,
     pub(crate) description: String,
     /// Where the fact applies, normalized as [`normalize_scope`] normalizes it: empty for
-    /// portable, `windows` or `wsl:<distro>`. Restored as the file states it, so
+    /// portable, `windows`, `wsl:<distro>` or `ssh:<target>`. Restored as the file states it, so
     /// an import keeps the target a note belongs to.
     pub(crate) scope: String,
     pub(crate) priority: u8,
@@ -1524,7 +1527,7 @@ mod tests {
     }
 
     /// The scope vocabulary: portable is stored empty, so a store holds one spelling of every
-    /// fact and a portable export keeps its short header; the two target forms are kept as
+    /// fact and a portable export keeps its short header; the three target forms are kept as
     /// written; and anything else is refused with the spellings that would have been accepted.
     #[test]
     fn a_scope_is_validated_and_portable_is_stored_as_empty() {
@@ -1535,6 +1538,7 @@ mod tests {
             (" portable ", ""),
             ("windows", "windows"),
             ("wsl:voidlinux-glibc", "wsl:voidlinux-glibc"),
+            ("ssh:build-host", "ssh:build-host"),
             ("wsl:a.b_c-1", "wsl:a.b_c-1"),
             // A target name is the configuration's, not an identifier subset of it: a distro may
             // be registered as `Ubuntu 22.04`, and its notes must be spellable.
@@ -1546,7 +1550,9 @@ mod tests {
         assert!(normalize_scope(&format!("wsl:{}", "d".repeat(MAX_SCOPE_NAME_CHARS))).is_ok());
         for bad in [
             "wsl:",
+            "ssh:",
             &format!("wsl:{}", "d".repeat(MAX_SCOPE_NAME_CHARS + 1)),
+            "ssh:host/name",
             "wsl:has\\slash",
             "wsl:has\"quote",
             "wsl:-leading",
@@ -1574,13 +1580,13 @@ mod tests {
 
         // Portable is every target's fact; a target-specific one applies only where the session
         // is actually on that target.
-        let active = ["windows".to_string(), "wsl:build".to_string()];
+        let active = ["windows".to_string(), "ssh:build".to_string()];
         assert!(scope_applies("", &active));
         assert!(scope_applies("windows", &active));
-        assert!(scope_applies("wsl:build", &active));
+        assert!(scope_applies("ssh:build", &active));
         assert!(!scope_applies("wsl:voidlinux-glibc", &active));
-        assert!(!scope_applies("wsl:prod", &active));
-        assert!(!scope_applies("wsl:prod", &[]));
+        assert!(!scope_applies("ssh:prod", &active));
+        assert!(!scope_applies("ssh:prod", &[]));
     }
 
     /// Applicability is the raw stored key against the raw route keys: a valid target name with
@@ -1588,24 +1594,24 @@ mod tests {
     /// rewrite or refuse never becomes applicable by being normalized into one that is.
     #[test]
     fn a_scope_applies_only_by_exact_raw_key() {
-        let active = ["wsl:Ubuntu  22.04".to_string(), "wsl:build".to_string()];
+        let active = ["wsl:Ubuntu  22.04".to_string(), "ssh:build".to_string()];
         assert!(scope_applies("wsl:Ubuntu  22.04", &active));
         assert!(
             !scope_applies("wsl:Ubuntu 22.04", &active),
             "the collapsed spelling names a different key"
         );
-        assert!(!scope_applies("wsl:build ", &active), "an untrimmed key");
-        assert!(!scope_applies(" wsl:build", &active), "an untrimmed key");
-        assert!(!scope_applies("wsl:build\n", &active), "an untrimmed key");
+        assert!(!scope_applies("ssh:build ", &active), "an untrimmed key");
+        assert!(!scope_applies(" ssh:build", &active), "an untrimmed key");
+        assert!(!scope_applies("ssh:build\n", &active), "an untrimmed key");
         assert!(
-            !scope_applies("wsl:BUILD", &active),
+            !scope_applies("ssh:BUILD", &active),
             "keys compare case-sensitively"
         );
         // The synonym and invalid spellings stay unapplied: not into a valid target, and not
         // into portable either, whatever the session holds.
         assert!(!scope_applies("portable", &active));
         assert!(!scope_applies("portable", &[]));
-        assert!(!scope_applies("wsl:build\n", &[]));
+        assert!(!scope_applies("ssh:build\n", &[]));
     }
 
     /// An export carries a target scope and the import reads it back; a portable memory writes no
@@ -1614,14 +1620,14 @@ mod tests {
     #[test]
     fn an_export_carries_a_scope_and_the_import_reads_it_back() {
         let scoped = Memory {
-            scope: "wsl:build-host".to_string(),
+            scope: "ssh:build-host".to_string(),
             ..plain_memory()
         };
         let file = export_memory(&scoped);
         let (frontmatter, _) = crate::entry::split_frontmatter(&file).expect("frontmatter");
         let parsed: yaml_serde::Value = yaml_serde::from_str(frontmatter).expect("yaml");
-        assert_eq!(parsed["scope"].as_str(), Some("wsl:build-host"), "{file}");
-        assert_eq!(reimported(&scoped).scope, "wsl:build-host");
+        assert_eq!(parsed["scope"].as_str(), Some("ssh:build-host"), "{file}");
+        assert_eq!(reimported(&scoped).scope, "ssh:build-host");
 
         let portable = plain_memory();
         let file = export_memory(&portable);

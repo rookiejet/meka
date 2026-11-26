@@ -14,7 +14,7 @@ pub(crate) struct SavedOutput {
 
 /// Where a task's work ran, which decides what ending it on this machine can prove about it. A
 /// native process tree can be killed and reaped here; a guest command leaves this machine with a
-/// launcher, whose end is not the command's.
+/// launcher, and a remote one with a client, whose end is not the command's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RouteEvidence {
     /// Work native to this machine: what was ended here is the whole of it.
@@ -22,6 +22,11 @@ pub(crate) enum RouteEvidence {
     /// A command in the managed WSL guest: ending the local launcher does not end the guest's
     /// namespace.
     Guest,
+    /// A command on a remote host over SSH: ending the local client does not end the remote
+    /// command. Constructed when a run records the route it took; until `TeardownObservation`
+    /// carries one (the tool-side seam in `crate::tools`), only tests build this variant.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Remote,
     /// The run recorded no route, so nothing here speaks for what the work started elsewhere.
     Unrecorded,
 }
@@ -87,7 +92,7 @@ impl Teardown {
     };
 }
 
-/// The tools whose calls can run off this machine: a shell command routed through WSL, and
+/// The tools whose calls can run off this machine: a shell command routed through WSL or SSH, and
 /// the WSL subshell tools. Only these get the route hedge below when the run recorded no route;
 /// for anything else there is nothing off this machine to speak for.
 fn route_capable(tool: &str) -> bool {
@@ -118,9 +123,8 @@ fn default_route(tool: &str) -> RouteEvidence {
 /// and the one thing stopping on this machine cannot establish for work that runs elsewhere.
 ///
 /// The route clause is per route evidence, never keyed on the tool alone: a WSL command must not
-/// inherit a caveat meant for another route. A run that recorded no route and ran on a tool that
-/// can route gets the neutral sentence that says exactly that, rather than a claim about any one
-/// route.
+/// inherit an SSH caveat. A run that recorded no route and ran on a tool that can route gets the
+/// neutral sentence that says exactly that, rather than a claim about any one route.
 fn stop_outcome(tool: &str, teardown: Teardown, outcome: Option<String>) -> String {
     let mut note = match teardown.reason {
         Some(StopReason::AgentRequest) => "Stopped at the agent's request",
@@ -141,6 +145,10 @@ fn stop_outcome(tool: &str, teardown: Teardown, outcome: Option<String>) -> Stri
             RouteEvidence::Local => {}
             RouteEvidence::Guest => note.push_str(
                 "\nThe guest command's state is unknown: stopping the local launcher does not stop \
+                 what it started.",
+            ),
+            RouteEvidence::Remote => note.push_str(
+                "\nThe remote command's state is unknown: stopping the local client does not stop \
                  what it started.",
             ),
             RouteEvidence::Unrecorded => match default_route(tool) {
@@ -1875,10 +1883,10 @@ mod tests {
         );
     }
 
-    /// An outcome nothing confirmed says which side could not be confirmed: a WSL command's
-    /// guest state, or what an unrecorded run started beyond this process. A call that never runs
-    /// code beyond this process has no route to hedge about, and a routed call whose route was
-    /// never recorded must not borrow another route's caveat.
+    /// An outcome nothing confirmed says which side could not be confirmed: a routed command's
+    /// remote state, a WSL command's guest state, or what an unrecorded run started beyond this
+    /// process. A call that never runs code beyond this process has no route to hedge about, and a
+    /// routed call whose route was never recorded must not borrow another route's caveat.
     #[tokio::test]
     async fn an_unconfirmed_stop_carries_the_evidence_for_its_route() {
         async fn unconfirmed_outcome(
@@ -1940,15 +1948,24 @@ mod tests {
             .await
             .expect("create session");
 
-        // A WSL command's hedge names the side it cannot reach: the guest.
+        let remote =
+            unconfirmed_outcome(&store, session_id, "shell_execute", RouteEvidence::Remote).await;
+        assert!(
+            remote.contains("remote command's state is unknown"),
+            "{remote}"
+        );
+        assert!(!remote.contains("local teardown is confirmed"), "{remote}");
+
+        // A WSL command must not inherit the SSH caveat: the side it cannot reach is the guest.
         let guest =
             unconfirmed_outcome(&store, session_id, "shell_execute", RouteEvidence::Guest).await;
         assert!(
             guest.contains("guest command's state is unknown"),
             "{guest}"
         );
+        assert!(!guest.contains("remote command"), "{guest}");
 
-        // A routed command whose route was never recorded can borrow no caveat; the hedge
+        // A routed command whose route was never recorded can borrow neither caveat; the hedge
         // says what is actually unknown.
         let unrecorded = unconfirmed_outcome(
             &store,
@@ -1961,12 +1978,14 @@ mod tests {
             unrecorded.contains("The run recorded no route for this call"),
             "{unrecorded}"
         );
+        assert!(!unrecorded.contains("the remote command"), "{unrecorded}");
         assert!(!unrecorded.contains("the guest command"), "{unrecorded}");
 
         let local =
             unconfirmed_outcome(&store, session_id, "agent_spawn", RouteEvidence::Unrecorded).await;
         assert!(local.contains("local teardown is unconfirmed"), "{local}");
         assert!(!local.contains("recorded no route"), "{local}");
+        assert!(!local.contains("remote command"), "{local}");
     }
 
     /// A process that died between recording a stop and hearing the result leaves the row

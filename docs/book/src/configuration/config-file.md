@@ -1099,6 +1099,39 @@ that is present and fails the installation checks is an error. See
 the [`subshell_*` tools](../tools/shell.md#subshell_open--subshell_execute--subshell_export--subshell_close)
 for guest requirements and usage.
 
+### `[shell.ssh]`
+
+Named SSH targets for `shell_execute`'s `ssh` parameter. Each target is one table under
+`[shell.ssh]`, named by the identifier the tool takes. Every field but `port` and `certificate`
+is required, and the target is refused at startup when one is missing or ill-formed.
+
+```toml
+[shell.ssh.build]
+host = "build.example.net"
+user = "dev"
+key = "C:\\Users\\me\\.ssh\\id_ed25519"
+host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL0example"
+# port = 22
+# certificate = "C:\\Users\\me\\.ssh\\id_ed25519-cert.pub"
+```
+
+| Field | Description |
+|---|---|
+| `host` | Host name or IP address. |
+| `port` | Optional, the SSH port. Default: 22. |
+| `user` | Remote user name. |
+| `key` | Path to the private key used for authentication. It is the only identity offered. |
+| `host_key` | Required, the server's public key in OpenSSH `<type> <base64>` form, as in a `known_hosts` line. `ssh-ed25519`, `ssh-rsa`, the ECDSA P-256/384/521 types and the FIDO `sk-` types are accepted. |
+| `certificate` | Optional, a client certificate for `key`. It is not proof of the server's identity and does not replace `host_key`. |
+
+The route needs `unrestricted` permission and `[permissions].network = "host"` (a client that
+dials the target's own address cannot honor a setting that confines the host), and
+`meka serve` sessions do not receive the targets. Forwarding, X11, the SSH agent and local
+commands are disabled, `-F none` keeps the operator's own SSH configuration out, public-key
+authentication is the only method allowed, and the pinned
+key is presented through a private known-hosts file written for that call. See
+[`shell_execute` with `ssh`](../tools/shell.md#shell_execute-with-ssh).
+
 ## `[tools]`: built-in tool filters
 
 The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to Meka's built-in tools (`file_read`, `file_write`, `shell_execute`, etc.) via a top-level `[tools]` table. MCP per-server filtering is separate from this and keeps its own namespaces; this block only affects the built-ins.

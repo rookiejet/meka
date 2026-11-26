@@ -66,8 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sub-agent may narrow its level, directories, and network access, never widen them. The parent
   sets the ceiling; the sub-agent's grants are a subset enforced by the target's admission
   checks.
+- SSH targets in `[shell.ssh]`: named targets whose server identity is pinned by a required
+  `host_key`. `shell_execute` takes an optional `ssh` parameter to route a command through a
+  named target. The target address is itself the scope, so the route requires `unrestricted`
+  permission and a network setting other than `none`; forwarding, X11, agent use and local
+  commands are off, and no ambient SSH configuration applies.
 - Memory facts record where they apply separately from where they were observed: `scope` names a
-  Windows host, a particular WSL distro, or is empty for portable. The
+  Windows host, a particular WSL distro, a configured SSH target, or is empty for portable. The
   scope is emitted in exports only when set. Target-specific notes are searchable by target and
   do not automatically become inline instructions in unrelated sessions.
 - Windows releases use an installed `meka-runner` or deploy a bundled copy on demand, without any
@@ -151,6 +156,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Windows workspace grant that is a drive root, or that contains Meka's private directories, is
   refused before the guest can mount it, and a grant's canonical path decides overlap rather than
   its spelling.
+- `shell_execute` with `ssh` captures the remote command's output on both streams, reports an
+  unconfirmed remote state when the client is stopped, and refuses a target whose key or
+  certificate is missing, so OpenSSH never falls back to the account's own identities. A remote
+  exit status of 255 is reported as indistinguishable from the client's own failure, and a
+  configured working directory is entered with `cd -- /absolute/path || exit 1`, so a failed
+  `cd` stops the command. The route requires `[permissions].network = "host"`, since a client that
+  dials the target's own address cannot honor a remote-only setting.
 - `subshell_close` waits for the guest namespace to end and reports an unconfirmed teardown,
   an export stops when its handle closes, and scratch staging refuses hard links, records a
   SHA-256 digest for each staged file, re-checks a copy back over the source, and refuses to adopt
@@ -162,6 +174,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were staged keeps its own bytes and nothing is replaced.
 - `subshell_open` refuses `workspace` mounts alongside `scratch`, whose snapshot is the only
   directory a scratch handle mounts.
+- A `shell_execute` SSH launch is serialized against a concurrent permission change: it holds the
+  ceiling and the session's own setter locks across the check and the launch, verifies the
+  session's snapshot token and ceiling there, and refuses rather than opening a remote session
+  under authority the downgrade already removed.
 - A stopped background task is `stopping` until its own result records how it ended, so a stop is
   never presented as a tool result the work did not produce. An in-process cancel that finds no
   live handle records the row as canceled with an unconfirmed teardown, and a `stopping` row left
@@ -195,7 +211,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a live runner instead of writing a terminal row from a caller that cannot observe the teardown.
   A row with no live owner stays `stopping` until its owner reports or the session sweep retires
   it.
-- A sandboxed shell configured through a WSL route is admitted when the native sandbox is
+- An SSH target offers only its configured key: public-key authentication is the only method
+  permitted, password, keyboard-interactive and hostbased authentication are off, and
+  `CertificateFile` is either the configured certificate or `none`, so a companion certificate
+  beside the key is never discovered. An SSH call already stopped when its run begins does not
+  spawn a client, and a stopped client is drained through the collector so its output is kept and
+  the remote command's state is reported unknown.
+- A sandboxed shell configured through a WSL or SSH route is admitted when the native sandbox is
   unavailable, since a native sandbox cannot apply to the route.
 
 ## [0.96.0] - 2026-11-18

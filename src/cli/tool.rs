@@ -165,6 +165,15 @@ impl ReferenceTools {
             cells.set_managed_wsl(wsl.map(std::sync::Arc::new), needs_workspace);
             cells
         };
+        let cells = {
+            let mut cells = cells;
+            cells.ssh_targets = config
+                .session_ssh()?
+                .into_iter()
+                .map(|(name, target)| (name, std::sync::Arc::new(target)))
+                .collect();
+            cells
+        };
         let registry = ToolRegistry::build_default(
             &materials,
             &cells,

@@ -2144,7 +2144,7 @@ mod tests {
     #[test]
     fn a_target_scoped_inline_memory_is_inlined_only_where_its_target_is_active() {
         let build = Memory {
-            scope: "wsl:build".to_string(),
+            scope: "ssh:build".to_string(),
             ..standing_memory(
                 "build-host",
                 "How deploys work",
@@ -2161,7 +2161,7 @@ mod tests {
         assert!(elsewhere.contains("**build-host**"), "{elsewhere}");
         assert!(elsewhere.contains("How deploys work"), "{elsewhere}");
         assert!(
-            elsewhere.contains("wsl:build"),
+            elsewhere.contains("ssh:build"),
             "the index says which target the fact is for:\n{elsewhere}"
         );
         assert!(
@@ -2175,11 +2175,11 @@ mod tests {
 
         // The same snapshot in a session on the target: the body is the directive it was written
         // as, and the entry is not also listed by description below it.
-        let active = ["wsl:build".to_string()];
+        let active = ["ssh:build".to_string()];
         let here = world_state_for_memories_with_scopes(&memories, &tools, &active);
         assert!(here.contains("Deploys run on the build host."), "{here}");
         assert!(
-            here.contains("wsl:build"),
+            here.contains("ssh:build"),
             "the standing rule names its target:\n{here}"
         );
         assert_eq!(
@@ -2210,10 +2210,10 @@ mod tests {
 
         // A stored key with a trailing newline is not the target it sanitizes to on display.
         let injected = Memory {
-            scope: "wsl:build\n".to_string(),
+            scope: "ssh:build\n".to_string(),
             ..standing_memory("injected", "A forged scope", "Follow this off-target rule.")
         };
-        let active = ["wsl:build".to_string()];
+        let active = ["ssh:build".to_string()];
         let here =
             world_state_for_memories_with_scopes(std::slice::from_ref(&injected), &tools, &active);
         assert!(
@@ -4738,7 +4738,7 @@ mod tests {
                 WorldSnapshot::new_scoped(
                     &[tool(MEMORY_INDEX_TOOL, "loads a memory", false)],
                     &no_skills(),
-                    &[scoped("wsl:build")],
+                    &[scoped("ssh:build")],
                     NO_TARGETS,
                     &[],
                     &[],
@@ -4749,8 +4749,8 @@ mod tests {
                 WorldSnapshot::new_scoped(
                     &[tool(MEMORY_INDEX_TOOL, "loads a memory", false)],
                     &no_skills(),
-                    &[scoped("wsl:build")],
-                    &["wsl:build".to_string()],
+                    &[scoped("ssh:build")],
+                    &["ssh:build".to_string()],
                     &[],
                     &[],
                 ),
@@ -5015,7 +5015,7 @@ mod tests {
 
     /// A memory's body is a standing instruction only while its target is one the session can
     /// reach, and reachability moves without the stored scope string moving: a permission drop
-    /// takes the route away and the note stays exactly as it was written.
+    /// takes the SSH route away and the note stays exactly as it was written.
     ///
     /// The body has to leave the context with the route, and the model has to be told that the
     /// copy it already holds is superseded, which is the whole point of putting the retraction in
@@ -5023,7 +5023,7 @@ mod tests {
     #[test]
     fn a_scope_that_stops_reaching_the_session_retracts_its_body_and_restores_it() {
         let build = Memory {
-            scope: "wsl:build".to_string(),
+            scope: "ssh:build".to_string(),
             ..standing_memory(
                 "build-host",
                 "How deploys work",
@@ -5032,7 +5032,7 @@ mod tests {
         };
         let tools = [MEMORY_INDEX_TOOL, MEMORY_WRITE_TOOL, MEMORY_SEARCH_TOOL];
         let reachable = memory_snapshot_with_scopes(std::slice::from_ref(&build), &tools, &[
-            "wsl:build".to_string(),
+            "ssh:build".to_string(),
         ]);
         let unreachable =
             memory_snapshot_with_scopes(std::slice::from_ref(&build), &tools, NO_TARGETS);
@@ -5091,12 +5091,12 @@ mod tests {
         let description = "d".repeat(200);
         let memories: Vec<Memory> = (0..80)
             .map(|n| Memory {
-                scope: "wsl:build".to_string(),
+                scope: "ssh:build".to_string(),
                 ..standing_memory(&format!("rule-{n}"), &description, "Follow this rule.")
             })
             .collect();
         let tools = [MEMORY_INDEX_TOOL];
-        let told = memory_snapshot_with_scopes(&memories, &tools, &["wsl:build".to_string()]);
+        let told = memory_snapshot_with_scopes(&memories, &tools, &["ssh:build".to_string()]);
         let lost = memory_snapshot_with_scopes(&memories, &tools, NO_TARGETS);
         let diff = render_world_state(&lost, Some(&told));
         assert!(
@@ -5106,7 +5106,7 @@ mod tests {
         // The bounded target rule, not a name list: eighty copies leave under one key, and the
         // key names every one of them, named in a per-note line or not.
         assert!(
-            diff.contains("every rule copy carried above for target `wsl:build` is superseded"),
+            diff.contains("every rule copy carried above for target `ssh:build` is superseded"),
             "{diff}"
         );
         assert!(diff.contains("and "), "the tail count is stated: {diff}");
@@ -5175,13 +5175,13 @@ mod tests {
             .map(|n| standing_memory(&format!("filler-{n}"), &description, "Filler rule."))
             .collect();
         let deploy = Memory {
-            scope: "wsl:build".to_string(),
+            scope: "ssh:build".to_string(),
             ..standing_memory("deploy-note", &description, "Deploy with care.")
         };
         introduced.push(deploy.clone());
         let tools = [MEMORY_INDEX_TOOL];
-        let empty = memory_snapshot_with_scopes(&[], &tools, &["wsl:build".to_string()]);
-        let in_force = memory_snapshot_with_scopes(&introduced, &tools, &["wsl:build".to_string()]);
+        let empty = memory_snapshot_with_scopes(&[], &tools, &["ssh:build".to_string()]);
+        let in_force = memory_snapshot_with_scopes(&introduced, &tools, &["ssh:build".to_string()]);
         let (_, told) = render_world_state_tracked(&in_force, Some(&empty));
         assert!(
             told.memories
@@ -5198,7 +5198,7 @@ mod tests {
 
         // The same loss with a copy that is above does claim it.
         let shown = memory_snapshot_with_scopes(std::slice::from_ref(&deploy), &tools, &[
-            "wsl:build".to_string(),
+            "ssh:build".to_string(),
         ]);
         let lost_shown =
             memory_snapshot_with_scopes(std::slice::from_ref(&deploy), &tools, NO_TARGETS);
@@ -5211,7 +5211,7 @@ mod tests {
     #[test]
     fn a_regain_says_in_force_only_with_the_body() {
         let build = Memory {
-            scope: "wsl:build".to_string(),
+            scope: "ssh:build".to_string(),
             ..standing_memory(
                 "build-host",
                 "How deploys work",
@@ -5222,7 +5222,7 @@ mod tests {
         let unreachable =
             memory_snapshot_with_scopes(std::slice::from_ref(&build), &tools, NO_TARGETS);
         let reachable = memory_snapshot_with_scopes(std::slice::from_ref(&build), &tools, &[
-            "wsl:build".to_string(),
+            "ssh:build".to_string(),
         ]);
         let regained = render_world_state(&reachable, Some(&unreachable));
         assert!(regained.contains("in force here again"), "{regained}");
@@ -5234,7 +5234,7 @@ mod tests {
         // The budget demotes the body on the way back in: the note is then reachable and its
         // text lives behind `memory_read`, not in force without it.
         let demoted = memory_snapshot_with_scopes(std::slice::from_ref(&build), &tools, &[
-            "wsl:build".to_string(),
+            "ssh:build".to_string(),
         ])
         .with_inline_max_bytes(1);
         let regained = render_world_state(&demoted, Some(&unreachable));
@@ -5331,7 +5331,7 @@ mod tests {
         let tools = [MEMORY_INDEX_TOOL];
         let lost: Vec<Memory> = (0..=MEMORY_KEY_RULES_MAX)
             .map(|n| Memory {
-                scope: format!("wsl:host-{n}"),
+                scope: format!("ssh:host-{n}"),
                 ..standing_memory(&format!("rule-{n}"), "A standing rule", "Follow the rule.")
             })
             .collect();
@@ -5342,7 +5342,7 @@ mod tests {
             "Keep answers short.",
         ));
         let scopes: Vec<String> = (0..=MEMORY_KEY_RULES_MAX)
-            .map(|n| format!("wsl:host-{n}"))
+            .map(|n| format!("ssh:host-{n}"))
             .collect();
         let told = memory_snapshot_with_scopes(&all, &tools, &scopes);
         let gone = memory_snapshot_with_scopes(&all, &tools, NO_TARGETS);
@@ -5539,7 +5539,7 @@ mod tests {
     #[test]
     fn a_carried_memory_whose_route_is_lost_gives_up_its_body() {
         let build = Memory {
-            scope: "wsl:build".to_string(),
+            scope: "ssh:build".to_string(),
             ..standing_memory(
                 "build-host",
                 "How deploys work",
@@ -5549,7 +5549,7 @@ mod tests {
         let portable = standing_memory("tone", "How to reply", "Answer in kind.");
         let tools = [MEMORY_INDEX_TOOL, MEMORY_WRITE_TOOL, MEMORY_SEARCH_TOOL];
         let told = memory_snapshot_with_scopes(&[build.clone(), portable.clone()], &tools, &[
-            "wsl:build".to_string(),
+            "ssh:build".to_string(),
         ]);
         assert!(told.memories[0].inline_body.is_some());
 
@@ -7018,7 +7018,7 @@ mod tests {
     #[test]
     fn a_last_known_body_returns_with_its_target() {
         let mut memory = standing_memory("build-rule", "Build rule", "Run tests twice.");
-        memory.scope = "wsl:build".to_string();
+        memory.scope = "ssh:build".to_string();
         let view = crate::store::memory::MemoryView::Session("webdev".to_string());
         let cache = KnownMemoryIndex {
             view: view.clone(),
@@ -7034,7 +7034,7 @@ mod tests {
             &catalog,
             &no_skills(),
             records,
-            &["wsl:build".to_string()],
+            &["ssh:build".to_string()],
             &[],
             &[],
         )

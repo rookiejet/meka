@@ -34,7 +34,7 @@ A memory is in one of two tiers: **global**, which every session sees, or a **pr
 | `description` | One line used in the bounded index. Make it stand on its own. |
 | `priority` | `0`–`9`, default `5`: how important the note is, not whether it loads. See [Priority](#priority). |
 | `load` | How the memory reaches the context: `inline`, `index` (default) or `search`. See [Loading](#loading). |
-| `scope` | Which machine the note applies to: `""`/`portable` (every session), `windows` or `wsl:<distro>`. A target-specific body is inlined only in a session on that target. See [Scope](#scope). |
+| `scope` | Which machine the note applies to: `""`/`portable` (every session), `windows`, `wsl:<distro>` or `ssh:<target>`. A target-specific body is inlined only in a session on that target. See [Scope](#scope). |
 | `tags` | Lowercase labels (`[a-z0-9-]`, at most 10) for grouping and filtering. |
 | `body` | Detail, loaded on demand by `memory_read`, or in context every turn when `load` is `inline`. |
 | `references` | What the memory depends on: memory names, paths, URLs, external ids. See [References and backlinks](#references-and-backlinks). |
@@ -102,8 +102,9 @@ The index ends with a count of the memories it lists nowhere, the search-only on
 | `portable` | the same thing, spelled out; stored as `""`, so an export of a portable memory carries no `scope` key. |
 | `windows` | a session running the Windows build. |
 | `wsl:<distro>` | a session with that WSL target, e.g. `wsl:voidlinux-glibc`. |
+| `ssh:<target>` | a session with that configured SSH target, e.g. `ssh:build`. |
 
-`<distro>` is the name the configuration uses: 1–64 characters, trimmed, with no
+`<distro>` and `<target>` are the names the configuration uses: 1–64 characters, trimmed, with no
 control characters, quotes or slashes, and not starting with `-`. Spaces are allowed where the
 name has them, so a distro registered as `Ubuntu 22.04` is scoped `wsl:Ubuntu 22.04`. Anything else
 is refused where it is written, by `memory_write` and by `meka memory import`, with the spellings
@@ -111,7 +112,7 @@ that would have been accepted: a scope no session can match would store a note t
 forever and inlined never. `meka memory export` checks the same rule before it writes, so a stored
 scope that an older version accepted cannot be carried into a backup that a later import refuses.
 
-A session's active scopes come from the targets it can actually reach: `windows` on the Windows build and `wsl:<distro>` for a WSL target whose grants are selectable at the session's level. `shell_execute` must be admitted and its live requirement, including `[tools.tool_permissions]`, met at the session's level. Matching is exact against the name as stored, case and spacing included; the display form exists for reading alone. A stored scope no session could ever match applies nowhere and is never reinterpreted as portable or as some other target. A memory scoped to a target the session is not on is **still listed in the `[Memory]` index** by name, description, priority and tags, so the agent knows it exists and `memory_search` and `memory_read` reach it. What it loses is the inline body: it does not appear in the standing band, so its text is not in context as an instruction. A target that stops being reachable takes its notes out of force at the next turn and the change is announced once; when more notes leave at once than the update line can name, the announcement supersedes the earlier rule copies by target, so no copy stands in context unclaimed. When the target returns, the body is restored and that is announced too, or the note is said to be merely reachable again when the inline budget does not take its body. A portable memory behaves exactly as it always did.
+A session's active scopes come from the targets it can actually reach: `windows` on the Windows build, `wsl:<distro>` for a WSL target whose grants are selectable at the session's level, and `ssh:<name>` for each SSH target its tools, level and networking admit. `shell_execute` must be admitted and its live requirement, including `[tools.tool_permissions]`, met at the session's level; an SSH target also needs `unrestricted` and `[permissions].network = "host"`. Matching is exact against the name as stored, case and spacing included; the display form exists for reading alone. A stored scope no session could ever match applies nowhere and is never reinterpreted as portable or as some other target. A memory scoped to a target the session is not on is **still listed in the `[Memory]` index** by name, description, priority and tags, so the agent knows it exists and `memory_search` and `memory_read` reach it. What it loses is the inline body: it does not appear in the standing band, so its text is not in context as an instruction. A target that stops being reachable takes its notes out of force at the next turn and the change is announced once; when more notes leave at once than the update line can name, the announcement supersedes the earlier rule copies by target, so no copy stands in context unclaimed. When the target returns, the body is restored and that is announced too, or the note is said to be merely reachable again when the inline budget does not take its body. A portable memory behaves exactly as it always did.
 
 The [inline budget](#the-inline-budget) is counted over every inline body in force, whatever its scope. The store is shared, and which targets the next session is on is not known at write time, so the limit a write door enforces has to hold for every host.
 

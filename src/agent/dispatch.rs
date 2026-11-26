@@ -1658,6 +1658,7 @@ mod tests {
             .register(Arc::new(crate::tools::shell::ExecuteCommandTool {
                 #[cfg(windows)]
                 wsl_target: None,
+                ssh_targets: Default::default(),
                 scope: crate::workspace::WriteScope::unconfined(),
                 #[cfg(windows)]
                 windows_grants: Arc::new(crate::sandbox::windows::WindowsGrants::default()),

@@ -2223,7 +2223,7 @@ async fn build_subagent(
     let inherits_targets = matches!(spec.stated_scope(), Ok(None));
     let sub_cells = crate::session::SessionCells {
         permission: sub_shared_perm.clone(),
-        // Guest targets are addressed by path, and no target-qualified grant exists, so a
+        // Guest and SSH targets are addressed by path, and no target-qualified grant exists, so a
         // worker with a scope of its own would reach a directory that scope withheld if it
         // inherited them. A bare worker holds exactly its parent's directories and may use what
         // its parent may use.
@@ -2237,6 +2237,11 @@ async fn build_subagent(
         // grants are the ones `request` proves, and a worker holding the target holds them.
         #[cfg(windows)]
         wsl_needs_workspace: inherits_targets && params.cells.wsl_needs_workspace,
+        ssh_targets: if inherits_targets {
+            params.cells.ssh_targets.clone()
+        } else {
+            std::collections::BTreeMap::new()
+        },
         cwd: workspace.cwd,
         roots: workspace.roots,
         read_only_roots: workspace.read_only_roots,

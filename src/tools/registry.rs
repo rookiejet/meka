@@ -1215,6 +1215,7 @@ impl ToolRegistry {
         core: &CoreMaterials,
         site: crate::session::ToolSite,
         #[cfg(windows)] wsl_target: Option<Arc<crate::subshell::Target>>,
+        ssh_targets: std::collections::BTreeMap<String, Arc<crate::subshell::SshTarget>>,
     ) -> Result<()> {
         let web_client_config = &core.web_client;
         let sandbox_enabled = core.sandbox_enabled;
@@ -1261,6 +1262,7 @@ impl ToolRegistry {
         self.register_builtin(Arc::new(shell::ExecuteCommandTool {
             #[cfg(windows)]
             wsl_target,
+            ssh_targets,
             scope: write_scope,
             #[cfg(windows)]
             windows_grants: Arc::clone(crate::sandbox::windows::process_grants()),
@@ -1583,6 +1585,7 @@ impl ToolRegistry {
             cells.site(),
             #[cfg(windows)]
             cells.wsl.clone(),
+            cells.ssh_targets.clone(),
         )?;
         #[cfg(windows)]
         if let Some(target) = &cells.wsl {
@@ -1712,6 +1715,7 @@ impl ToolRegistry {
             site,
             #[cfg(windows)]
             None,
+            std::collections::BTreeMap::new(),
         )?;
         Ok(registry)
     }
@@ -1744,6 +1748,7 @@ impl ToolRegistry {
             cells.site(),
             #[cfg(windows)]
             cells.wsl.clone(),
+            cells.ssh_targets.clone(),
         )?;
         #[cfg(windows)]
         if let Some(target) = &cells.wsl {
